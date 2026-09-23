@@ -56,6 +56,9 @@ struct Request {
   std::optional<std::int64_t> seed;
   std::vector<std::string> stops;
   bool allow_tool_calls = false;
+  bool require_tool_calls = false;
+  bool parallel_tool_calls = true;
+  bool enforce_tool_calls = false;
   bool enable_thinking = false;
   bool initial_reasoning = false;
   std::shared_ptr<const constraint::Compiled> constraint;

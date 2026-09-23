@@ -159,8 +159,7 @@ void neutral_controls(const json& body, Request& request, const text::TextContra
     for (const char* key : {"functions"}) {
       if (present(body, key) && (!body[key].is_array() || !body[key].empty())) unsupported(key);
     }
-    for (const char* key : {"function_call", "reasoning_effort"})
-      if (present(body, key)) unsupported(key);
+    if (present(body, "function_call")) unsupported("function_call");
   } else {
     for (const char* key : {"messages", "max_completion_tokens", "chat_template_kwargs",
                            "top_logprobs", "response_format", "store", "modalities", "tools",
@@ -200,17 +199,62 @@ json tool_controls(const json& body, Request& request, const text::TextContract&
   json tools;
   try { tools = contract.normalize_tools(body.value("tools", json(nullptr))); }
   catch (const std::invalid_argument& error) { invalid("tools", error.what()); }
-  for (const auto& tool : tools) request.tool_names.push_back(tool["function"]["name"].get<std::string>());
+  for (const auto& tool : tools) {
+    request.tool_names.push_back(tool["function"]["name"].get<std::string>());
+    request.enforce_tool_calls |= tool["function"].value("strict", false);
+  }
   request.allow_tool_calls = !tools.empty();
+  if (present(body, "parallel_tool_calls")) {
+    request.parallel_tool_calls = boolean(body["parallel_tool_calls"], "parallel_tool_calls");
+    request.enforce_tool_calls |= !request.parallel_tool_calls;
+  }
   if (present(body, "tool_choice")) {
     const auto& choice = body["tool_choice"];
-    if (choice != "auto" && choice != "none") unsupported("tool_choice");
-    if (choice == "auto" && tools.empty()) invalid("tool_choice", "tool_choice auto requires tools");
-    request.allow_tool_calls = choice == "auto";
+    if (choice.is_string()) {
+      if (choice != "auto" && choice != "none" && choice != "required")
+        invalid("tool_choice", "tool_choice must be auto, none, required, or a function selection");
+      request.allow_tool_calls = choice != "none";
+      request.require_tool_calls = choice == "required";
+      request.enforce_tool_calls |= choice != "auto";
+    } else if (choice.is_object()) {
+      request.enforce_tool_calls = request.allow_tool_calls = true;
+      json selected;
+      if (choice.value("type", json()) == "function") {
+        allow_keys(choice, {"type", "function"}, "tool_choice.");
+        selected = json::array({choice});
+        request.require_tool_calls = true;
+        request.parallel_tool_calls = false;
+      } else if (choice.value("type", json()) == "allowed_tools") {
+        allow_keys(choice, {"type", "allowed_tools"}, "tool_choice.");
+        const auto allowed = choice.value("allowed_tools", json());
+        if (!allowed.is_object()) invalid("tool_choice", "allowed_tools must be an object");
+        allow_keys(allowed, {"mode", "tools"}, "tool_choice.allowed_tools.");
+        const auto mode = allowed.value("mode", json());
+        if (mode != "auto" && mode != "required") invalid("tool_choice", "allowed_tools mode must be auto or required");
+        request.require_tool_calls = mode == "required";
+        selected = allowed.value("tools", json());
+      } else invalid("tool_choice", "unsupported tool selection type");
+      if (!selected.is_array() || selected.empty() || selected.size() > 128)
+        invalid("tool_choice", "selection must contain 1..128 declared functions");
+      std::vector<std::string> names;
+      for (const auto& tool : selected) {
+        if (!tool.is_object()) invalid("tool_choice", "selected tool must be an object");
+        allow_keys(tool, {"type", "function"}, "tool_choice.");
+        if (tool.value("type", json()) != "function" || !tool.contains("function") || !tool["function"].is_object())
+          invalid("tool_choice", "selected tool must specify a function");
+        allow_keys(tool["function"], {"name"}, "tool_choice.function.");
+        const auto name = tool["function"].value("name", json());
+        if (!name.is_string() || std::find(request.tool_names.begin(), request.tool_names.end(), name.get<std::string>()) == request.tool_names.end())
+          invalid("tool_choice", "selected function is not declared");
+        if (std::find(names.begin(), names.end(), name.get<std::string>()) != names.end())
+          invalid("tool_choice", "selected functions must be unique");
+        names.push_back(name.get<std::string>());
+      }
+      request.tool_names = std::move(names);
+    } else invalid("tool_choice", "tool_choice must be a string or object");
+    if (request.allow_tool_calls && tools.empty()) invalid("tool_choice", "tool selection requires tools");
   }
-  if (present(body, "parallel_tool_calls") && !boolean(body["parallel_tool_calls"], "parallel_tool_calls"))
-    unsupported("parallel_tool_calls");
-  return request.allow_tool_calls ? tools : json::array();
+  return tools;
 }
 
 void response_constraint(const json& body, Request& request, constraint::Compiler& compiler) {
@@ -249,8 +293,6 @@ void response_constraint(const json& body, Request& request, constraint::Compile
   } else invalid("response_format.type", "response_format.type must be text, json_object, or json_schema");
   if (!request.stops.empty())
     invalid("stop", "stop strings cannot be combined with constrained response_format");
-  if (request.allow_tool_calls)
-    invalid("response_format", "constrained response_format requires tool_choice=none when tools are supplied");
   try { request.constraint = compiler.compile(schema); }
   catch (const std::invalid_argument& error) {
     invalid("response_format.json_schema.schema", error.what(), "invalid_schema");
@@ -273,10 +315,16 @@ std::vector<std::uint32_t> chat_prompt(const json& body, const text::Tokenizer& 
   text::ChatTemplateOptions options;
   try {
     options = tokenizer.contract().template_options(body.value("chat_template_kwargs", json(nullptr)));
-    request.enable_thinking = options.enable_thinking;
   } catch (const std::invalid_argument& error) {
     invalid("chat_template_kwargs", error.what());
   }
+  if (present(body, "reasoning_effort")) {
+    const auto& effort = body["reasoning_effort"];
+    if (effort != "none" && effort != "low" && effort != "medium" && effort != "high")
+      invalid("reasoning_effort", "reasoning_effort must be none, low, medium, or high");
+    options.enable_thinking = effort != "none";
+  }
+  request.enable_thinking = options.enable_thinking;
   if (!body.contains("messages")) invalid("messages", "messages is required", "missing_required_parameter");
   try {
     const auto rendered = tokenizer.contract().render_chat(tokenizer.contract().normalize_messages(body["messages"]), options, tools);
@@ -543,7 +591,7 @@ Request parse_request(std::string_view method, std::string_view path,
   }
   if (request.operation == Operation::prefill) {
     allow_keys(body, {"model", "messages", "prompt", "cache", "chat_template_kwargs",
-                      "tools", "tool_choice", "parallel_tool_calls"});
+                      "tools", "tool_choice", "parallel_tool_calls", "reasoning_effort"});
     if (body.contains("messages") == body.contains("prompt"))
       invalid("prompt", "prefill requires exactly one of messages or prompt");
     request.chat = body.contains("messages");
@@ -553,6 +601,8 @@ Request parse_request(std::string_view method, std::string_view path,
       invalid("tools", "tool controls require messages");
     if (!request.chat && present(body, "chat_template_kwargs") && body["chat_template_kwargs"] != json::object())
       invalid("chat_template_kwargs", "chat_template_kwargs requires messages");
+    if (!request.chat && present(body, "reasoning_effort"))
+      invalid("reasoning_effort", "reasoning_effort requires messages");
   } else {
     neutral_controls(body, request, tokenizer.contract());
     stop_and_seed(body, request);
@@ -578,7 +628,11 @@ Request parse_request(std::string_view method, std::string_view path,
   std::vector<std::uint32_t> prompt;
   auto prepared_images = request.chat ? prepare_chat_images(body, tokenizer, images)
                                       : std::vector<std::shared_ptr<runtime::ImageInput>>{};
-  if (request.chat) prompt = chat_prompt(body, tokenizer, tool_controls(body, request, tokenizer.contract()), request);
+  json tools;
+  if (request.chat) {
+    tools = tool_controls(body, request, tokenizer.contract());
+    prompt = chat_prompt(body, tokenizer, request.allow_tool_calls ? tools : json::array(), request);
+  }
   else {
     if (!body.contains("prompt")) invalid("prompt", "prompt is required", "missing_required_parameter");
     prompt = raw_prompt(body["prompt"], tokenizer);
@@ -589,8 +643,16 @@ Request parse_request(std::string_view method, std::string_view path,
   if (prompt.size() > tokenizer.contract().context_tokens || (request.max_tokens && prompt.size() + request.max_tokens - 1 > tokenizer.contract().context_tokens))
     invalid(request.chat ? "messages" : "prompt", "prompt and generation exceed the " + std::to_string(tokenizer.contract().context_tokens) + "-token context", "context_length_exceeded");
   request.prompt = std::make_shared<const std::vector<std::uint32_t>>(std::move(prompt));
-  if (request.chat && request.operation == Operation::generate)
+  if (request.chat && request.operation == Operation::generate) {
     response_constraint(body, request, compiler);
+    if (request.enforce_tool_calls || (request.allow_tool_calls && request.constraint)) {
+      try {
+        request.constraint = compiler.compile_tools(tools,
+            request.allow_tool_calls ? request.tool_names : std::vector<std::string>{}, request.require_tool_calls,
+            request.parallel_tool_calls, request.constraint);
+      } catch (const std::invalid_argument& error) { invalid("tools", error.what(), "invalid_schema"); }
+    }
+  }
   return request;
 }
 

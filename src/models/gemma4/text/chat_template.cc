@@ -65,7 +65,6 @@ void validate_argument(const json& value, const std::string& path, unsigned dept
     invalid(path, "exceeds the 32-level nesting limit");
   if (value.is_object()) {
     for (const auto& field : value.items()) {
-      if (!identifier(field.key())) invalid(path, "object keys must use letters, digits, underscores or hyphens");
       validate_argument(field.value(), path + "." + field.key(), depth + 1);
     }
   } else if (value.is_array()) {
@@ -75,48 +74,70 @@ void validate_argument(const json& value, const std::string& path, unsigned dept
   }
 }
 
+// Non-strict declarations describe arguments to the model. Preserve schema
+// assertions and annotations; the constraint compiler validates its enforceable
+// subset separately when strict mode is requested.
 json normalize_schema(json schema, const std::string& path, unsigned depth = 0) {
   if (depth >= 32) invalid(path, "exceeds the 32-level nesting limit");
-  keys(schema, {"type", "description", "enum", "nullable", "properties", "required", "items", "additionalProperties"}, path);
-  const auto type = string_field(schema, "type", path);
-  if (type != "string" && type != "integer" && type != "number" && type != "boolean" &&
-      type != "object" && type != "array" && type != "null") invalid(path + ".type", "is unsupported");
-  if (schema.contains("description") && !schema["description"].is_string())
-    invalid(path + ".description", "must be a string");
-  if (schema.contains("nullable") && !schema["nullable"].is_boolean())
-    invalid(path + ".nullable", "must be boolean");
-  if (schema.contains("additionalProperties") && !schema["additionalProperties"].is_boolean())
-    invalid(path + ".additionalProperties", "must be boolean metadata");
-  if (schema.contains("additionalProperties") && type != "object")
-    invalid(path + ".additionalProperties", "requires object type");
-  if (schema.contains("enum")) {
-    if (type != "string" || !schema["enum"].is_array() || schema["enum"].empty() ||
-        std::any_of(schema["enum"].begin(), schema["enum"].end(), [](const auto& v) { return !v.is_string(); }))
-      invalid(path + ".enum", "must be a nonempty string enum on a string property");
-  }
-  if (type == "object") {
-    if (!schema.contains("properties")) schema["properties"] = json::object();
-    if (!schema["properties"].is_object()) invalid(path + ".properties", "must be an object");
-    for (auto& field : schema["properties"].items()) {
-      if (!identifier(field.key())) invalid(path + ".properties", "keys must use letters, digits, underscores or hyphens");
-      field.value() = normalize_schema(field.value(), path + ".properties." + field.key(), depth + 1);
+  if (schema.is_boolean()) return schema;
+  if (!schema.is_object()) invalid(path, "must be an object or boolean schema");
+  for (const char* key : {"$schema", "$id", "$ref", "$comment", "title", "description", "pattern", "format"})
+    if (schema.contains(key) && !schema[key].is_string()) invalid(path + "." + key, "must be a string");
+  schema.erase("$schema");
+  for (const char* key : {"nullable", "deprecated", "readOnly", "writeOnly", "uniqueItems"})
+    if (schema.contains(key) && !schema[key].is_boolean()) invalid(path + "." + key, "must be boolean");
+  if (schema.contains("examples") && !schema["examples"].is_array()) invalid(path + ".examples", "must be an array");
+  if (schema.contains("type")) {
+    const auto types = schema["type"].is_array() ? schema["type"] : json::array({schema["type"]});
+    if (types.empty()) invalid(path + ".type", "must not be empty");
+    std::set<std::string> seen;
+    for (const auto& value : types) {
+      if (!value.is_string()) invalid(path + ".type", "must contain JSON type names");
+      const auto type = value.get<std::string>();
+      if ((type != "string" && type != "integer" && type != "number" && type != "boolean" &&
+           type != "object" && type != "array" && type != "null") || !seen.insert(type).second)
+        invalid(path + ".type", "must contain unique JSON type names");
     }
-    if (schema.contains("required")) {
-      if (!schema["required"].is_array()) invalid(path + ".required", "must be an array");
-      std::set<std::string> seen;
-      for (const auto& item : schema["required"]) {
-        if (!item.is_string() || !schema["properties"].contains(item.get<std::string>()) ||
-            !seen.insert(item.get<std::string>()).second)
-          invalid(path + ".required", "must list unique declared property names");
-      }
-    }
-  } else if (schema.contains("properties") || schema.contains("required")) {
-    invalid(path, "properties/required require object type");
   }
-  if (type == "array") {
-    if (!schema.contains("items")) invalid(path + ".items", "is required for arrays");
-    schema["items"] = normalize_schema(schema["items"], path + ".items", depth + 1);
-  } else if (schema.contains("items")) invalid(path + ".items", "requires array type");
+  if (schema.contains("enum") && (!schema["enum"].is_array() || schema["enum"].empty()))
+    invalid(path + ".enum", "must be a nonempty array");
+  for (const char* key : {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"})
+    if (schema.contains(key) && (!schema[key].is_number() || !std::isfinite(schema[key].get<double>()) ||
+        (std::string_view(key) == "multipleOf" && schema[key].get<double>() <= 0)))
+      invalid(path + "." + key, "must be a finite number (positive for multipleOf)");
+  for (const char* key : {"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains", "maxContains"})
+    if (schema.contains(key) && (!schema[key].is_number_integer() || schema[key].get<long double>() < 0))
+      invalid(path + "." + key, "must be a nonnegative integer");
+  if (schema.value("type", json()) == "object" && !schema.contains("properties")) schema["properties"] = json::object();
+  for (const char* key : {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"}) {
+    if (!schema.contains(key)) continue;
+    if (!schema[key].is_object()) invalid(path + "." + key, "must be an object");
+    for (auto& field : schema[key].items()) {
+      if (std::string_view(key) == "dependencies" && field.value().is_array()) {
+        for (const auto& name : field.value())
+          if (!name.is_string()) invalid(path + ".dependencies." + field.key(), "must list property names");
+      } else field.value() = normalize_schema(field.value(), path + "." + key + "." + field.key(), depth + 1);
+    }
+  }
+  if (schema.contains("required")) {
+    if (!schema["required"].is_array()) invalid(path + ".required", "must be an array");
+    std::set<std::string> seen;
+    for (const auto& item : schema["required"])
+      if (!item.is_string() || !seen.insert(item.get<std::string>()).second)
+        invalid(path + ".required", "must list unique property names");
+  }
+  for (const char* key : {"anyOf", "oneOf", "allOf", "prefixItems"}) {
+    if (!schema.contains(key)) continue;
+    if (!schema[key].is_array() || schema[key].empty()) invalid(path + "." + key, "must be a nonempty schema array");
+    for (auto& child : schema[key]) child = normalize_schema(child, path + "." + key, depth + 1);
+  }
+  for (const char* key : {"items", "additionalProperties", "additionalItems", "contains", "propertyNames",
+                          "not", "if", "then", "else", "unevaluatedProperties", "unevaluatedItems", "contentSchema"}) {
+    if (!schema.contains(key)) continue;
+    if (std::string_view(key) == "items" && schema[key].is_array()) {
+      for (auto& child : schema[key]) child = normalize_schema(child, path + ".items", depth + 1);
+    } else schema[key] = normalize_schema(schema[key], path + "." + key, depth + 1);
+  }
   return schema;
 }
 
@@ -149,7 +170,7 @@ std::string format_argument(const json& value, bool escape_keys = true) {
     std::string result = "{";
     for (const auto& key : sorted_keys(value)) {
       if (result.size() > 1) result += ',';
-      result += (escape_keys ? gemma_quote(key) : key) + ":" + format_argument(value[key], escape_keys);
+      result += (escape_keys || !identifier(key) ? gemma_quote(key) : key) + ":" + format_argument(value[key], escape_keys);
     }
     return result + "}";
   }
@@ -230,11 +251,51 @@ std::string format_parameters(const json& properties) {
   return result;
 }
 
+bool native_schema(const json& schema) {
+  if (!schema.is_object() || !schema.contains("type") || !schema["type"].is_string()) return false;
+  for (const auto& field : schema.items()) {
+    if (field.key() != "type" && field.key() != "description" && field.key() != "enum" &&
+        field.key() != "nullable" && field.key() != "properties" && field.key() != "required" &&
+        field.key() != "items" && field.key() != "additionalProperties") return false;
+  }
+  const auto type = schema["type"].get<std::string>();
+  if (schema.contains("enum") && (type != "string" ||
+      std::any_of(schema["enum"].begin(), schema["enum"].end(), [](const auto& v) { return !v.is_string(); }))) return false;
+  if (schema.contains("additionalProperties") && !schema["additionalProperties"].is_boolean()) return false;
+  if (schema.contains("properties")) {
+    if (type != "object") return false;
+    for (const auto& field : schema["properties"].items())
+      if (!identifier(field.key()) || !native_schema(field.value())) return false;
+  }
+  if (type == "array") return schema.contains("items") && native_schema(schema["items"]);
+  return !schema.contains("items");
+}
+
+json declaration_schema(json schema) {
+  if (!schema.is_object()) return schema;
+  if (schema.contains("type")) {
+    if (schema["type"].is_string()) schema["type"] = uppercase(schema["type"].get<std::string>());
+    else for (auto& type : schema["type"]) type = uppercase(type.get<std::string>());
+  }
+  for (const char* key : {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies",
+                          "anyOf", "oneOf", "allOf", "prefixItems"})
+    if (schema.contains(key)) for (auto& child : schema[key]) child = declaration_schema(child);
+  for (const char* key : {"items", "additionalProperties", "additionalItems", "contains", "propertyNames",
+                          "not", "if", "then", "else", "unevaluatedProperties", "unevaluatedItems", "contentSchema"}) {
+    if (!schema.contains(key)) continue;
+    if (schema[key].is_array()) for (auto& child : schema[key]) child = declaration_schema(child);
+    else schema[key] = declaration_schema(schema[key]);
+  }
+  return schema;
+}
+
 std::string format_declaration(const json& tool) {
   const auto& function = tool.at("function");
   std::string result = "declaration:" + function.at("name").get<std::string>() +
       "{description:" + gemma_quote(function.at("description").get<std::string>());
   const auto& parameters = function.at("parameters");
+  if (!native_schema(parameters) || parameters.contains("description") || parameters.contains("nullable") || parameters.contains("enum"))
+    return result + ",parameters:" + format_argument(declaration_schema(parameters), false) + "}";
   result += ",parameters:{";
   if (!parameters["properties"].empty()) result += "properties:{" + format_parameters(parameters["properties"]) + "},";
   if (truthy(get(parameters, "required"))) result += "required:" + format_argument(parameters["required"]) + ",";
@@ -300,14 +361,22 @@ json normalize_chat_tools(const json& tools) {
     if (!identifier(name, true)) invalid(path + ".function.name", "must use 1..64 letters, digits, underscores or hyphens");
     if (!names.insert(name).second) invalid(path + ".function.name", "must be unique");
     const auto& strict = get(input, "strict");
-    if (!strict.is_null() && strict != false) invalid(path + ".function.strict", "only supports false or null");
+    if (!strict.is_null() && !strict.is_boolean()) invalid(path + ".function.strict", "must be boolean or null");
     json function = {{"name", name}, {"description", string_field(input, "description", path + ".function", false)}};
+    if (strict == true) function["strict"] = true;
     json parameters = get(input, "parameters");
-    if (parameters.is_null()) parameters = {{"type", "object"}, {"properties", json::object()}};
+    if (parameters.is_null()) {
+      parameters = {{"type", "object"}, {"properties", json::object()}};
+      if (strict == true) {
+        parameters["additionalProperties"] = false;
+        parameters["required"] = json::array();
+      }
+    }
+    if (!parameters.is_object()) invalid(path + ".function.parameters", "must be an object schema");
+    if (parameters.dump().size() > 64 * 1024) invalid(path + ".function.parameters", "exceeds 64 KiB");
+    if (!parameters.contains("type")) parameters["type"] = "object";
     function["parameters"] = normalize_schema(std::move(parameters), path + ".function.parameters");
     if (function["parameters"]["type"] != "object") invalid(path + ".function.parameters.type", "must be object");
-    for (const char* key : {"description", "enum", "nullable", "items"})
-      if (function["parameters"].contains(key)) invalid(path + ".function.parameters." + key, "is unsupported at the parameter root");
     result.push_back({{"type", "function"}, {"function", std::move(function)}});
   }
   return result;

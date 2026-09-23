@@ -30,18 +30,6 @@ void escape_byte(std::string& output, unsigned char c) {
   } else output.push_back(c);
 }
 
-void validate_argument_keys(const nlohmann::json& value) {
-  if (value.is_object()) {
-    for (const auto& item : value.items()) {
-      if (item.key().empty() || !std::all_of(item.key().begin(), item.key().end(), name_char))
-        malformed("object keys must use letters, digits, underscore or hyphen");
-      validate_argument_keys(item.value());
-    }
-  } else if (value.is_array()) {
-    for (const auto& item : value) validate_argument_keys(item);
-  }
-}
-
 }  // namespace
 
 struct ToolOutputDecoder::Impl {
@@ -184,7 +172,6 @@ struct ToolOutputDecoder::Impl {
     try {
       const auto value = nlohmann::json::parse(calls.back().arguments);
       if (!value.is_object()) malformed("arguments must be an object");
-      validate_argument_keys(value);
     } catch (const nlohmann::json::exception&) { malformed("arguments are not valid JSON"); }
     calls.back().complete = true;
     in_call = have_name = false;

@@ -37,15 +37,28 @@ memory configuration.
 from the output. `chat_template_kwargs` accepts the booleans `enable_thinking`
 and `preserve_thinking` and rejects every other key; rendering follows the
 built-in Gemma 4 template described in the [bundle guide](models.md). Reasoning is
-returned separately as `reasoning_content`. Chat also accepts `logprobs:true`
+returned separately as `reasoning_content`. For compatibility, chat also accepts
+`reasoning_effort`: `none` disables thinking; `low`, `medium`, and `high` all
+enable it. A supplied value overrides `chat_template_kwargs.enable_thinking`.
+Omission or null keeps the template setting, which defaults to false. This
+changes the thinking switch, not its budget. Chat prefill uses the same mapping.
+Chat also accepts `logprobs:true`
 and `top_logprobs` from 0 through 20; supplying `top_logprobs` requires logprobs
 to be enabled. Raw Completions' integer `logprobs` control is unsupported.
 
 ## Tools and JSON answers
 
 Chat supports function definitions in `tools`, generated `tool_calls`, and
-matching tool-result history. `tool_choice` supports `auto` and `none`;
-required or named selection and strict argument schemas are not implemented.
+matching tool-result history. `tool_choice` supports `auto`, `none`, `required`,
+named functions, and `allowed_tools` subsets. Named selection forces one call;
+`parallel_tool_calls:false` limits the response to at most one call.
+`strict:true` enforces the supported JSON Schema subset for arguments. Each
+strict object requires `additionalProperties:false` and every property in
+`required`; use nullable types for optional values. Unsupported strict assertions
+are rejected before generation. Non-strict schemas retain metadata, references,
+unions, and assertions as prompt guidance; `$schema` string metadata is accepted
+and removed during normalization. JSON argument keys can contain Unicode and
+punctuation.
 The server never executes tools; the client runs them and submits the
 results.
 
@@ -73,8 +86,9 @@ results.
 ```
 
 Constraints apply to the answer channel and work with MTP. Stop strings cannot
-be combined with a constrained response format. If tool definitions are also
-supplied, set `tool_choice:"none"`. Invalid or unsupported schemas receive a
+be combined with a constrained response format. When tool definitions are also
+supplied, `response_format` constrains the answer branch and each tool's schema
+and strictness govern its arguments. Invalid or unsupported strict schemas receive a
 request error. A response stopped by the token limit can still be incomplete.
 
 ## Images
@@ -119,15 +133,15 @@ the configured buffers and timeouts.
 
 Recognized controls are accepted only at their neutral value: `n:1`, zero
 `frequency_penalty`/`presence_penalty`, empty `logit_bias`, and, in chat,
-`store:false`, `modalities:["text"]`, and `parallel_tool_calls:true`. Always
-rejected are `functions`, `function_call`, `reasoning_effort`, and the
+`store:false` and `modalities:["text"]`. Always
+rejected are `functions`, `function_call`, and the
 prompt-cleanup fields `audio`, `moderation`, `prediction`,
 `prompt_cache_retention`, `service_tier`, `verbosity`, and
 `web_search_options`. Each endpoint also rejects the other endpoint's fields:
 chat rejects `prompt`, `echo`, `best_of`, and `suffix`; Completions rejects
 `messages`, `max_completion_tokens`, `chat_template_kwargs`, `top_logprobs`,
 `logprobs`, `response_format`, `tools`, `tool_choice`, `store`, `modalities`,
-and `parallel_tool_calls`, and accepts `echo` and `best_of` only at their
+`parallel_tool_calls`, and `reasoning_effort`, and accepts `echo` and `best_of` only at their
 defaults. Unknown top-level fields are ignored. Nested messages, tools,
 schemas, and cache objects are validated. There is no `/v1/responses`
 endpoint. Error responses include an `x-request-id` for matching server logs;

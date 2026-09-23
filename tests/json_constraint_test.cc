@@ -164,6 +164,88 @@ void masks_and_rollback(const text::Tokenizer& tokenizer, constraint::Compiler& 
   require(state.accept(106) && state.terminated(), "terminal EOS not accepted");
 }
 
+void tool_constraints(const text::Tokenizer& tokenizer, constraint::Compiler& compiler) {
+  const json schema = {{"type", "object"}, {"properties", {
+      {"city name", {{"type", "string"}, {"enum", {"café ☃", "東京"}}}},
+      {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 3}}}}},
+      {"required", {"city name", "count"}}, {"additionalProperties", false}};
+  const json tools = json::array({{{"type", "function"}, {"function", {
+      {"name", "lookup"}, {"strict", true}, {"parameters", schema}}}}});
+  const std::string call = "<|tool_call>call:lookup{\"city name\":\"café ☃\",\"count\":2}<tool_call|>";
+  const auto required = compiler.compile_tools(tools, {"lookup"}, true, true);
+  require(accepts(tokenizer, required, call + "<|tool_response>"), "strict required call rejected");
+  require(accepts(tokenizer, required, call + call + "<|tool_response>"), "parallel calls rejected");
+  for (const auto& text : std::vector<std::string>{"done<turn|>", "<turn|>", "<|tool_response>",
+      call + "<turn|>", "<|tool_call>call:unknown{}<tool_call|><|tool_response>",
+      "<|tool_call>call:lookup{\"city name\":\"café ☃\",\"count\":4}<tool_call|><|tool_response>",
+      "<|tool_call>call:lookup{\"count\":2}<tool_call|><|tool_response>"})
+    require(!accepts(tokenizer, required, text), "invalid required/strict output accepted: " + text);
+  const auto single = compiler.compile_tools(tools, {"lookup"}, true, false);
+  require(accepts(tokenizer, single, call + "<|tool_response>"), "single call rejected");
+  require(!accepts(tokenizer, single, call + call + "<|tool_response>"), "single-call limit ignored");
+  const auto automatic = compiler.compile_tools(tools, {"lookup"}, false, false);
+  require(accepts(tokenizer, automatic, "A plain answer.<turn|>"), "auto cannot answer");
+  require(accepts(tokenizer, automatic, "Looking it up. " + call + "<|tool_response>"), "auto cannot call after content");
+  const auto none = compiler.compile_tools(tools, {}, false, true);
+  require(accepts(tokenizer, none, "A plain answer.<turn|>"), "none cannot answer");
+  require(!accepts(tokenizer, none, call + "<|tool_response>"), "none permits tool calls");
+  const auto answer = compiler.compile({{"type", "object"}, {"properties", {{"ok", {{"const", true}}}}},
+      {"required", {"ok"}}, {"additionalProperties", false}});
+  const auto combined = compiler.compile_tools(tools, {"lookup"}, false, true, answer);
+  require(accepts(tokenizer, combined, "{\"ok\":true}<turn|>"), "combined JSON answer rejected");
+  require(accepts(tokenizer, combined, call + "<|tool_response>"), "combined tool call rejected");
+  require(!accepts(tokenizer, combined, "{\"ok\":false}<turn|>"), "combined answer schema ignored");
+  auto loose = tools;
+  loose[0]["function"]["strict"] = false;
+  require(accepts(tokenizer, compiler.compile_tools(loose, {"lookup"}, true, false),
+      "<|tool_call>call:lookup{\"arbitrary key\":false}<tool_call|><|tool_response>"),
+      "non-strict arguments were constrained to the parameter schema");
+  auto structured = tools;
+  structured[0]["function"]["parameters"] = json::parse(R"({
+    "type":"object", "properties":{
+      "data":{"$ref":"#/$defs/node"},
+      "option":{"anyOf":[{"type":"integer","enum":[1,2]},{"type":"null"}]}
+    }, "required":["data","option"], "additionalProperties":false,
+    "$defs":{"node":{"type":"object","properties":{
+      "children":{"type":"array","items":{"$ref":"#/$defs/node"},"maxItems":2},
+      "name":{"type":["string","null"]}
+    },"required":["children","name"],"additionalProperties":false}}
+  })");
+  const auto recursive = compiler.compile_tools(structured, {"lookup"}, true, false);
+  require(accepts(tokenizer, recursive,
+      "<|tool_call>call:lookup{\"data\":{\"children\":[{\"children\":[],\"name\":null}],\"name\":\"東京\"},\"option\":2}<tool_call|><|tool_response>"),
+      "recursive references, unions, or anyOf rejected in strict arguments");
+  for (const auto& invalid_schema : std::vector<json>{
+      {{"type", "object"}, {"properties", {{"x", {{"type", "string"}}}}}, {"additionalProperties", false}},
+      {{"type", "object"}, {"properties", json::object()}},
+      {{"type", "object"}, {"properties", {{"x", {{"type", "integer"}, {"minimum", 3}, {"maximum", 1}}}}},
+       {"required", {"x"}}, {"additionalProperties", false}},
+      {{"type", "object"}, {"properties", {{"x", {{"type", "string"}, {"pattern", "[a-z]+"}}}}},
+       {"required", {"x"}}, {"additionalProperties", false}}}) {
+    auto invalid = tools;
+    invalid[0]["function"]["parameters"] = invalid_schema;
+    rejects("invalid or unsupported strict arguments", [&] { (void)compiler.compile_tools(invalid, {"lookup"}, true, false); });
+    rejects("invalid unselected strict arguments", [&] { (void)compiler.compile_tools(invalid, {}, false, false); });
+  }
+
+  // Walk and rewind across thinking, name selection, arguments, repeated calls,
+  // and handoff using the same block-mask interface used by MTP.
+  const auto tokens = tokenizer.encode("<|channel>thought\nPlan.<channel|>" + call + call + "<|tool_response>");
+  constraint::State state(required, true);
+  std::vector<std::uint32_t> before(contract.mask_words()), after(before.size());
+  std::vector<std::uint32_t> masks((tokens.size() + 1) * contract.mask_words());
+  state.fill_mask(before.data());
+  state.block_masks(tokens.data(), tokens.size(), masks.data());
+  state.fill_mask(after.data());
+  require(before == after && !state.terminated(), "tool speculation changed committed state");
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    state.fill_mask(after.data());
+    require(std::equal(after.begin(), after.end(), masks.begin() + i * contract.mask_words()), "tool speculative mask differs");
+    require(state.accept(tokens[i]), "committed tool token rejected");
+  }
+  require(state.completed() && state.terminated(), "handoff did not terminate the grammar");
+}
+
 void thinking(const text::Tokenizer& tokenizer, constraint::Compiler& compiler) {
   const auto grammar = compiler.compile({{"type", "object"}});
   constraint::State state(grammar, true);
@@ -357,6 +439,7 @@ int main(int argc, char** argv) {
     object_properties(tokenizer, compiler);
     masks_and_rollback(tokenizer, compiler);
     thinking(tokenizer, compiler);
+    tool_constraints(tokenizer, compiler);
     unicode_bytes(tokenizer, compiler);
     invalid_schemas(compiler);
     std::cout << "Native JSON constraints, token masks, speculative rollback, thinking and Unicode passed\n";

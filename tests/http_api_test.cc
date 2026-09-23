@@ -34,7 +34,7 @@ void rejects(int status, const std::string& param, Function action) {
     require(envelope.at("error").contains("code") && envelope.at("error").contains("type"), "incomplete error envelope");
     return;
   }
-  throw std::runtime_error("invalid request/output was accepted");
+  throw std::runtime_error("invalid request/output was accepted: expected " + std::to_string(status) + " " + param);
 }
 
 http::Request parse(const text::Tokenizer& tokenizer, constraint::Compiler& compiler, const json& body,
@@ -142,7 +142,7 @@ void request_cases(const text::Tokenizer& tokenizer, constraint::Compiler& compi
   }
   for (const auto& [key, value] : std::vector<std::pair<std::string, json>>{
       {"logprobs", 0}, {"top_logprobs", 1}, {"tools", json::array({json::object()})},
-      {"tool_choice", "required"}, {"parallel_tool_calls", false},
+      {"tool_choice", "required"}, {"parallel_tool_calls", "false"},
       {"modalities", json::array({"audio"})}, {"store", true}, {"echo", false}}) {
     auto body = chat_body;
     body[key] = value;
@@ -193,6 +193,52 @@ void request_cases(const text::Tokenizer& tokenizer, constraint::Compiler& compi
   require(http::immediate_json(health, kModel, 42, true)["status"] == "ok", "ready health mismatch");
   const auto models = http::parse_request("GET", "/v1/models", "", tokenizer, kModel, compiler);
   require(http::immediate_json(models, kModel, 42, true)["data"][0] == http::model_json(kModel, 42), "model list mismatch");
+}
+
+void reasoning_effort_cases(const text::Tokenizer& tokenizer, constraint::Compiler& compiler) {
+  const json messages = json::array({{{"role", "user"}, {"content", "Hi"}}});
+  const json base = {{"model", kModel}, {"messages", messages}};
+  require(!parse(tokenizer, compiler, base, "/v1/chat/completions").enable_thinking,
+          "omitted reasoning effort enabled thinking by default");
+  for (const auto& effort : std::vector<json>{nullptr, "none", "low", "medium", "high"}) {
+    auto body = base;
+    body["reasoning_effort"] = effort;
+    const bool thinking = !effort.is_null() && effort != "none";
+    const auto request = parse(tokenizer, compiler, body, "/v1/chat/completions");
+    auto native = base;
+    native["chat_template_kwargs"] = {{"enable_thinking", thinking}};
+    require(request.enable_thinking == thinking &&
+                *request.prompt == *parse(tokenizer, compiler, native, "/v1/chat/completions").prompt,
+            "reasoning effort differs from native thinking prompt");
+    const auto prefill = parse(tokenizer, compiler, body, "/v1/cache/prefill");
+    require(prefill.enable_thinking == thinking && *prefill.prompt == *request.prompt,
+            "reasoning effort prefill and generation prompts differ");
+    if (!effort.is_null()) {
+      body["chat_template_kwargs"] = {{"enable_thinking", !thinking}, {"preserve_thinking", true}};
+      native["chat_template_kwargs"]["preserve_thinking"] = true;
+      const auto overridden = parse(tokenizer, compiler, body, "/v1/chat/completions");
+      require(overridden.enable_thinking == thinking &&
+                  *overridden.prompt == *parse(tokenizer, compiler, native, "/v1/chat/completions").prompt,
+              "explicit reasoning effort did not override enable_thinking");
+    }
+  }
+  for (bool supplied_null : {false, true}) {
+    auto body = base;
+    body["chat_template_kwargs"] = {{"enable_thinking", true}};
+    if (supplied_null) body["reasoning_effort"] = nullptr;
+    require(parse(tokenizer, compiler, body, "/v1/chat/completions").enable_thinking,
+            "omitted/null reasoning effort changed explicit template setting");
+  }
+  for (const auto& value : std::vector<json>{"", "minimal", "xhigh", "HIGH", true, 1, json::array(), json::object()}) {
+    auto body = base;
+    body["reasoning_effort"] = value;
+    for (const auto* route : {"/v1/chat/completions", "/v1/cache/prefill"})
+      rejects(400, "reasoning_effort", [&] { (void)parse(tokenizer, compiler, body, route); });
+  }
+  for (const auto* route : {"/v1/completions", "/v1/cache/prefill"})
+    rejects(400, "reasoning_effort", [&] {
+      (void)parse(tokenizer, compiler, {{"model", kModel}, {"prompt", "Hi"}, {"reasoning_effort", "low"}}, route);
+    });
 }
 
 void image_request_cases(const text::Tokenizer& tokenizer, constraint::Compiler& compiler) {
@@ -683,6 +729,30 @@ void tool_request_cases(const text::Tokenizer& tokenizer, constraint::Compiler& 
   const auto automatic = parse(tokenizer, compiler, body, "/v1/chat/completions");
   require(automatic.allow_tool_calls && automatic.tool_names == std::vector<std::string>({"weather", "sum"}),
           "tool defaults or function names differ");
+  body["tools"][0]["function"]["parameters"]["properties"] = {
+      {"locations", {{"type", "array"}, {"items", {{"type", "object"},
+          {"properties", {{"city", {{"type", "string"}}}}}}}}}};
+  const auto schema_prompt = parse(tokenizer, compiler, body, "/v1/chat/completions").prompt;
+  const auto unannotated = body;
+  for (const auto* dialect : {"http://json-schema.org/draft-07/schema#",
+                              "https://json-schema.org/draft/2020-12/schema"}) {
+    for (const auto* path : {"/tools/0/function/parameters",
+                             "/tools/0/function/parameters/properties/locations/items",
+                             "/tools/0/function/parameters/properties/locations/items/properties/city"}) {
+      body = unannotated;
+      auto& schema = body[json::json_pointer(path)];
+      schema["$schema"] = dialect;
+      const auto annotated = parse(tokenizer, compiler, body, "/v1/chat/completions");
+      require(annotated.allow_tool_calls && annotated.tool_names == automatic.tool_names &&
+                  *annotated.prompt == *schema_prompt,
+              "tool schema dialect changed the prompt or tool controls");
+      for (const auto& value : std::vector<json>{nullptr, false, 7, json::array(), json::object()}) {
+        schema["$schema"] = value;
+        rejects(400, "tools", [&] { (void)parse(tokenizer, compiler, body, "/v1/chat/completions"); });
+      }
+    }
+  }
+  body = tool_body();
   body["tool_choice"] = "none";
   body["parallel_tool_calls"] = true;
   const auto none = parse(tokenizer, compiler, body, "/v1/chat/completions");
@@ -691,7 +761,7 @@ void tool_request_cases(const text::Tokenizer& tokenizer, constraint::Compiler& 
           "tool_choice none retained current declarations");
   const auto prefill = parse(tokenizer, compiler, body, "/v1/cache/prefill");
   require(prefill.chat && *prefill.prompt == *none.prompt, "prefill tool prompt differs");
-  for (const auto& choice : {json("required"), json{{"type", "function"}, {"function", {{"name", "weather"}}}}, json(true)}) {
+  for (const auto& choice : {json("unknown"), json{{"type", "function"}, {"function", {{"name", "unknown"}}}}, json(true)}) {
     body["tool_choice"] = choice;
     rejects(400, "tool_choice", [&] { (void)parse(tokenizer, compiler, body, "/v1/chat/completions"); });
   }
@@ -700,6 +770,8 @@ void tool_request_cases(const text::Tokenizer& tokenizer, constraint::Compiler& 
   body = tool_body(); body["tools"].push_back(body["tools"][0]);
   rejects(400, "tools", [&] { (void)parse(tokenizer, compiler, body, "/v1/chat/completions"); });
   body = tool_body(); body["parallel_tool_calls"] = false;
+  require(bool(parse(tokenizer, compiler, body, "/v1/chat/completions").constraint), "single-call control was not compiled");
+  body["parallel_tool_calls"] = "false";
   rejects(400, "parallel_tool_calls", [&] { (void)parse(tokenizer, compiler, body, "/v1/chat/completions"); });
   body = tool_body();
   body["messages"].push_back({{"role", "assistant"}, {"content", nullptr}, {"tool_calls", json::array({
@@ -808,7 +880,6 @@ void tool_output_cases(const text::Tokenizer& tokenizer, constraint::Compiler& c
       "<|tool_call>call:unknown{}<tool_call|><|tool_response>",
       "<|tool_call>call:weather{x:wat}<tool_call|><|tool_response>",
       "<|tool_call>call:weather{key name:1}<tool_call|><|tool_response>",
-      "<|tool_call>call:weather{<|\"|>世界<|\"|>:1}<tool_call|><|tool_response>",
       "<|tool_call>call:weather{x:1<tool_call|>",
       "<|tool_call>call:weather{}<turn|>",
       "<|tool_call>call:weather{}<tool_call|><turn|>",
@@ -917,7 +988,7 @@ void schema_cases(const text::Tokenizer& tokenizer, constraint::Compiler& compil
   bad = base; bad["stop"] = "blue";
   rejects(400, "stop", [&] { (void)parse(tokenizer, compiler, bad, "/v1/chat/completions"); });
   bad = base; bad["tools"] = tool_declarations();
-  rejects(400, "response_format", [&] { (void)parse(tokenizer, compiler, bad, "/v1/chat/completions"); });
+  require(bool(parse(tokenizer, compiler, bad, "/v1/chat/completions").constraint), "tools blocked JSON answer constraints");
   bad["tool_choice"] = "none";
   require(bool(parse(tokenizer, compiler, bad, "/v1/chat/completions").constraint), "disabled tools blocked JSON finalization");
   rejects(400, "response_format", [&] { (void)parse(tokenizer, compiler,
@@ -1028,6 +1099,7 @@ int main(int argc, char** argv) {
     constraint::Compiler compiler(tokenizer, 1279);
     explicit_contract_limits();
     request_cases(tokenizer, compiler);
+    reasoning_effort_cases(tokenizer, compiler);
     image_request_cases(tokenizer, compiler);
     cache_cases(tokenizer, compiler);
     completion_cases(tokenizer, compiler);

@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace gewell::constraint {
 
@@ -35,6 +37,14 @@ class Compiler {
   Compiler(const text::Tokenizer& tokenizer, std::uint32_t maximum_speculative_depth);
   ~Compiler();
   [[nodiscard]] std::shared_ptr<const Compiled> compile(const nlohmann::json& schema);
+  // Constrain function selection, JSON arguments, call count, and handoff.
+  // Non-strict functions use generic JSON objects; strict functions use their
+  // parameter schemas. Validate all declarations, then allow only selected names.
+  // An optional answer grammar applies only to text output.
+  [[nodiscard]] std::shared_ptr<const Compiled> compile_tools(
+      const nlohmann::json& tools, const std::vector<std::string>& selected,
+      bool required, bool parallel,
+      std::shared_ptr<const Compiled> answer = {});
 
  private:
   struct Impl;

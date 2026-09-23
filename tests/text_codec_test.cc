@@ -235,6 +235,47 @@ void repeated_inputs(const text::Tokenizer& tokenizer) {
               !tokenizer.is_special(238), "special-token inventory differs");
 }
 
+void schema_tools() {
+  auto schema = json::parse(R"({
+    "$schema":"https://json-schema.org/draft/2020-12/schema",
+    "title":"Generated SDK schema", "description":"Root description", "type":"object",
+    "$defs":{"value":{"type":"integer","minimum":0}},
+    "properties":{
+      "query":{"type":["string","null"],"default":null,"examples":["東京"]},
+      "count":{"$ref":"#/$defs/value"},
+      "mode":{"enum":[1,2,null]},
+      "variant":{"anyOf":[{"const":true},{"type":"string","pattern":"^[a-z]+$"}]},
+      "encoded":{"type":"string","contentMediaType":"application/json",
+        "contentSchema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"integer"}},
+      "free":{"type":"array"},
+      "世界 key":{"type":"object","properties":{},"additionalProperties":{"type":"string"}},
+      "$schema":{"type":"string"}
+    },
+    "default":{"type":"string","$schema":"application data"},
+    "dependencies":{"query":["count"], "count":{"$schema":"http://json-schema.org/draft-07/schema#",
+      "type":"object","properties":{"query":{"type":"string"}}}},
+    "required":["query"],"additionalProperties":false
+  })");
+  const auto tools = contract.normalize_tools(json::array({{{"type", "function"},
+      {"function", {{"name", "lookup"}, {"parameters", schema}}}}}));
+  schema.erase("$schema");
+  schema["properties"]["encoded"]["contentSchema"].erase("$schema");
+  schema["dependencies"]["count"].erase("$schema");
+  expect_equal(tools[0]["function"]["parameters"], schema, "SDK schema assertions and annotation data preserved");
+  const auto rendered = contract.render_chat(contract.normalize_messages(
+      json::array({{{"role", "user"}, {"content", "lookup"}}})), {}, tools);
+  for (const char* text : {"#/$defs/value", "anyOf", "^[a-z]+$", "Root description", "世界 key", "application data"})
+    require(rendered.find(text) != std::string::npos, std::string("schema detail missing from prompt: ") + text);
+  const json arguments = {{"世界 key", {{"", 1}, {"a.b", true}}}, {"$schema", "value"}};
+  const auto messages = contract.normalize_messages(json::array({
+      {{"role", "assistant"}, {"content", nullptr}, {"tool_calls", json::array({
+          {{"id", "call"}, {"type", "function"}, {"function", {{"name", "lookup"}, {"arguments", arguments.dump()}}}}
+      })}}, {{"role", "tool"}, {"tool_call_id", "call"}, {"content", "done"}}}));
+  expect_equal(messages[0].tool_calls[0].arguments, arguments, "arbitrary JSON argument keys preserved");
+  require(contract.render_chat(messages).find("<|\"|>世界 key<|\"|>") != std::string::npos,
+          "non-identifier argument keys were not quoted");
+}
+
 void invalid_tools() {
   const auto tools = json::parse(R"([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}])");
   expect_equal(contract.normalize_tools(nullptr), json::array(), "null tools");
@@ -245,20 +286,20 @@ void invalid_tools() {
   rejects("duplicate function names", [&] { (void)contract.normalize_tools(duplicate); });
   for (const auto& [key, value] : std::vector<std::pair<std::string, json>>{
       {"name", ""}, {"name", "has space"}, {"name", "函数"}, {"name", std::string(65, 'x')},
-      {"description", 1}, {"strict", true}, {"strict", 0}, {"unknown", nullptr},
+      {"description", 1}, {"strict", 0}, {"unknown", nullptr},
       {"parameters", json::array()}, {"parameters", {{"type", "string"}}},
-      {"parameters", {{"type", "object"}, {"additionalProperties", json::object()}}},
-      {"parameters", {{"type", "object"}, {"required", json::array({"missing"})}}}}) {
+      {"parameters", {{"type", "object"}, {"additionalProperties", 1}}},
+      {"parameters", {{"type", "object"}, {"required", json::array({"query", "query"})}}}}) {
     auto invalid = tools;
     invalid[0]["function"][key] = value;
     rejects("invalid tool function " + key, [&] { (void)contract.normalize_tools(invalid); });
   }
   for (const auto& schema : std::vector<json>{
-      {{"type", json::array({"string", "null"})}}, {{"type", "String"}}, {{"$ref", "#/$defs/value"}},
-      {{"type", "integer"}, {"minimum", 0}}, {{"type", "integer"}, {"enum", json::array({1})}},
+      {{"type", json::array({"string", "string"})}}, {{"type", "String"}}, {{"$ref", 1}},
+      {{"type", "integer"}, {"minimum", "0"}}, {{"type", "integer"}, {"enum", 1}},
       {{"type", "string"}, {"nullable", 1}}, {{"type", "string"}, {"enum", json::array()}},
-      {{"type", "array"}}, {{"type", "object"}, {"properties", {{"bad key", {{"type", "string"}}}}}},
-      {{"type", "object"}, {"properties", {{"é", {{"type", "string"}}}}}}}) {
+      {{"type", "array"}, {"items", 1}}, {{"type", "object"}, {"properties", json::array()}},
+      {{"anyOf", json::array()}}}) {
     auto invalid = tools;
     invalid[0]["function"]["parameters"]["properties"]["query"] = schema;
     rejects("unsupported property schema " + schema.dump(), [&] { (void)contract.normalize_tools(invalid); });
@@ -305,8 +346,7 @@ void invalid_tools() {
     changed[1][key] = value;
     bad_histories.push_back(changed);
   }
-  for (const auto& arguments : std::vector<json>{"{", "[]", "null", json::array(), nullptr,
-                                                {{"bad key", 1}}, {{"é", 1}}}) {
+  for (const auto& arguments : std::vector<json>{"{", "[]", "null", json::array(), nullptr}) {
     changed = history;
     changed[1]["tool_calls"][0]["function"]["arguments"] = arguments;
     bad_histories.push_back(changed);
@@ -343,6 +383,7 @@ int main(int argc, char** argv) {
     golden_cases(tokenizer, fixture);
     invalid_inputs(tokenizer);
     invalid_tools();
+    schema_tools();
     repeated_inputs(tokenizer);
     std::cout << "text codec: " << fixture.at("raw").size() << " raw, "
               << fixture.at("chat").size() << " chat, "

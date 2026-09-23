@@ -320,11 +320,12 @@ struct Compiled::Impl {
   std::shared_ptr<const std::vector<std::uint32_t>> ordinary_mask;
   std::shared_ptr<const ByteTokens> byte_tokens;
   std::size_t bytes;
+  bool tool_mode;
   Impl(xgrammar::CompiledGrammar compiled, std::shared_ptr<const std::vector<std::uint32_t>> mask,
        std::shared_ptr<const ByteTokens> tokens, const text::TextContract& text_contract,
-       std::uint32_t maximum_depth)
+       std::uint32_t maximum_depth, bool tools = false)
       : contract(text_contract), maximum_speculative_depth(maximum_depth), grammar(std::move(compiled)), ordinary_mask(std::move(mask)), byte_tokens(std::move(tokens)),
-        bytes(grammar.MemorySizeBytes()) {}
+        bytes(grammar.MemorySizeBytes()), tool_mode(tools) {}
 };
 
 struct Compiler::Impl {
@@ -332,6 +333,7 @@ struct Compiler::Impl {
   std::uint32_t maximum_speculative_depth;
   xgrammar::TokenizerInfo tokenizer_info;
   xgrammar::GrammarCompiler compiler;
+  std::unique_ptr<xgrammar::GrammarCompiler> tool_compiler;
   std::shared_ptr<const std::vector<std::uint32_t>> ordinary_mask;
   std::shared_ptr<const ByteTokens> byte_tokens;
   std::mutex mutex;
@@ -391,6 +393,95 @@ std::shared_ptr<const Compiled> Compiler::compile(const json& schema) {
   catch (const std::exception& error) { invalid("schema", error.what()); }
 }
 
+namespace {
+void strict_objects(const json& schema) {
+  if (!schema.is_object()) return;
+  const auto types = schema_types(schema, "schema");
+  if (types.count("object")) {
+    if (!schema.contains("additionalProperties") || schema["additionalProperties"] != false)
+      invalid("schema.additionalProperties", "strict objects require false");
+    const auto properties = schema.value("properties", json::object());
+    const auto required = schema.value("required", json::array());
+    if (required.size() != properties.size())
+      invalid("schema.required", "strict objects require every property");
+  }
+  for (const char* key : {"properties", "$defs", "definitions", "anyOf", "prefixItems"})
+    if (schema.contains(key)) for (const auto& child : schema[key]) strict_objects(child);
+  for (const char* key : {"items", "additionalProperties"})
+    if (schema.contains(key)) strict_objects(schema[key]);
+}
+}  // namespace
+
+std::shared_ptr<const Compiled> Compiler::compile_tools(
+    const json& tools, const std::vector<std::string>& selected,
+    bool required, bool parallel, std::shared_ptr<const Compiled> answer) {
+  try {
+    std::vector<xgrammar::NamedGrammar> arguments;
+    std::string calls;
+    for (std::size_t i = 0; i < tools.size(); ++i) {
+      const auto& function = tools[i].at("function");
+      json schema = {{"type", "object"}};
+      if (function.value("strict", false)) {
+        schema = normalize_schema(function.at("parameters"));
+        strict_objects(function.at("parameters"));
+      }
+      auto argument = xgrammar::Grammar::FromJSONSchema(
+          schema.dump(), true, std::nullopt, std::nullopt, false, 16);
+      const auto name = function.at("name").get<std::string>();
+      if (std::find(selected.begin(), selected.end(), name) == selected.end()) continue;
+      arguments.push_back({"args" + std::to_string(i), std::move(argument)});
+      if (!calls.empty()) calls += " | ";
+      calls += json("call:" + name).dump() + " @args" + std::to_string(i);
+    }
+    if (required && calls.empty()) invalid("tools", "required selection needs a function");
+    const auto token = [](std::uint32_t id) { return "<[" + std::to_string(id) + "]>"; };
+    const auto& contract = impl_->contract;
+    std::string eos;
+    for (auto id : contract.constraint_stop_tokens) {
+      if (!eos.empty()) eos += " | ";
+      eos += token(id);
+    }
+    std::string grammar = "start: ";
+    if (required) grammar += "tool_turn\n";
+    else if (answer) {
+      arguments.push_back({"answer", answer->impl_->grammar.GetGrammar()});
+      grammar += "@answer eos" + std::string(calls.empty() ? "\n" : " | tool_turn\n");
+    } else {
+      grammar += calls.empty() ? "text eos\n" : "text (eos | tool_turn)\n";
+      grammar += "text: /[^\\x00]*/\n";
+    }
+    grammar += "eos: " + eos + "\n";
+    if (!calls.empty()) {
+      grammar += "tool_turn: call" + std::string(parallel ? " ~ 1..128 " : " ") + token(contract.tool_handoff) + "\n";
+      grammar += "call: " + token(contract.tool_call_start) + " (" + calls + ") " + token(contract.tool_call_end) + "\n";
+    }
+    auto parsed = xgrammar::Grammar::FromLark(grammar, std::nullopt, arguments);
+    std::lock_guard lock(impl_->mutex);
+    if (!impl_->tool_compiler) {
+      auto vocabulary = impl_->tokenizer_info.GetDecodedVocab();
+      // Nonempty placeholders make boundary tokens available to XGrammar's
+      // atomic token rules. NUL cannot match JSON or the ordinary-text rule,
+      // so a boundary token cannot masquerade as argument/content bytes.
+      for (auto id : contract.constraint_stop_tokens) vocabulary[id] = std::string(1, '\0');
+      for (auto id : {contract.tool_call_start, contract.tool_call_end, contract.tool_handoff})
+        vocabulary[id] = std::string(1, '\0');
+      xgrammar::TokenizerInfo info(vocabulary, xgrammar::VocabType::RAW, contract.vocabulary_size,
+                                  std::vector<std::int32_t>{int(contract.bos)}, false);
+      impl_->tool_compiler = std::make_unique<xgrammar::GrammarCompiler>(info, 1, true, kCacheBytes);
+    }
+    auto compiled = impl_->tool_compiler->CompileGrammar(parsed);
+    auto mask = std::make_shared<std::vector<std::uint32_t>>(*impl_->ordinary_mask);
+    for (auto id : contract.constraint_stop_tokens) set_bit(mask->data(), id);
+    for (auto id : {contract.tool_call_start, contract.tool_call_end, contract.tool_handoff})
+      set_bit(mask->data(), id);
+    return std::shared_ptr<const Compiled>(new Compiled(std::make_shared<const Compiled::Impl>(
+        std::move(compiled), std::move(mask), impl_->byte_tokens, contract,
+        impl_->maximum_speculative_depth, true)));
+  } catch (const std::bad_alloc&) { throw; }
+  catch (const std::invalid_argument&) { throw; }
+  catch (const std::exception& error) { invalid("tools", error.what()); }
+}
+
 struct State::Impl {
   enum class Phase { begin, thinking, answer };
   std::shared_ptr<const Compiled> compiled;
@@ -399,13 +490,17 @@ struct State::Impl {
   std::uint64_t grammar_steps = 0;
   Utf8 utf8;
   Impl(std::shared_ptr<const Compiled> value, bool allow_thinking, bool initial_reasoning)
-      : compiled(std::move(value)), matcher(compiled->impl_->grammar, std::nullopt, false, compiled->impl_->maximum_speculative_depth + 1),
+      : compiled(std::move(value)), matcher(compiled->impl_->grammar, std::nullopt,
+          compiled->impl_->tool_mode, compiled->impl_->maximum_speculative_depth + 1),
         phase(initial_reasoning ? Phase::thinking : allow_thinking ? Phase::begin : Phase::answer) {}
 
   void fill_mask(std::uint32_t* mask) {
     if (matcher.IsTerminated()) throw std::logic_error("cannot mask a terminated JSON constraint");
     if (phase == Phase::thinking) {
       std::copy(compiled->impl_->ordinary_mask->begin(), compiled->impl_->ordinary_mask->end(), mask);
+      for (auto id : compiled->impl_->contract.stop_tokens) clear_bit(mask, id);
+      clear_bit(mask, compiled->impl_->contract.tool_call_start);
+      clear_bit(mask, compiled->impl_->contract.tool_call_end);
       set_bit(mask, compiled->impl_->contract.channel_end);
       return;
     }
@@ -418,6 +513,8 @@ struct State::Impl {
     if (token >= compiled->impl_->contract.vocabulary_size || matcher.IsTerminated()) return false;
     if (phase == Phase::thinking) {
       if (token == compiled->impl_->contract.channel_end) { phase = Phase::answer; return true; }
+      if (compiled->impl_->contract.is_stop(token) || token == compiled->impl_->contract.tool_call_start ||
+          token == compiled->impl_->contract.tool_call_end) return false;
       return has_bit(compiled->impl_->ordinary_mask->data(), token);
     }
     if (phase == Phase::begin && token == compiled->impl_->contract.channel_start) { phase = Phase::thinking; return true; }
