@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.25)
 
 project(gewell LANGUAGES CXX)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 include(CTest)
 option(GEWELL_ENABLE_CUDA "Build the SM120 runtime and GPU tests" ON)
 option(GEWELL_BUILD_DIAGNOSTICS "Build fixed oracle and profiling runners" ON)
