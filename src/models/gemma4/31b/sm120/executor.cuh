@@ -177,6 +177,8 @@ struct BatchMtpInput {
   bool return_probabilities{};
   std::vector<float> uniforms;
   std::function<void(const std::uint32_t*, std::uint32_t, std::uint32_t*)> constraint_mask;
+  MtpCaptureFeatures* capture{};
+  MtpTargetProbes* capture_next{};
 };
 
 struct BatchMtpCommitInput {
@@ -220,7 +222,8 @@ class Executor {
                           kv_cache::Format local_format = kv_cache::Format::bf16,
                           kv_cache::Format global_format = kv_cache::Format::bf16,
                           attention::Compute local_compute = attention::Compute::bf16,
-                          attention::Compute global_compute = attention::Compute::bf16)
+                          attention::Compute global_compute = attention::Compute::bf16,
+                          std::uint32_t packed_rows = 0)
       : weights_(weights),
         activation_policy_(activation_policy),
         prompt_tokens_(prompt_tokens),
@@ -232,13 +235,13 @@ class Executor {
         persistent_cache_(persistent_cache),
         persistent_execution_(persistent_execution),
         checkpoint_triggers_(std::move(checkpoint_triggers)),
-        scratch_layout_(std::max(kMultimodalChunkTokens, checked_prefill_chunk_tokens(chunk_cap))),
+        scratch_layout_(std::max({kMultimodalChunkTokens, checked_prefill_chunk_tokens(chunk_cap), packed_rows})),
         scratch_(scratch_layout_.kBytes),
         attention_scratch_(std::max(decode_attention_scratch_bytes(global_capacity_, decode_batch_capacity),
             local_compute == attention::Compute::fp8 || global_compute == attention::Compute::fp8
                 ? mtp_attention::scratch_bytes(1, global_capacity_) : std::size_t{0})),
         prefill_attention_scratch_(prefill::tensor_attention_scratch_bytes(
-            std::max(prefill_chunk_tokens_, chunk_cap))),
+            std::max({prefill_chunk_tokens_, chunk_cap, kMultimodalChunkTokens}))),
         caches_(global_capacity_, persistent_cache, persistent_execution, local_format, global_format),
         outputs_(static_cast<std::size_t>(new_token_count) *
                  sizeof(std::uint32_t)),
@@ -469,6 +472,40 @@ class Executor {
     }
   }
 
+  void prefill_batch(const std::vector<runtime::BatchPrefillInput>& inputs,
+                     const std::vector<VisionPromptSlice>& images) {
+    if (inputs.empty() || inputs.size() > batch_capacity_ ||
+        (!images.empty() && images.size() != inputs.size()))
+      fail("packed prefill", "invalid segment count");
+    std::vector<PrefillSegment> segments;
+    std::uint32_t rows = 0;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      const auto& input = inputs[i];
+      const auto* vision = !images.empty() && images[i].soft_features ? &images[i] : nullptr;
+      if (!input.execution || !input.tokens || !input.rows || !input.hidden ||
+          input.rows > scratch_layout_.kRows - rows)
+        fail("packed prefill", "invalid segment or workspace capacity");
+      for (const auto& prior : segments)
+        if (prior.execution == input.execution)
+          fail("packed prefill", "an execution may occur only once per forward");
+      if (vision && (vision->begin != input.position || vision->end - vision->begin != input.rows))
+        fail("packed prefill", "image segment must contain exactly one whole image");
+      segments.push_back({input.tokens, input.position, input.rows, rows, input.execution, vision});
+      rows += input.rows;
+    }
+    for (const auto& input : inputs)
+      persistent_cache_->prepare_write(input.execution, input.position, input.rows, stream_.get());
+    prefill_chunks(segments, rows, plans_for(rows), false);
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      const auto& segment = segments[i];
+      primitives::rms_norm(
+          at<BFloat16>(scratch_layout_.kH0) +
+              std::size_t(segment.offset + segment.rows - 1) * model::kHiddenSize,
+          weights_.pointer(model::kFinalNormPhysicalId),
+          static_cast<BFloat16*>(inputs[i].hidden.value), 1, model::kHiddenSize, 1.0e-6F, stream_.get());
+    }
+  }
+
   void prefix_head_step(kv_cache::ExecutionId execution,
                         BFloat16* saved_hidden = nullptr,
                         const BFloat16* input_hidden = nullptr) {
@@ -506,6 +543,8 @@ class Executor {
       proposal.return_probabilities = input.return_probabilities;
       proposal.constraint_mask = input.constraint_mask;
       proposal.uniforms = input.uniforms;
+      proposal.capture = input.capture;
+      proposal.capture_next = input.capture_next;
       proposals.push_back(std::move(proposal));
     }
     return batch_mtp_->run(proposals, stream_.get());
@@ -1128,6 +1167,13 @@ class Executor {
   }
 
  private:
+  struct PrefillSegment {
+    const std::uint32_t* tokens;
+    std::uint32_t position, rows, offset;
+    kv_cache::ExecutionId execution;
+    const VisionPromptSlice* vision;
+  };
+
   std::size_t native_scratch_bytes() const {
     return (nvfp4_projections_ ? nvfp4_projections_->scratch_bytes() : 0) +
            (fp8_projections_ ? fp8_projections_->scratch_bytes() : 0);
@@ -1276,14 +1322,17 @@ class Executor {
                      std::uint32_t rows, const RuntimeChunkPlans& plans,
                      bool produce_token, const VisionPromptSlice* vision,
                      kv_cache::ExecutionId execution = 0) {
-    if (!rows || rows > scratch_layout_.kRows ||
-        (!vision && prefill::tensor_attention_scratch_bytes(rows) > prefill_attention_scratch_.size()))
+    prefill_chunks({{tokens, base_position, rows, 0, execution, vision}}, rows, plans, produce_token);
+  }
+
+  void prefill_chunks(const std::vector<PrefillSegment>& segments,
+                      std::uint32_t rows, const RuntimeChunkPlans& plans, bool produce_token) {
+    if (!rows || rows > scratch_layout_.kRows)
       fail("prefill chunk", "row count exceeds the configured workspace");
-    // The attention size sweep favors tensor operations from 32 cold rows,
-    // and even for one row with at least 1024 cached tokens. Tiny cold
-    // chunks retain the warp path to avoid the extra launch overhead.
-    const bool tensor_attention = rows <= prefill::kTensorAttentionMaximumQueryRows &&
-        (rows >= 32 || base_position >= 1024);
+    for (const auto& segment : segments)
+      if (!segment.rows ||
+          prefill::tensor_attention_scratch_bytes(segment.rows) > prefill_attention_scratch_.size())
+        fail("prefill chunk", "segment exceeds the configured attention workspace");
     if (nvfp4_projections_) nvfp4_projections_->prepare(rows);
     if (fp8_projections_) fp8_projections_->prepare(rows);
     BFloat16* const h0 = at<BFloat16>(scratch_layout_.kH0);
@@ -1326,24 +1375,27 @@ class Executor {
         at<BFloat16>(scratch_layout_.kGlobalSin);
     const cudaStream_t stream = stream_.get();
 
-    prefill::generate_rope_factors_chunk(
-        local_cos, local_sin, global_cos, global_sin, base_position, rows,
-        stream);
-    primitives::embedding_lookup_host_tokens(
-        weights_.pointer(model::kEmbeddingPhysicalId), tokens, h0, rows, stream);
-    if (vision != nullptr) {
-      const std::size_t feature_bytes =
-          static_cast<std::size_t>(vision->end - vision->begin) *
-          model::kHiddenSize * sizeof(BFloat16);
-      check_cuda(cudaMemcpyAsync(
-                     h0 + static_cast<std::size_t>(vision->begin -
-                                                   base_position) *
-                              model::kHiddenSize,
-                     vision->soft_features, feature_bytes,
-                     cudaMemcpyDeviceToDevice, stream),
-                 "insert vision soft features");
+    for (const auto& segment : segments) {
+      prefill::generate_rope_factors_chunk(
+          local_cos + std::size_t(segment.offset) * model::kLocalHeadSize,
+          local_sin + std::size_t(segment.offset) * model::kLocalHeadSize,
+          global_cos + std::size_t(segment.offset) * model::kGlobalHeadSize,
+          global_sin + std::size_t(segment.offset) * model::kGlobalHeadSize,
+          segment.position, segment.rows, stream);
+      primitives::embedding_lookup_host_tokens(
+          weights_.pointer(model::kEmbeddingPhysicalId), segment.tokens,
+          h0 + std::size_t(segment.offset) * model::kHiddenSize, segment.rows, stream);
+      if (const auto* vision = segment.vision) {
+        check_cuda(cudaMemcpyAsync(
+            h0 + std::size_t(segment.offset + vision->begin - segment.position) * model::kHiddenSize,
+            vision->soft_features,
+            std::size_t(vision->end - vision->begin) * model::kHiddenSize * sizeof(BFloat16),
+            cudaMemcpyDeviceToDevice, stream), "insert vision soft features");
+      }
     }
 
+    std::vector<primitives::QkvRopeInput> qkv_inputs;
+    qkv_inputs.reserve(segments.size());
     primitives::rms_norm(h0, layers_[0].input_norm, h1, rows,
                          model::kHiddenSize, 1.0e-6F, stream);
     for (std::uint32_t layer = 0; layer < model::kLayerCount; ++layer) {
@@ -1353,102 +1405,130 @@ class Executor {
       const std::uint32_t kv_heads =
           global ? model::kGlobalKvHeadCount : model::kLocalKvHeadCount;
       const LayerWeights& weight = layers_[layer];
-      const LayerCacheView cache = execution != 0
-          ? persistent_cache_->layer(execution, layer) : caches_.layer(layer);
       const BFloat16* const cosine = global ? global_cos : local_cos;
       const BFloat16* const sine = global ? global_sin : local_sin;
 
+      const auto d = global ? model::kGlobalHeadSize : model::kLocalHeadSize;
+      const auto query_width = model::kQueryHeadCount * d;
+      const auto kv_width = kv_heads * d;
       const auto fp8_joined = gewell::fp8::qkv_weight(weights_.fp8_weights(), layer);
-      if (const auto* joined = fusion::qkv_weight(weights_.pointers(), layer)) {
+      const auto* joined = fusion::qkv_weight(weights_.pointers(), layer);
+      if (joined) {
         plans.qkv(global).run(handle_.get(), h1, joined, q_raw, stream);
-        primitives::qkv_rms_rope_batch(
-            {{q_raw, cosine, sine, q_rope, k_rope, v_norm, rows}},
-            weight.q_norm, weight.k_norm, kind, stream);
       } else if (fp8_joined.data) {
         fp8_projections_->run_joined(rows, fusion::qkv_width(global), h1, fp8_joined, q_raw, stream);
-        primitives::qkv_rms_rope_batch(
-            {{q_raw, cosine, sine, q_rope, k_rope, v_norm, rows}},
-            weight.q_norm, weight.k_norm, kind, stream);
       } else {
         project_qkv(plans, rows, layer, h1, q_raw, k_raw, v_raw,
                     q_norm, k_norm, v_norm, stream, gewell::nvfp4::Phase::prefill);
-        prefill::apply_rope_transpose_chunk(
-            q_norm, cosine, sine, q_rope, model::kQueryHeadCount, rows, kind, stream);
-        prefill::apply_rope_transpose_chunk(k_norm, cosine, sine, k_rope,
-                                            kv_heads, rows, kind, stream);
       }
-      if (global) {
-        if (cache.page_pool != nullptr) {
-          const prefill::CompactGlobalPagedCache paged_cache{
-              cache.page_pool,
-              cache.page_offsets,
-              cache.page_tokens,
-              cache.page_count,
-              cache.page_stride_elements,
-              cache.layer_offset_elements,
-              cache.format,
-          };
-          if (vision != nullptr) {
-            prefill::image_block_gqa_attention_cached_chunk_global_compact_paged(
-                q_rope, k_rope, v_norm, paged_cache, weight.k_norm,
-                base_position, rows, vision->begin, vision->end, context,
-                stream);
-          } else if (tensor_attention || global_compute_ == attention::Compute::fp8) {
-            prefill::
-                causal_gqa_attention_cached_chunk_tensor_global_compact_paged(
-                    prefill_attention_handle_.get(), q_rope, k_rope,
-                    v_norm, paged_cache, weight.k_norm, base_position,
-                    rows, prefill_attention_scratch_.data(), context, stream,
-                    global_compute_ == attention::Compute::fp8 ? fp8_attention_.get() : nullptr);
-          } else {
-            prefill::causal_gqa_attention_cached_chunk_global_compact_paged(
-                q_rope, k_rope, v_norm, paged_cache, weight.k_norm,
-                base_position, rows, context, stream);
-          }
-          prefill::write_kv_cache_chunk_global_compact_paged(
-              k_rope, v_norm, paged_cache, base_position, rows, stream);
-        } else {
-          if (vision != nullptr) {
-            prefill::image_block_gqa_attention_cached_chunk_global_compact(
-                q_rope, k_rope, v_norm, cache.key, weight.k_norm,
-                base_position, rows, cache.capacity, vision->begin,
-                vision->end, context, stream, cache.format);
-          } else if (tensor_attention || global_compute_ == attention::Compute::fp8) {
-            prefill::
-                causal_gqa_attention_cached_chunk_tensor_global_compact(
-                    prefill_attention_handle_.get(), q_rope, k_rope, v_norm,
-                    cache.key, weight.k_norm, base_position, rows, cache.capacity,
-                    prefill_attention_scratch_.data(), context, stream, cache.format,
-                    global_compute_ == attention::Compute::fp8 ? fp8_attention_.get() : nullptr);
-          } else {
-            prefill::causal_gqa_attention_cached_chunk_global_compact(
-                q_rope, k_rope, v_norm, cache.key, weight.k_norm,
-                base_position, rows, cache.capacity, context, stream, cache.format);
-          }
-          prefill::write_kv_cache_chunk_global_compact(
-              k_rope, v_norm, cache.key, base_position, rows,
-              cache.capacity, stream, cache.format);
+      if (joined || fp8_joined.data) {
+        qkv_inputs.clear();
+        for (const auto& segment : segments) {
+          const auto offset = std::size_t(segment.offset);
+          qkv_inputs.push_back({q_raw + offset * fusion::qkv_width(global),
+              cosine + offset * d, sine + offset * d, q_rope + offset * query_width,
+              k_rope + offset * kv_width, v_norm + offset * kv_width, segment.rows});
         }
+        primitives::qkv_rms_rope_batch(qkv_inputs, weight.q_norm, weight.k_norm, kind, stream);
       } else {
-        if (vision != nullptr) {
-          prefill::image_block_gqa_attention_cached_chunk(
-              q_rope, k_rope, v_norm, cache.key, cache.value,
-              base_position, rows, cache.capacity, vision->begin,
-              vision->end, context, kind, stream, cache.format);
-        } else if (tensor_attention || local_compute_ == attention::Compute::fp8) {
-          prefill::causal_gqa_attention_cached_chunk_tensor(
-              prefill_attention_handle_.get(), q_rope, k_rope, v_norm,
-              cache.key, cache.value, base_position, rows, cache.capacity,
-              prefill_attention_scratch_.data(), context, kind, stream, cache.format,
-              local_compute_ == attention::Compute::fp8 ? fp8_attention_.get() : nullptr);
-        } else {
-          prefill::causal_gqa_attention_cached_chunk(
-              q_rope, k_rope, v_norm, cache.key, cache.value, base_position,
-              rows, cache.capacity, context, kind, stream, cache.format);
+        for (const auto& segment : segments) {
+          const auto offset = std::size_t(segment.offset);
+          prefill::apply_rope_transpose_chunk(
+              q_norm + offset * query_width, cosine + offset * d, sine + offset * d,
+              q_rope + offset * query_width, model::kQueryHeadCount, segment.rows, kind, stream);
+          prefill::apply_rope_transpose_chunk(
+              k_norm + offset * kv_width, cosine + offset * d, sine + offset * d,
+              k_rope + offset * kv_width, kv_heads, segment.rows, kind, stream);
         }
-        prefill::write_kv_cache_chunk(
-            k_rope, v_norm, cache.key, cache.value, base_position, rows,
-            cache.capacity, kind, stream, cache.format);
+      }
+      // Projections share the packed token dimension; attention sees only one
+      // segment's private head-major Q/K and committed execution at a time.
+      for (const auto& segment : segments) {
+        const auto base_position = segment.position;
+        const auto rows = segment.rows;
+        const auto* vision = segment.vision;
+        const bool tensor_attention = rows <= prefill::kTensorAttentionMaximumQueryRows &&
+            (rows >= 32 || base_position >= 1024);
+        const auto* query = q_rope + std::size_t(segment.offset) * query_width;
+        const auto* key = k_rope + std::size_t(segment.offset) * kv_width;
+        const auto* value = v_norm + std::size_t(segment.offset) * kv_width;
+        auto* segment_context = context + std::size_t(segment.offset) * query_width;
+        const LayerCacheView cache = segment.execution
+            ? persistent_cache_->layer(segment.execution, layer) : caches_.layer(layer);
+        if (global) {
+          if (cache.page_pool != nullptr) {
+            const prefill::CompactGlobalPagedCache paged_cache{
+                cache.page_pool,
+                cache.page_offsets,
+                cache.page_tokens,
+                cache.page_count,
+                cache.page_stride_elements,
+                cache.layer_offset_elements,
+                cache.format,
+            };
+            if (vision != nullptr && !tensor_attention) {
+              prefill::image_block_gqa_attention_cached_chunk_global_compact_paged(
+                  query, key, value, paged_cache, weight.k_norm,
+                  base_position, rows, vision->begin, vision->end, segment_context,
+                  stream);
+            } else if (tensor_attention || (!vision && global_compute_ == attention::Compute::fp8)) {
+              prefill::
+                  causal_gqa_attention_cached_chunk_tensor_global_compact_paged(
+                      prefill_attention_handle_.get(), query, key,
+                      value, paged_cache, weight.k_norm, base_position,
+                      rows, prefill_attention_scratch_.data(), segment_context, stream,
+                      !vision && global_compute_ == attention::Compute::fp8 ? fp8_attention_.get() : nullptr);
+            } else {
+              prefill::causal_gqa_attention_cached_chunk_global_compact_paged(
+                  query, key, value, paged_cache, weight.k_norm,
+                  base_position, rows, segment_context, stream);
+            }
+            prefill::write_kv_cache_chunk_global_compact_paged(
+                key, value, paged_cache, base_position, rows, stream);
+          } else {
+            if (vision != nullptr && !tensor_attention) {
+              prefill::image_block_gqa_attention_cached_chunk_global_compact(
+                  query, key, value, cache.key, weight.k_norm,
+                  base_position, rows, cache.capacity, vision->begin,
+                  vision->end, segment_context, stream, cache.format);
+            } else if (tensor_attention || (!vision && global_compute_ == attention::Compute::fp8)) {
+              prefill::
+                  causal_gqa_attention_cached_chunk_tensor_global_compact(
+                      prefill_attention_handle_.get(), query, key, value,
+                      cache.key, weight.k_norm, base_position, rows, cache.capacity,
+                      prefill_attention_scratch_.data(), segment_context, stream, cache.format,
+                      !vision && global_compute_ == attention::Compute::fp8 ? fp8_attention_.get() : nullptr);
+            } else {
+              prefill::causal_gqa_attention_cached_chunk_global_compact(
+                  query, key, value, cache.key, weight.k_norm,
+                  base_position, rows, cache.capacity, segment_context, stream, cache.format);
+            }
+            prefill::write_kv_cache_chunk_global_compact(
+                key, value, cache.key, base_position, rows,
+                cache.capacity, stream, cache.format);
+          }
+        } else {
+          if (vision != nullptr && !tensor_attention) {
+            prefill::image_block_gqa_attention_cached_chunk(
+                query, key, value, cache.key, cache.value,
+                base_position, rows, cache.capacity, vision->begin,
+                vision->end, segment_context, kind, stream, cache.format);
+          } else if (tensor_attention || (!vision && local_compute_ == attention::Compute::fp8)) {
+            prefill::causal_gqa_attention_cached_chunk_tensor(
+                prefill_attention_handle_.get(), query, key, value,
+                cache.key, cache.value, base_position, rows, cache.capacity,
+                prefill_attention_scratch_.data(), segment_context, kind, stream, cache.format,
+                !vision && local_compute_ == attention::Compute::fp8 ? fp8_attention_.get() : nullptr,
+                vision ? vision->begin : 0, vision ? vision->end : 0);
+          } else {
+            prefill::causal_gqa_attention_cached_chunk(
+                query, key, value, cache.key, cache.value, base_position,
+                rows, cache.capacity, segment_context, kind, stream, cache.format);
+          }
+          prefill::write_kv_cache_chunk(
+              key, value, cache.key, cache.value, base_position, rows,
+              cache.capacity, kind, stream, cache.format);
+        }
       }
 
       projection_linear(plans.output(global), rows, layer, model::TensorRole::o_proj,

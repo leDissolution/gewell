@@ -3,9 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 
 namespace gewell::runtime {
 namespace {
@@ -23,9 +27,9 @@ class TestBackend final : public ExecutionBackend {
   void initialize(PersistentCacheManager& owner, kv_cache::ExecutionId, const BatchLimits&) override { cache = &owner; }
   void initialize_outputs(bool, bool) override {}
   CompletionContext context() const override { return {}; }
-  void wait() const override { ++waits; image_inflight = decode_inflight = false; }
-  void synchronize(std::string_view) const override { image_inflight = decode_inflight = false; }
-  bool ready(std::string_view) const override { image_inflight = false; return true; }
+  void wait() const override { ++waits; image_inflight = decode_inflight = prefill_inflight = false; }
+  void synchronize(std::string_view) const override { image_inflight = decode_inflight = prefill_inflight = false; }
+  bool ready(std::string_view) const override { image_inflight = prefill_inflight = false; return true; }
   TerminalState acquire_hidden() override {
     if (fail_hidden) throw std::bad_alloc();
     auto state = std::make_unique<std::array<std::uint32_t, 4>>();
@@ -35,6 +39,7 @@ class TestBackend final : public ExecutionBackend {
   }
   void release_hidden(TerminalState state) override {
     require(!decode_inflight, "terminal state released during decode");
+    require(!prefill_inflight, "terminal state released during prefill");
     if (state) require(states.erase(state.value) == 1, "double terminal release");
   }
   std::size_t occupied_hidden_bytes() const override { return states.size() * 16; }
@@ -43,49 +48,55 @@ class TestBackend final : public ExecutionBackend {
   void begin_step(std::string_view) override {}
   void end_step(std::string_view) override {}
   float elapsed(std::string_view) const override { return 1; }
-  void prefill_step(kv_cache::ExecutionId execution, const std::uint32_t* tokens,
-      std::uint32_t position, std::uint32_t rows, bool, TerminalState hidden) override {
-    require(rows <= chunk_cap, "prefill exceeded selected bound");
-    require(!image_live, "text prefill overlapped image features");
-    cache->prepare_write(execution, position, rows, {});
-    auto* state = static_cast<std::uint32_t*>(hidden.value);
-    if (!position) state[0] = 0;
-    for (std::uint32_t i = 0; i < rows; ++i) state[0] += tokens[i];
-    state[1] = position + rows;
-    prefill_rows += rows;
-    operations.emplace_back('P', rows);
-    if (fail_prefill) throw std::runtime_error("injected prefill failure");
-  }
-  std::uint32_t image_prefill_step(kv_cache::ExecutionId execution, const std::uint32_t* tokens,
-      std::uint32_t rows, std::uint32_t begin, std::uint32_t end,
-      const std::vector<std::shared_ptr<const ImageInput>>& images,
-      TerminalState hidden, const std::function<bool()>& continue_prefill) override {
-    require(!image_live, "image features from preceding request remained live");
-    require(begin < end && end <= rows, "invalid image prefill range");
-    if (on_image_begin) on_image_begin();
-    if (!continue_prefill()) return begin;
-    image_live = image_inflight = true;
-    ++image_prefills;
-    auto* state = static_cast<std::uint32_t*>(hidden.value);
-    if (!begin) state[0] = state[1] = 0;
-    require(state[1] == begin, "image resume lost terminal cursor");
-    for (std::size_t i = 0; i < images.size(); ++i) {
-      const auto& image = *images[i];
-      if (image.end <= begin || image.begin >= end) continue;
-      require(image.begin >= begin && image.end <= end, "prefill split an image");
-      cache->prepare_write(execution, state[1], image.end - state[1], {});
-      for (auto position = state[1]; position < image.end; ++position) state[0] += tokens[position];
-      state[0] += image.pixels.at(0) * (i + 1);
-      state[1] = image.end;
+  std::vector<bool> prefill_batch(const std::vector<BatchPrefillInput>& inputs,
+      const std::function<bool(std::size_t)>& continue_prefill) override {
+    require(!image_live, "image features from preceding forward remained live");
+    std::uint32_t total = 0;
+    const bool has_images = std::any_of(inputs.begin(), inputs.end(),
+        [](const auto& input) { return bool(input.image); });
+    for (const auto& input : inputs) total += input.rows;
+    require(total <= chunk_cap || (inputs.size() == 1 && inputs.front().image),
+            "prefill exceeded selected bound");
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      if (!inputs[i].image) continue;
+      if (on_image_begin) on_image_begin();
+      if (!continue_prefill(i)) continue;
+      if (!image_live) ++image_prefills;
+      image_live = image_inflight = true;
+      const auto& image = *inputs[i].image;
+      require(image.begin == inputs[i].position && image.end - image.begin == inputs[i].rows,
+              "prefill split an image");
+      require(!image.pixels.empty(), "image bytes released before encoding");
       ++encoded_images;
       if (fail_image || encoded_images == fail_image_number)
         throw std::runtime_error("injected image prefill failure");
-      if (!continue_prefill()) return state[1];
     }
-    if (state[1] < end) cache->prepare_write(execution, state[1], end - state[1], {});
-    for (auto position = state[1]; position < end; ++position) state[0] += tokens[position];
-    state[1] = end;
-    return end;
+    std::vector<bool> completed(inputs.size(), false);
+    total = 0;
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      completed[i] = !has_images || continue_prefill(i);
+      if (completed[i]) { total += inputs[i].rows; ++count; }
+    }
+    if (count) {
+      prefill_sizes.push_back(count);
+      operations.emplace_back('P', total);
+    }
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      if (!completed[i]) continue;
+      const auto& [execution, tokens, position, rows, hidden, image] = inputs[i];
+      cache->prepare_write(execution, position, rows, {});
+      prefill_inflight = true;
+      auto* state = static_cast<std::uint32_t*>(hidden.value);
+      if (!position) state[0] = state[2] = 0;
+      else require(state[1] == position, "packed prefill resumed the wrong cursor");
+      for (std::uint32_t j = 0; j < rows; ++j) state[0] += tokens[j];
+      if (image) state[0] += image->pixels.at(0) * ++state[2];
+      state[1] = position + rows;
+      prefill_rows += rows;
+      if (fail_prefill) throw std::runtime_error("injected prefill failure");
+    }
+    return completed;
   }
   void release_image() override {
     require(!image_inflight, "image features were released before GPU completion");
@@ -99,6 +110,7 @@ class TestBackend final : public ExecutionBackend {
     require(!image_live, "decode overlapped in-flight image features");
     decode_sizes.push_back(inputs.size());
     operations.emplace_back('D', inputs.size());
+    decode_depths.emplace_back(inputs.size(), 0);
     for (std::size_t row = 0; row < inputs.size(); ++row) {
       const auto& in = inputs[row];
       cache->prepare_write(in.execution, in.position, 1, {});
@@ -121,7 +133,16 @@ class TestBackend final : public ExecutionBackend {
     operations.emplace_back('D', inputs.size());
     BatchMtpOutcome result;
     proposals = inputs;
+    decode_depths.emplace_back();
     for (const auto& input : inputs) {
+      if (input.capture) {
+        input.capture->target_width = 2; input.capture->assistant_width = 1;
+        input.capture->target_hidden = {1, 2};
+        input.capture->assistant_hidden.assign(input.depth, 3);
+        input.capture->draft_tokens.assign(input.depth, input.pending_token + 1);
+        input.capture->scores.resize(input.depth);
+      }
+      decode_depths.back().push_back(input.depth);
       return_probability_flags.push_back(input.return_probabilities);
       require(input.uniforms.size() == 2 * input.depth + 1, "MTP draw block size");
       MtpOutcome output;
@@ -132,6 +153,13 @@ class TestBackend final : public ExecutionBackend {
       } else {
         output.verification = {input.depth, input.depth + 1, input.depth};
         for (std::uint32_t i = 0; i <= input.depth; ++i) output.tokens.push_back(input.pending_token + i + 1);
+      }
+      if (input.capture_next && output.error.empty()) {
+        input.capture_next->width = 2;
+        // Encode the committed terminal position; the collector must pair this
+        // with the following round, not the round producing the probes.
+        input.capture_next->hidden.assign(input.capture_next->layers.size() * 2,
+            input.position + output.verification.output_count - 1);
       }
       result.requests.push_back(std::move(output));
     }
@@ -159,7 +187,7 @@ class TestBackend final : public ExecutionBackend {
   std::size_t output_bytes() const override { return 0; }
   std::size_t host_scratch_bytes() const override { return 0; }
   std::size_t sampling_scratch_bytes() const override { return 0; }
-  BackendLimits supported{64,64,4,3,16,8,8,128,{63},8};
+  BackendLimits supported{64,64,4,3,16,8,16,8,128,{63},8};
   kv_cache::PoolConfig config_;
   PersistentCacheManager* cache{};
   std::uint32_t chunk_cap{4}, prefill_rows{};
@@ -168,7 +196,7 @@ class TestBackend final : public ExecutionBackend {
   std::set<std::size_t> failed_mtp_rows;
   std::set<kv_cache::ExecutionId> failed_mtp_executions;
   bool fail_image{}, fail_hidden{}, image_live{};
-  mutable bool image_inflight{}, decode_inflight{};
+  mutable bool image_inflight{}, decode_inflight{}, prefill_inflight{};
   std::function<void()> on_decode;
   std::function<void()> on_image_begin;
   std::uint32_t image_prefills{}, image_releases{}, encoded_images{}, fail_image_number{};
@@ -182,13 +210,15 @@ class TestBackend final : public ExecutionBackend {
   std::vector<std::uint32_t> commits;
   std::vector<std::size_t> commit_batch_sizes;
   std::vector<std::size_t> decode_sizes;
+  std::vector<std::size_t> prefill_sizes;
+  std::vector<std::vector<std::uint32_t>> decode_depths;
   std::vector<std::pair<char, std::uint32_t>> operations;
 };
 BatchLimits limits(std::uint32_t depth = 0) {
   BatchLimits value;
   value.capacity = 3;
   value.mtp_depth = depth;
-  value.plan_rows = value.prefill_chunk_tokens = 4;
+  value.plan_rows = value.prefill_chunk_tokens = value.prefill_batch_tokens = 4;
   value.max_horizon = 64;
   value.kv_bytes = 8192 + 512;
   value.max_requests = 8;
@@ -224,6 +254,86 @@ void run(BatchScheduler& scheduler) {
   for (int turn = 0; scheduler.has_pending() && turn < 1000; ++turn) scheduler.step();
   require(!scheduler.has_pending(), "scheduler failed to make bounded progress");
 }
+void packed_prefill() {
+  for (const auto cap : {4U, 8U}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    device->chunk_cap = cap;
+    auto configured = limits(); configured.prefill_batch_tokens = configured.prefill_chunk_tokens = configured.plan_rows = cap;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("a", {2,3,4}, 1));
+    scheduler.submit(request("b", {5,6,7}, 1));
+    scheduler.submit(request("c", {8,9,10,11,12}, 1));
+    run(scheduler);
+    require(device->prefill_sizes.front() == (cap == 4 ? 1U : 2U),
+            "ready independent prompts did not share a bounded prefill forward");
+    require(output.tokens["a"] == std::vector<std::uint32_t>{10} &&
+                output.tokens["b"] == std::vector<std::uint32_t>{19} &&
+                output.tokens["c"] == std::vector<std::uint32_t>{51},
+            "packed prefill mixed histories or lost a tail segment");
+    require(scheduler.prefill_tokens == 11 && device->prefill_rows == 11 && device->states.empty(),
+            "packed prefill duplicated physical work or leaked terminal state");
+  }
+}
+void packed_prefill_separate_limits() {
+  Output output;
+  auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+  device->chunk_cap = 16;
+  auto configured = limits(); configured.capacity = 4;
+  configured.prefill_batch_tokens = 16;
+  BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+  scheduler.submit(request("a", {2,3,4,5,6,7,8,9}, 1));
+  scheduler.submit(request("b", {10,11,12,13,14,15,16,17}, 1));
+  scheduler.submit(request("c", {18,19,20,21,22,23,24,25}, 1));
+  scheduler.submit(request("d", {26,27,28,29,30,31,32,33}, 1));
+  run(scheduler);
+  require(device->prefill_sizes == std::vector<std::size_t>{4,4},
+          "long prompts did not share forwards at the independent chunk cap");
+  require(device->operations[0] == std::pair<char,std::uint32_t>{'P',16} &&
+              device->operations[1] == std::pair<char,std::uint32_t>{'P',16},
+          "four per-prompt chunks were not aggregated into one dense forward");
+  require(scheduler.prefill_tokens == 32 && output.tokens["a"] == std::vector<std::uint32_t>{45} &&
+              output.tokens["b"] == std::vector<std::uint32_t>{49} &&
+              output.tokens["c"] == std::vector<std::uint32_t>{53} &&
+              output.tokens["d"] == std::vector<std::uint32_t>{57},
+          "independent chunk limits changed request histories or token accounting");
+}
+void packed_prefill_cancellation_and_failure() {
+  for (const bool failure : {false, true}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    device->chunk_cap = 8;
+    device->fail_prefill = failure;
+    auto callbacks = output.callbacks();
+    BatchScheduler* running = nullptr;
+    bool cancelled = false;
+    std::size_t rejected = 0;
+    callbacks.poll = [&](bool inflight) {
+      if (!failure && inflight && device->prefill_inflight && !cancelled) {
+        cancelled = true;
+        running->cancel(0, true);
+      }
+    };
+    callbacks.reject = [&](auto&, const auto&, auto) { ++rejected; device->fail_prefill = false; };
+    callbacks.finish = [](auto& r) { r.delivered = true; };
+    auto configured = limits(); configured.live = true; configured.capacity = 2;
+    configured.prefill_batch_tokens = configured.prefill_chunk_tokens = configured.plan_rows = 8;
+    BatchScheduler scheduler(std::move(backend), configured, std::move(callbacks)); running = &scheduler;
+    scheduler.submit(request("a", {2,3,4}, 1));
+    scheduler.submit(request("b", {5,6}, 1));
+    scheduler.submit(request("later", {7,8}, 1));
+    run(scheduler);
+    require(device->prefill_sizes.front() == 2 && output.tokens["a"].empty(),
+            "cancelled or failed packed prefill emitted output");
+    require(output.tokens["later"] == std::vector<std::uint32_t>{16} &&
+                (failure ? output.tokens["b"].empty() : output.tokens["b"] == std::vector<std::uint32_t>{12}),
+            "packed prefill failure/cancellation affected unrelated successful work");
+    require(rejected == (failure ? 2U : 0U) && device->states.empty() &&
+                device->cache->stats().execution_count == 0,
+            "packed prefill cleanup lost rejection or retained in-flight resources");
+    if (!failure) require(scheduler.prefill_tokens == 7, "cancelled packed rows lost physical-work accounting");
+  }
+}
 void shared_prefix_and_seed(std::uint32_t budget = 0) {
   Output output;
   auto backend = std::make_unique<TestBackend>();
@@ -238,6 +348,123 @@ void shared_prefix_and_seed(std::uint32_t budget = 0) {
   require(output.tokens.at("a") == output.tokens.at("b"), "per-request seeded draws changed with sharing");
   require(output.processed.at("a") == 9 && output.processed.at("b") == 9, "fed and emitted cursors conflated");
   require(device->states.empty() && device->cache->stats().execution_count == 0, "completed execution leaked");
+}
+void live_decode_accounting() {
+  for (const auto depth : {0U, 3U}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>();
+    auto configured = limits(depth); configured.prefill_budget_tokens = 16;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("a", {2,3}, 9));
+    scheduler.submit(request("b", {4,5}, 9));
+    nlohmann::json previous;
+    std::uint64_t observed_tokens = 0, observed_batches = 0;
+    for (unsigned turn = 0; scheduler.has_pending() && turn < 100; ++turn) {
+      scheduler.step();
+      std::ostringstream stream;
+      scheduler.write_live_stats(stream);
+      const auto current = nlohmann::json::parse(stream.str());
+      require(current.at("decode_tokens") == scheduler.decode_tokens &&
+                  current.at("prefill_gpu_seconds") == scheduler.prefill_gpu_seconds &&
+                  current.at("mtp_proposed") == scheduler.mtp_proposed &&
+                  current.at("mtp_accepted") == scheduler.mtp_accepted &&
+                  current.at("mtp_verifier_rows") == scheduler.mtp_verifier_rows,
+              "live counters disagree with committed scheduler work");
+      if (!previous.is_null()) {
+        require(current.at("wall_seconds").get<double>() >= previous.at("wall_seconds").get<double>(),
+                "live elapsed time moved backwards");
+        observed_tokens += current.at("decode_tokens").get<std::uint64_t>() -
+                           previous.at("decode_tokens").get<std::uint64_t>();
+        observed_batches += current.at("decode_batches").get<std::uint64_t>() -
+                            previous.at("decode_batches").get<std::uint64_t>();
+      }
+      previous = current;
+    }
+    require(!scheduler.has_pending() && observed_tokens == 16 && observed_batches > 0,
+            "live interval accounting lost decode work or included prefill heads");
+    require(scheduler.mtp_cycles == (depth ? 4U : 0U) &&
+                scheduler.mtp_proposed == (depth ? 12U : 0U), "unexpected measured MTP work");
+  }
+}
+void adaptive_decode_depth() {
+  // Three ready requests shrink to two, then one. Remaining output limits
+  // still trim individual rows below the chosen batch depth.
+  for (const auto width : {0U, 8U, 0xffffffffU}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    auto configured = limits(3);
+    configured.decode_width = width;
+    configured.prefill_budget_tokens = 32;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("a", {2,3}, 3));
+    scheduler.submit(request("b", {4,5}, 6));
+    scheduler.submit(request("c", {6,7}, 14));
+    run(scheduler);
+    const std::vector<std::vector<std::uint32_t>> expected = width == 8
+        ? std::vector<std::vector<std::uint32_t>>{{1,1,1}, {2,3}, {3}, {2}}
+        : std::vector<std::vector<std::uint32_t>>{{1,3,3}, {0,3}, {3}, {0}};
+    require(device->decode_depths == expected, "decode depth did not follow the current batch or maximum");
+    require(output.tokens["a"].size() == 3 && output.tokens["b"].size() == 6 &&
+                output.tokens["c"].size() == 14, "adaptive depth lost or overproduced output");
+    require(device->states.empty() && device->cache->stats().execution_count == 0,
+            "adaptive depth leaked execution state");
+  }
+  // Width below batch size must select ordinary decode without unsigned
+  // underflow, then resume MTP as the batch shrinks.
+  {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    auto configured = limits(3); configured.decode_width = 2; configured.prefill_budget_tokens = 32;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("a", {2,3}, 2));
+    scheduler.submit(request("b", {4,5}, 3));
+    scheduler.submit(request("c", {6,7}, 9));
+    run(scheduler);
+    require(device->decode_depths == std::vector<std::vector<std::uint32_t>>{
+                {0,0,0}, {0,0}, {1}, {1}, {1}}, "ordinary/MTP transition used the wrong depth");
+    require(output.tokens["c"] == std::vector<std::uint32_t>{14,15,16,17,18,19,20,21,22},
+            "ordinary/MTP transition lost the pending token");
+  }
+  // A configured floor can exceed the target width; request tails and
+  // ordinary-only requests remain correctness exceptions to that floor.
+  {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    auto configured = limits(3); configured.decode_width = 1; configured.mtp_min_depth = 2;
+    configured.prefill_budget_tokens = 32;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("tail", {2,3}, 3));
+    scheduler.submit(request("mtp", {4,5}, 8));
+    auto ordinary = request("ordinary", {6,7}, 8); ordinary.ordinary_decode = true;
+    scheduler.submit(std::move(ordinary)); run(scheduler);
+    require(device->decode_depths.front() == std::vector<std::uint32_t>{1,2,0},
+            "minimum depth overrode a request limit or ordinary fallback");
+    require(output.tokens["tail"].size() == 3 && output.tokens["mtp"].size() == 8 &&
+                output.tokens["ordinary"].size() == 8, "minimum-depth run lost output");
+  }
+  // Backpressured requests do not count toward the decode batch. When they
+  // become runnable, depth decreases again without restarting the scheduler.
+  {
+    Output output; output.blocked = {"b", "c"};
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    device->on_decode = [&] { output.blocked.clear(); };
+    auto configured = limits(3); configured.decode_width = 6; configured.prefill_budget_tokens = 32;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    for (const auto* id : {"a", "b", "c"}) scheduler.submit(request(id, {2,3}, 13));
+    run(scheduler);
+    require(device->decode_depths.front() == std::vector<std::uint32_t>{3} &&
+                std::find(device->decode_depths.begin(), device->decode_depths.end(),
+                          std::vector<std::uint32_t>{1,1,1}) != device->decode_depths.end(),
+            "depth used admitted capacity or failed to decrease as requests became ready");
+  }
+  {
+    Output output;
+    auto configured = limits(3); configured.mtp_min_depth = 4; configured.decode_width = 8;
+    bool rejected = false;
+    try { BatchScheduler scheduler(std::make_unique<TestBackend>(), configured, output.callbacks()); }
+    catch (const std::runtime_error& e) { rejected = std::string(e.what()).find("invalid scheduler limits") != std::string::npos; }
+    require(rejected, "minimum depth greater than maximum was accepted");
+  }
 }
 void cancellation_and_backpressure(std::uint32_t budget = 0) {
   Output output; output.blocked.insert("slow");
@@ -291,6 +518,158 @@ void mtp_commit_and_stop_fallback() {
                       device->return_probability_flags.end(),
                       [](bool value) { return !value; }),
           "MTP request without logprobs required probability rows");
+}
+void windowed_mtp_statistics() {
+  struct Directory {
+    std::filesystem::path path;
+    Directory() {
+      auto pattern = (std::filesystem::temp_directory_path() / "gewell-scheduler-stats-XXXXXX").string();
+      require(::mkdtemp(pattern.data()) != nullptr, "create statistics test directory");
+      path = pattern;
+    }
+    ~Directory() { std::error_code error; std::filesystem::remove_all(path, error); }
+  } directory;
+  const auto path = directory.path / "stats.jsonl";
+  std::map<std::string, std::vector<std::uint32_t>> reference;
+  std::map<std::string, std::mt19937_64> reference_rng;
+  for (const bool enabled : {false, true}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>();
+    backend->supported.stop_tokens = {8};
+    auto configured = limits(3); configured.prefill_budget_tokens = 16;
+    if (enabled) {
+      configured.mtp_stats_path = path;
+      configured.mtp_capture = {directory.path / "capture", 1, 100};
+    }
+    configured.mtp_stats_window = 2;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    auto eos = request("eos", {2,3}, 8); eos.honor_eos = true;
+    auto ordinary = request("ordinary", {2,3}, 5); ordinary.ordinary_decode = true;
+    scheduler.submit(std::move(eos)); scheduler.submit(std::move(ordinary));
+    scheduler.submit(request("long", {2,3}, 14)); run(scheduler);
+    if (!enabled) {
+      reference = output.tokens;
+      for (const auto& r : scheduler.requests) reference_rng[r.id] = r.rng;
+      continue;
+    }
+    for (const auto& r : scheduler.requests)
+      require(r.rng == reference_rng[r.id], "capture consumed inference RNG");
+    {
+      std::ifstream captures(directory.path / "capture" / "samples.jsonl");
+      bool final_round = false;
+      for (std::string line; std::getline(captures, line);) {
+        const auto record = nlohmann::json::parse(line);
+        if (record["event"] != "mtp_capture") continue;
+        require(record["id"] != "ordinary", "capture recorded depth zero");
+        require(record["cycle"] > 0 && record["probe_source_cycle"].get<unsigned>() + 1 == record["cycle"],
+                "probe was labeled with its own round");
+        std::ifstream binary(directory.path / "capture" / "hidden.bf16", std::ios::binary);
+        binary.seekg(record["byte_offset"].get<std::size_t>() + 2 * (2 + record["depth"].get<unsigned>()));
+        std::uint16_t probe{}; binary.read(reinterpret_cast<char*>(&probe), 2);
+        require(probe + 1 == record["position"], "probe used a rejected or misaligned target row");
+        final_round |= record["id"] == "long" && record["cycle"] > 0 && record["previous_depth"] == 3;
+      }
+      require(final_round, "capture lost per-request history");
+    }
+    require(output.tokens == reference, "collecting statistics changed decoded output");
+    std::ifstream file(path);
+    std::map<std::string, std::uint64_t> cycles, proposed, accepted, emitted, windows;
+    std::map<std::string, nlohmann::json> endings;
+    std::set<std::uint32_t> batches;
+    bool ordinary_verifier = false, ordinary_decode = false, clipped_eos = false;
+    for (std::string line; std::getline(file, line);) {
+      const auto record = nlohmann::json::parse(line);
+      if (record["event"] == "mtp_request_end") endings[record["id"]] = record;
+      if (record["event"] != "mtp_window") continue;
+      const auto id = record["id"].get<std::string>();
+      require(record["window"] == windows[id]++, "request window numbering changed");
+      require(record["output_begin"] == emitted[id] + 1, "decode windows lost their output offset");
+      for (const auto& group : record["groups"]) {
+        const auto depth = group["depth"].get<std::uint32_t>();
+        const auto count = group["cycles"].get<std::uint64_t>();
+        batches.insert(group["batch"].get<std::uint32_t>());
+        emitted[id] += group["emitted_tokens"].get<std::uint64_t>();
+        require(std::abs(group["gpu_seconds"].get<double>() - count * 0.001) < 1e-9,
+                "statistics divided shared batch GPU time among requests");
+        require(group["failed_cycles"] == 0, "healthy cycle was marked as failed");
+        ordinary_verifier |= depth == 0 && group["mtp"] == true;
+        ordinary_decode |= depth == 0 && group["mtp"] == false;
+        if (id == "eos") clipped_eos = depth == 3 && group["accepted"][2] == 1;
+        if (!depth) continue;
+        cycles[id] += count; proposed[id] += depth * count;
+        for (std::size_t i = 0; i < group["accepted"].size(); ++i)
+          accepted[id] += i * group["accepted"][i].get<std::uint64_t>();
+      }
+      require(record["output_end"] == emitted[id] + 1, "decode windows lost emitted tokens");
+    }
+    require(clipped_eos && ordinary_verifier && ordinary_decode && batches.size() > 1,
+            "statistics lost EOS clipping, mixed ordinary rows, tails, or actual batch changes");
+    for (const auto& r : scheduler.requests) {
+      require(cycles[r.id] == r.mtp_cycles && proposed[r.id] == r.mtp_proposed && accepted[r.id] == r.mtp_accepted,
+              "window histogram disagrees with committed request MTP totals");
+      require(emitted[r.id] + 1 == output.tokens[r.id].size() && endings[r.id]["status"] == "complete" &&
+              endings[r.id]["output_tokens"] == output.tokens[r.id].size(),
+              "statistics lost final output or request completion");
+    }
+    require(windows["eos"] == 1, "final partial decode window was dropped");
+  }
+  // Resume either or both sinks. Their sequence floors can differ because
+  // capture samples only some requests and either output can be disabled.
+  std::uint64_t next_sequence = 3;
+  for (const auto [stats, capture] : {std::pair{true, true}, {false, true}, {true, true}, {true, false}, {true, true}}) {
+    Output output;
+    auto configured = limits(3);
+    if (stats) configured.mtp_stats_path = path;
+    if (capture) configured.mtp_capture = {directory.path / "capture", 1, 100};
+    BatchScheduler scheduler(std::make_unique<TestBackend>(), configured, output.callbacks());
+    scheduler.submit(request("long", {4,5}, 14)); run(scheduler);
+    require(scheduler.requests[0].accepted_order == next_sequence && scheduler.submitted == 1,
+            "resuming outputs reused a sequence or changed request counts");
+    for (const auto& sink : {stats ? path : std::filesystem::path{},
+                            capture ? directory.path / "capture" / "samples.jsonl" : std::filesystem::path{}}) {
+      if (sink.empty()) continue;
+      std::ifstream file(sink);
+      nlohmann::json last;
+      for (std::string line; std::getline(file, line);) last = nlohmann::json::parse(line);
+      require(last["sequence"] == next_sequence, "capture and statistics request identities disagree");
+    }
+    ++next_sequence;
+  }
+  // The last selected source round must still be labeled after selection hits
+  // its cap. No additional sources or samples may be collected afterward.
+  {
+    Output output;
+    auto configured = limits(3);
+    configured.mtp_capture = {directory.path / "capture-cap", 1, 1};
+    BatchScheduler scheduler(std::make_unique<TestBackend>(), configured, output.callbacks());
+    scheduler.submit(request("capped", {2,3}, 14)); run(scheduler);
+    std::ifstream captures(directory.path / "capture-cap" / "samples.jsonl");
+    unsigned count = 0;
+    for (std::string line; std::getline(captures, line);) {
+      const auto record = nlohmann::json::parse(line);
+      if (record["event"] != "mtp_capture") continue;
+      ++count;
+      require(record["cycle"] == 1 && record["probe_source_cycle"] == 0,
+              "capture cap discarded the pending label or used the source outcome");
+    }
+    require(count == 1, "capture cap lost or added a sample");
+  }
+  // Destruction flushes a partial window for a request that never retired.
+  const auto interrupted_path = directory.path / "interrupted.jsonl";
+  {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    auto configured = limits(3); configured.mtp_stats_path = interrupted_path;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("interrupted", {2,3}, 14));
+    for (int n = 0; device->decode_sizes.empty() && n < 10; ++n) scheduler.step();
+    require(device->decode_sizes.size() == 1, "interruption fixture did not decode one cycle");
+  }
+  std::ifstream interrupted(interrupted_path);
+  nlohmann::json last;
+  for (std::string line; std::getline(interrupted, line);) last = nlohmann::json::parse(line);
+  require(last["status"] == "interrupted" && last["decode_cycles"] == 1 && last["windows"] == 1,
+          "scheduler destruction lost a partial statistics window");
 }
 void mtp_failure_isolation() {
   for (const std::set<std::size_t> failed : {
@@ -440,6 +819,65 @@ BatchRequest image_request(const char* id, std::uint8_t pixel = 1, std::uint32_t
   image->padded_patch_rows = 1; image->begin = 1; image->end = 3;
   value.images.push_back(std::move(image));
   return value;
+}
+void packed_image_prefill() {
+  // Mixed whole-image/text cohorts, including cancellation before a later tower
+  // pass and failure after an earlier image's features have been retained.
+  for (int mode = 0; mode < 4; ++mode) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    auto configured = limits(); configured.live = true;
+    configured.prefill_batch_tokens = device->chunk_cap = mode == 3 ? 4 : 8;
+    auto callbacks = output.callbacks();
+    auto finish = callbacks.finish;
+    callbacks.finish = [finish](auto& r) { finish(r); r.delivered = true; };
+    BatchScheduler* running = nullptr;
+    bool cancelled = false;
+    std::size_t rejected = 0;
+    callbacks.poll = [&](bool inflight) {
+      if (mode == 1 && inflight && device->encoded_images == 1 && !cancelled) {
+        cancelled = true;
+        running->cancel(1, true);
+      }
+    };
+    callbacks.reject = [&](auto&, const auto&, auto) { ++rejected; };
+    if (mode == 2) device->fail_image_number = 2;
+    BatchScheduler scheduler(std::move(backend), configured, std::move(callbacks)); running = &scheduler;
+    std::vector<std::weak_ptr<const ImageInput>> lifetimes;
+    for (int i = 0; i < 2; ++i) {
+      auto input = image_request(i ? "b" : "a", i + 1, 1);
+      const auto rows = mode == 3 && i == 0 ? 6U : 2U;
+      input.prompt = std::make_shared<const std::vector<std::uint32_t>>(rows, i + 2);
+      auto image = std::make_shared<ImageInput>(*input.images.front());
+      image->begin = 0; image->end = rows;
+      input.images = {image}; input.controls.mode = CacheRequestMode::reuse_only;
+      lifetimes.push_back(image);
+      scheduler.submit(std::move(input));
+    }
+    auto text = request("text", {4,4,4,4}, 1); text.controls.mode = CacheRequestMode::reuse_only;
+    scheduler.submit(std::move(text));
+    run(scheduler);
+    if (mode == 2) {
+      require(rejected == 3 && output.tokens.empty(), "failed packed image cohort leaked partial outputs");
+      scheduler.submit(request("after", {5,6}, 1)); run(scheduler);
+      require(output.tokens["after"] == std::vector<std::uint32_t>{12}, "image failure blocked later work");
+    } else {
+      require(output.tokens["a"] == std::vector<std::uint32_t>{mode == 3 ? 14U : 6U} &&
+                  output.tokens["text"] == std::vector<std::uint32_t>{17},
+              "image packing mixed feature buffers or text history");
+      require(mode == 1 ? output.tokens["b"].empty() : output.tokens["b"] == std::vector<std::uint32_t>{9},
+              "packed image cancellation affected the wrong request");
+      require(device->prefill_sizes.front() == (mode == 3 ? 1U : mode == 1 ? 2U : 3U),
+              "whole images and text did not pack within the physical cap");
+      require(device->encoded_images == (mode == 1 ? 1U : 2U), "cancelled image still ran the tower");
+      require(scheduler.prefill_tokens == (mode == 3 ? 12U : mode == 1 ? 6U : 8U),
+              "packed image token accounting lost processed rows");
+    }
+    require(std::all_of(lifetimes.begin(), lifetimes.end(), [](const auto& image) { return image.expired(); }) &&
+                device->image_prefills == device->image_releases && device->states.empty() &&
+                device->cache->stats().execution_count == 0,
+            "packed image completion retained input, feature lifetime, hidden state or KV");
+  }
 }
 void logical_budget_failed_prefill() {
   for (const auto depth : {0U, 3U}) for (const bool image : {false, true}) {
@@ -841,8 +1279,10 @@ void multi_image_partial_cleanup() {
 int main() {
   try {
     using namespace gewell::runtime;
+    packed_image_prefill(); packed_prefill(); packed_prefill_separate_limits(); packed_prefill_cancellation_and_failure();
     shared_prefix_and_seed(); cancellation_and_backpressure(); mtp_commit_and_stop_fallback(); failure_cleanup();
-    mtp_failure_isolation();
+    live_decode_accounting(); adaptive_decode_depth();
+    mtp_failure_isolation(); windowed_mtp_statistics();
     logical_prefill_budgets(); logical_budget_under_kv_pressure(); cancellation_and_backpressure(16);
     logical_budget_failed_prefill();
     shared_prefix_and_seed(16); images_share_and_mix_with_text(16);

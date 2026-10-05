@@ -483,6 +483,51 @@ __device__ float lookup_probability(const TokenProbability* row, unsigned size,
   return low < size && row[low].token == token ? row[low].probability : 0.0F;
 }
 
+__global__ void gather_capture_rows_kernel(const std::uint16_t* probes,
+    unsigned rows, unsigned width, const Result* result, const Status* status,
+    std::uint16_t* output) {
+  const unsigned count = result->output_count;
+  const bool valid = *status == Status::success && count && count <= rows;
+  for (unsigned col = threadIdx.x; col < width; col += blockDim.x)
+    output[std::size_t(blockIdx.x) * width + col] = valid
+        ? probes[(std::size_t(blockIdx.x) * rows + count - 1) * width + col] : 0;
+}
+
+template <typename Entry>
+__global__ void capture_scores_kernel(const Entry* target, const Entry* draft,
+    const std::uint32_t* ids, unsigned row_size, const std::uint32_t* greedy_ids,
+    const Status* status, MtpCaptureScores* output) {
+  const unsigned step = blockIdx.x, lane = threadIdx.x;
+  if (*status != Status::success) {
+    if (!lane) output[step] = {};
+    return;
+  }
+  if (greedy_ids) {
+    if (!lane) output[step] = {1.0F, ids[step] == greedy_ids[step] ? 1.0F : 0.0F, 0.0F, 1.0F};
+    return;
+  }
+  const auto* q = draft + std::size_t(step) * row_size;
+  const auto* p = target + std::size_t(step) * row_size;
+  __shared__ float entropy[kThreads], maximum[kThreads];
+  float e = 0, m = 0;
+  for (unsigned col = lane; col < row_size; col += kThreads) {
+    const float value = probability_at(q, col);
+    if (value > 0) e -= value * logf(value);
+    m = fmaxf(m, value);
+  }
+  entropy[lane] = e; maximum[lane] = m;
+  __syncthreads();
+  for (unsigned stride = kThreads / 2; stride; stride /= 2) {
+    if (lane < stride) {
+      entropy[lane] += entropy[lane + stride];
+      maximum[lane] = fmaxf(maximum[lane], maximum[lane + stride]);
+    }
+    __syncthreads();
+  }
+  if (!lane) output[step] = {lookup_probability(q, row_size, ids[step]),
+      lookup_probability(p, row_size, ids[step]), entropy[0], maximum[0]};
+}
+
 template <typename Entry>
 __global__ void summarize_logprobs_kernel(
     const Entry* probabilities, const std::uint32_t* selected_ids,
@@ -1082,6 +1127,33 @@ void sample_distribution(const float* probs, std::uint32_t vocabulary_size,
   sample_cdf_kernel<<<1, 1, 0, stream>>>(probs, cumulative, vocabulary_size, uniform,
                                        output_token, status);
   check_cuda(cudaGetLastError(), "sample MTP probability row");
+}
+
+void gather_capture_rows(const std::uint16_t* probes, std::uint32_t layers,
+    std::uint32_t rows, std::uint32_t width, const Result* result,
+    const Status* status, std::uint16_t* output, cudaStream_t stream) {
+  require(probes && result && status && output && layers && rows && width,
+          "invalid target probe capture shape or pointers");
+  gather_capture_rows_kernel<<<layers, kThreads, 0, stream>>>(probes, rows, width, result, status, output);
+  check_cuda(cudaGetLastError(), "gather selected target probe rows");
+}
+
+void capture_scores(const void* target, const void* draft,
+    const std::uint32_t* ids, std::uint32_t depth, std::uint32_t vocabulary_size,
+    std::uint32_t compact_size, const std::uint32_t* greedy_ids,
+    const Status* status, MtpCaptureScores* output, cudaStream_t stream) {
+  require(ids && status && output && (greedy_ids || (target && draft)), "invalid capture pointers");
+  require(depth && depth <= kMaxDraftTokens && vocabulary_size && compact_size <= vocabulary_size,
+          "invalid capture shape");
+  if (compact_size && !greedy_ids)
+    capture_scores_kernel<<<depth, kThreads, 0, stream>>>(
+        static_cast<const TokenProbability*>(target), static_cast<const TokenProbability*>(draft),
+        ids, compact_size, nullptr, status, output);
+  else
+    capture_scores_kernel<<<depth, kThreads, 0, stream>>>(
+        static_cast<const float*>(target), static_cast<const float*>(draft),
+        ids, vocabulary_size, greedy_ids, status, output);
+  check_cuda(cudaGetLastError(), "capture MTP probability scores");
 }
 
 void summarize_logprobs(const float* probs,

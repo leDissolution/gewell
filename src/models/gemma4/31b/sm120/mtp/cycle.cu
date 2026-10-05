@@ -529,6 +529,8 @@ struct Batch::Impl {
   std::size_t stage_stride;
   Layout layout;
   mtp_cuda::Buffer own, tokens;
+  // Allocated only when capture is requested; reused across sampled batches.
+  std::unique_ptr<mtp_cuda::Buffer> capture, probe_capture;
   ConstraintBuffers constraints;
   mtp_assistant::Executor assistant;
   mtp_target::Verifier target;
@@ -569,7 +571,9 @@ Batch::~Batch() = default;
 
 std::size_t Batch::scratch_bytes() const {
   return impl_->own.size() + impl_->tokens.size() + impl_->assistant.scratch_bytes() +
-      impl_->target.scratch_bytes() + impl_->constraints.device_masks.size();
+      impl_->target.scratch_bytes() + impl_->constraints.device_masks.size() +
+      (impl_->capture ? impl_->capture->size() : 0) +
+      (impl_->probe_capture ? impl_->probe_capture->size() : 0);
 }
 
 std::size_t Batch::host_scratch_bytes() const {
@@ -587,6 +591,9 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
   BatchOutcome outcome;
   outcome.requests.resize(inputs.size());
   std::vector<mtp_sampling::Status> statuses(inputs.size());
+  std::vector<std::size_t> capture_offsets(inputs.size());
+  std::size_t capture_rows = 0, probe_elements = 0, probe_outputs = 0;
+  std::vector<std::size_t> probe_offsets(inputs.size()), probe_output_offsets(inputs.size());
   std::uint32_t total_rows = 0;
   bool constrained = false;
   bool greedy = true;
@@ -613,6 +620,43 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
         static_cast<unsigned char*>(s.staging) + i * s.stage_stride,
         s.stage_stride, s.max_depth + 1});
     outcome.requests[i].tokens.resize(input.depth + 1);
+    if (input.capture_next) {
+      auto& probes = *input.capture_next;
+      require(!probes.layers.empty(), "target probe layers are empty");
+      probes.width = model::kHiddenSize;
+      probes.hidden.resize(probes.layers.size() * probes.width);
+      probe_offsets[i] = probe_elements;
+      probe_output_offsets[i] = probe_outputs;
+      probe_elements += (input.depth + 1) * probes.hidden.size();
+      probe_outputs += probes.hidden.size();
+    }
+    if (input.capture) {
+      require(input.depth > 0, "capture requires a positive proposal depth");
+      capture_offsets[i] = capture_rows;
+      capture_rows += input.depth;
+      auto& features = *input.capture;
+      features.target_width = model::kHiddenSize;
+      features.assistant_width = model::kAssistantHiddenSize;
+      features.target_hidden.resize(features.target_width);
+      features.assistant_hidden.resize(std::size_t(input.depth) * features.assistant_width);
+      features.draft_tokens.resize(input.depth);
+      features.scores.resize(input.depth);
+    }
+  }
+  const auto score_offset = mtp_cuda::align(capture_rows * model::kAssistantHiddenSize * sizeof(mtp_target::BFloat16));
+  const auto capture_bytes = score_offset + capture_rows * sizeof(MtpCaptureScores);
+  if (capture_bytes && (!s.capture || s.capture->size() < capture_bytes))
+    s.capture = std::make_unique<mtp_cuda::Buffer>(capture_bytes);
+  const auto probe_output_base = mtp_cuda::align(probe_elements * sizeof(std::uint16_t));
+  const auto probe_bytes = probe_output_base + probe_outputs * sizeof(std::uint16_t);
+  if (probe_bytes && (!s.probe_capture || s.probe_capture->size() < probe_bytes))
+    s.probe_capture = std::make_unique<mtp_cuda::Buffer>(probe_bytes);
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    if (const auto* probes = inputs[i].capture_next)
+      for (std::size_t j = 0; j < probes->layers.size(); ++j)
+        s.verification[i].captures.push_back({probes->layers[j],
+            s.probe_capture->at<mtp_target::BFloat16>() + probe_offsets[i] +
+                j * (inputs[i].depth + 1) * probes->width});
   }
   s.target.prepare(total_rows);
   s.draft_begin.record(stream);
@@ -646,7 +690,9 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
       auto* feedback = s.at<mtp_target::BFloat16>(i, l.feedback);
       drafts.push_back({s.tokens.at<std::uint32_t>() + s.offsets[i] + step,
           step ? feedback : input.target_hidden, frozen_cache(input.caches, input.position),
-          s.at<mtp_target::BFloat16>(i, l.assistant_logits), feedback});
+          s.at<mtp_target::BFloat16>(i, l.assistant_logits), feedback,
+          input.capture ? s.capture->at<mtp_target::BFloat16>() +
+              (capture_offsets[i] + step) * model::kAssistantHiddenSize : nullptr});
     }
     if (drafts.empty()) break;
     s.assistant.forward_batch(drafts, stream);
@@ -809,6 +855,32 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
   s.select_end.record(stream);
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     auto& result = outcome.requests[i];
+    if (auto* probes = inputs[i].capture_next) {
+      auto* selected_probes = s.probe_capture->at<std::uint16_t>(probe_output_base) + probe_output_offsets[i];
+      mtp_sampling::gather_capture_rows(s.probe_capture->at<std::uint16_t>() + probe_offsets[i],
+          probes->layers.size(), inputs[i].depth + 1, probes->width,
+          s.at<mtp_sampling::Result>(i, l.result), s.at<mtp_sampling::Status>(i, l.status), selected_probes, stream);
+      check(cudaMemcpyAsync(probes->hidden.data(), selected_probes, probes->hidden.size() * sizeof(std::uint16_t),
+          cudaMemcpyDeviceToHost, stream), "capture selected target layer probes");
+    }
+    if (auto* features = inputs[i].capture) {
+      auto* scores = s.capture->at<MtpCaptureScores>(score_offset) + capture_offsets[i];
+      mtp_sampling::capture_scores(s.at<void>(i, l.target_probs), s.at<void>(i, l.draft_probs),
+          s.tokens.at<std::uint32_t>() + s.offsets[i] + 1, inputs[i].depth, kVocabulary,
+          s.compact_sizes[i], greedy ? s.at<std::uint32_t>(i, l.greedy_ids) : nullptr,
+          s.at<mtp_sampling::Status>(i, l.status), scores, stream);
+      check(cudaMemcpyAsync(features->target_hidden.data(), inputs[i].target_hidden,
+          features->target_hidden.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+          "capture target hidden");
+      check(cudaMemcpyAsync(features->assistant_hidden.data(),
+          s.capture->at<mtp_target::BFloat16>() + capture_offsets[i] * model::kAssistantHiddenSize,
+          features->assistant_hidden.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+          "capture assistant hidden");
+      check(cudaMemcpyAsync(features->draft_tokens.data(), s.tokens.at<std::uint32_t>() + s.offsets[i] + 1,
+          inputs[i].depth * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream), "capture draft IDs");
+      check(cudaMemcpyAsync(features->scores.data(), scores, inputs[i].depth * sizeof(MtpCaptureScores),
+          cudaMemcpyDeviceToHost, stream), "capture probability scores");
+    }
     check(cudaMemcpyAsync(&statuses[i], s.at<void>(i, l.status), sizeof(statuses[i]),
                           cudaMemcpyDeviceToHost, stream), "copy batch MTP status");
     check(cudaMemcpyAsync(&result.verification, s.at<void>(i, l.result),

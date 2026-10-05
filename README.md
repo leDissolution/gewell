@@ -3,8 +3,9 @@
 Gewell is a single-GPU inference engine for Gemma 4 31B (more to come) on NVIDIA Blackwell
 GPUs with compute capability 12.0 (`sm_120a`) (*potentially* more to come).
 
-Features include streamed responses, tool conversations, JSON-constrained
-answers, continuous batching, prefix caching with optional CPU storage, and
+Features include streamed responses, PNG/JPEG image input with configurable
+per-image token budgets, tool conversations, JSON-constrained answers,
+continuous batching, prefix caching with optional CPU storage, and
 MTP speculative decoding using the Gemma assistant. Local and global
 KV storage can independently use BF16 or FP8 (no, I will not be implementing FP4. Go lobotomize your models somewhere else).
 

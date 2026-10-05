@@ -167,7 +167,9 @@ struct Server::Impl {
         !settings.max_body_bytes || !settings.max_body_total_bytes ||
         settings.max_output_bytes < 1024 || !settings.socket_timeout_seconds || !max_burst ||
         max_burst > static_cast<std::size_t>(std::numeric_limits<int>::max()) || settings.model.empty() ||
-        (images.prepare && (!images.prepared_bytes || !images.max_image_tokens)))
+        (images.prepare && (!images.max_image_tokens ||
+          !images.prepared_bytes.count(images.default_max_soft_tokens) ||
+          !images.prepared_bytes.at(images.default_max_soft_tokens))))
       throw std::invalid_argument("invalid HTTP bounds, port, model, or token burst (output minimum: 1024 bytes)");
     metrics::Writer initial(settings.model);
     initial.gauge("vllm:kv_cache_usage_perc", "Nonreclaimable allocated GPU cache pool fraction; 1 means full.", 0);
@@ -458,19 +460,20 @@ struct Server::Impl {
         alive = client->alive;
       }
       auto bounded_images = images;
-      if (images.prepare) bounded_images.prepare = [this, client](std::string_view url) {
+      if (images.prepare) bounded_images.prepare = [this, client](std::string_view url, std::uint32_t max_soft_tokens) {
         auto lease = std::make_shared<ImageLease>();
         lease->total = image_bytes;
+        const auto prepared_bytes = images.prepared_bytes.at(max_soft_tokens);
         {
           std::lock_guard lock(mutex);
           if (stopping || !client->alive || client->terminal || client->error)
             throw Error(503, "image preparation cancelled", {}, "request_cancelled");
-          if (images.prepared_bytes > settings.max_body_total_bytes - body_bytes - image_bytes->load())
+          if (prepared_bytes > settings.max_body_total_bytes - body_bytes - image_bytes->load())
             throw Error(503, "aggregate image and request body capacity is exhausted", {}, "capacity_exceeded");
-          image_bytes->fetch_add(images.prepared_bytes);
-          lease->bytes = images.prepared_bytes;
+          image_bytes->fetch_add(prepared_bytes);
+          lease->bytes = prepared_bytes;
         }
-        lease->image = images.prepare(url);
+        lease->image = images.prepare(url, max_soft_tokens);
         if (!lease->image || lease->image->pixels.size() > lease->bytes ||
             lease->image->positions.size() > lease->bytes - lease->image->pixels.size())
           throw Error(500, "image processor exceeded its reserved tensor capacity", {}, "execution_failed");

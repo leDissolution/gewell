@@ -35,9 +35,10 @@ memory configuration.
 
 `stop` accepts a string or an array of strings; matched stop text is removed
 from the output. `chat_template_kwargs` accepts the booleans `enable_thinking`
-and `preserve_thinking` and rejects every other key; rendering follows the
-built-in Gemma 4 template described in the [bundle guide](models.md). Reasoning is
-returned separately as `reasoning_content`. For compatibility, chat also accepts
+and `preserve_thinking`; unknown keys such as `clear_thinking` are ignored.
+Rendering follows the built-in Gemma 4 template described in the
+[bundle guide](models.md). Reasoning is returned separately as
+`reasoning_content`. For compatibility, chat also accepts
 `reasoning_effort`: `none` disables thinking; `low`, `medium`, and `high` all
 enable it. A supplied value overrides `chat_template_kwargs.enable_thinking`.
 Omission or null keeps the template setting, which defaults to false. This
@@ -95,18 +96,61 @@ request error. A response stopped by the token limit can still be incomplete.
 
 User message content can contain text parts and `image_url` parts. Images must
 be inline base64 PNG or JPEG data URLs; remote URLs and local file URLs are not
-fetched. `image_url.detail` can be omitted or set to `auto`. Multiple images
-and images in multiple user turns are supported.
+fetched. Enable image input with `--vision PATH`. Multiple images and images
+in multiple user turns are supported.
+
+The image budget is a maximum number of soft tokens **per image**. Supported
+values are **70, 140, 280, 560, and 1120**. The server defaults to **280**;
+set `--image-max-soft-tokens N` after `serve-http` to change that default.
+A request can override it in either direction with the top-level
+`mm_processor_kwargs.max_soft_tokens` field:
 
 ```json
-{"role":"user","content":[
-  {"type":"text","text":"Describe this picture."},
-  {"type":"image_url","image_url":{"url":"data:image/png;base64,BASE64_IMAGE_BYTES"}}
-]}
+{
+  "model": "gemma-4-31b",
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "Read the small text in this picture."},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,BASE64_IMAGE_BYTES"}}
+  ]}],
+  "mm_processor_kwargs": {"max_soft_tokens": 1120},
+  "max_tokens": 128
+}
 ```
 
+The override applies to every image in the request, including earlier user
+turns. The same option works on `/v1/cache/prefill` with `messages`. Omitted,
+null, or empty `mm_processor_kwargs` uses the server default. A supplied
+`max_soft_tokens` must be an integer from the list above; null, other values,
+and unknown processor options return 400. Raw Completions and cache prefill
+with `prompt` reject non-null processor options.
+
+For clients using the OpenAI Python SDK, put this extension in
+`extra_body={"mm_processor_kwargs": {"max_soft_tokens": 1120}}` on the chat
+completion call. `image_url.detail` can be omitted, null, or `"auto"`; each
+uses the selected token budget. `"low"` and `"high"` are unsupported.
+
+Larger budgets retain more spatial detail and increase processing time, prompt
+length, and memory use. Aspect-ratio-preserving resizing can produce fewer
+tokens than the selected maximum. For example, a square image uses 256 image
+tokens at budget 280 and 1089 at budget 1120. The 1280-row execution capacity
+is not an image-budget option.
+
 The server decodes and prepares images natively. Body, pixel, tensor, and GPU
-capacity limits apply. Image identity participates in prefix caching.
+capacity limits apply. Prepared tensors cost about 7.4 MiB per image at 280
+and 29.6 MiB at 1120, charged alongside encoded bodies against
+`--max-body-total-bytes` (default 256 MiB). Exhausting this limit returns 503;
+raise it when serving many concurrent large images. The server retains one GPU
+vision workspace sized for the largest image processed: up to about 112 MiB
+at 280 or 449 MiB at 1120, including uploads and the tower's output. Packed
+prefill uses a separate image-feature buffer: up to 21 MiB with the default
+`--prefill-batch-tokens 2048`, or 42 MiB at the maximum 4096. These buffers
+grow as needed and remain until shutdown; they need room alongside model
+weights, text executor scratch and the configured KV cache.
+
+Prepared image identity participates in prefix caching. Repeating the same
+image and budget can reuse its cached prefix; changing the budget changes
+that identity. Existing retained prefixes remain available for requests using
+their original budget.
 
 ## Cache
 
@@ -141,8 +185,8 @@ prompt-cleanup fields `audio`, `moderation`, `prediction`,
 chat rejects `prompt`, `echo`, `best_of`, and `suffix`; Completions rejects
 `messages`, `max_completion_tokens`, `chat_template_kwargs`, `top_logprobs`,
 `logprobs`, `response_format`, `tools`, `tool_choice`, `store`, `modalities`,
-`parallel_tool_calls`, and `reasoning_effort`, and accepts `echo` and `best_of` only at their
+`parallel_tool_calls`, `reasoning_effort`, and `mm_processor_kwargs`, and accepts `echo` and `best_of` only at their
 defaults. Unknown top-level fields are ignored. Nested messages, tools,
-schemas, and cache objects are validated. There is no `/v1/responses`
+schemas, processor options, and cache objects are validated. There is no `/v1/responses`
 endpoint. Error responses include an `x-request-id` for matching server logs;
 an error after streaming has started is reported within the stream.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gewell/logprobs.h"
+#include "gewell/mtp_capture.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -73,6 +74,22 @@ struct TokenProbability {
   std::uint32_t token;
   float probability;
 };
+
+// Small training diagnostics from the filtered distributions. A nonnull
+// greedy_target_ids selects the ID-only greedy path (p is 0/1, q is 1).
+// Otherwise compact_size == 0 means dense FP32 rows, >0 TokenProbability rows.
+// Does not change distributions, status, RNG, or verifier results.
+void capture_scores(const void* target, const void* draft,
+    const std::uint32_t* draft_ids, std::uint32_t depth, std::uint32_t vocabulary_size,
+    std::uint32_t compact_size, const std::uint32_t* greedy_target_ids,
+    const Status* status, MtpCaptureScores* output, cudaStream_t stream = nullptr);
+
+// Select the last committed verifier-input row from layer-major probe rows.
+// The selected row precedes the next pending token, so its label is the NEXT
+// MTP round. All pointers are device pointers; failed results produce zeros.
+void gather_capture_rows(const std::uint16_t* probes, std::uint32_t layers,
+    std::uint32_t rows, std::uint32_t width, const Result* result,
+    const Status* status, std::uint16_t* output, cudaStream_t stream = nullptr);
 
 // Returns the compact row size, or zero for the dense/greedy paths.
 std::uint32_t compact_row_size(std::uint32_t vocabulary_size, float temperature,

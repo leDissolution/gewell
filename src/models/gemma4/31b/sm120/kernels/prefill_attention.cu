@@ -5,6 +5,101 @@ namespace {
 
 using namespace detail;
 
+// Short cached suffixes used to serialize both QK and PV in one warp. Compute
+// scores across eight warps, then retain the scalar path's exact online-softmax
+// and per-dimension accumulation order. In particular, probabilities stay FP32.
+template <unsigned HeadSize, unsigned KvHeads, bool Local,
+          bool Compact = false, bool Paged = false>
+__global__ void short_cached_attention_kernel(
+    const BFloat16* query, const BFloat16* current_key,
+    const BFloat16* current_value, const BFloat16* key_cache,
+    const BFloat16* value_cache, const std::uint64_t* page_offsets,
+    const BFloat16* norm, unsigned page_tokens, std::size_t layer_offset,
+    unsigned base, unsigned rows, unsigned capacity, BFloat16* output,
+    kv_cache::Format format) {
+  constexpr unsigned kMaximumKeys = gemma4_31b::kLocalWindowSize + 32;
+  __shared__ float scores[kMaximumKeys];
+  __shared__ float old_weights[kMaximumKeys];
+  __shared__ float new_weights[kMaximumKeys];
+  __shared__ float denominator;
+  const unsigned head = blockIdx.x, row = blockIdx.y;
+  const unsigned kv_head = head / (gemma4_31b::kQueryHeadCount / KvHeads);
+  const unsigned lane = threadIdx.x % kWarpSize;
+  const unsigned warp = threadIdx.x / kWarpSize;
+  const unsigned last = base + row;
+  const unsigned first = Local && last >= gemma4_31b::kLocalWindowSize - 1
+      ? last - (gemma4_31b::kLocalWindowSize - 1) : 0;
+  const unsigned count = last - first + 1;
+  const auto load = [&](unsigned position, unsigned d, bool key) {
+    const bool current = position >= base;
+    const auto current_k = (std::size_t(kv_head) * rows + position - base) * HeadSize + d;
+    const auto current_v = (std::size_t(position - base) * KvHeads + kv_head) * HeadSize + d;
+    if constexpr (Compact) {
+      const auto* cached = current ? nullptr : compact_global_cache_row<Paged>(
+          key_cache, page_offsets, page_tokens, layer_offset, kv_head, position, capacity, format);
+      if (key && is_compact_global_key_dimension(d))
+        return current ? current_key[current_k]
+            : kv_storage::load(cached, compact_global_key_index(d), 640, format, 128);
+      const auto v = current ? current_value[current_v]
+          : kv_storage::load(cached, 128 + d, 640, format, 128);
+      return key ? compact_global_reconstructed_key(v, norm[d]) : v;
+    } else {
+      if (current) return key ? current_key[current_k] : current_value[current_v];
+      const unsigned slot = Local ? position % gemma4_31b::kLocalWindowSize : position;
+      const auto* cached = kv_storage::row(key ? key_cache : value_cache,
+          std::size_t(kv_head) * capacity + slot, HeadSize, format);
+      return kv_storage::load(cached, d, HeadSize, format);
+    }
+  };
+  float q[HeadSize / kWarpSize];
+#pragma unroll
+  for (unsigned i = 0; i < HeadSize / kWarpSize; ++i)
+    q[i] = __bfloat162float(query[(std::size_t(head) * rows + row) * HeadSize + lane + i * kWarpSize]);
+  for (unsigned key = warp; key < count; key += kWarpsPerBlock) {
+    float score = 0.0F;
+#pragma unroll
+    for (unsigned i = 0; i < HeadSize / kWarpSize; ++i)
+      score = fmaf(q[i], __bfloat162float(load(first + key, lane + i * kWarpSize, true)), score);
+#pragma unroll
+    for (unsigned offset = kWarpSize / 2; offset; offset /= 2)
+      score += __shfl_down_sync(0xffffffffU, score, offset);
+    if (!lane) scores[key] = score;
+  }
+  __syncthreads();
+  if (!threadIdx.x) {
+    float maximum = -CUDART_INF_F, sum = 0.0F;
+    for (unsigned key = 0; key < count; ++key) {
+      float old_weight, new_weight;
+      if (scores[key] <= maximum) {
+        old_weight = 1.0F;
+        new_weight = expf(scores[key] - maximum);
+        sum += new_weight;
+      } else {
+        old_weight = expf(maximum - scores[key]);
+        new_weight = 1.0F;
+        sum = fmaf(sum, old_weight, new_weight);
+        maximum = scores[key];
+      }
+      old_weights[key] = old_weight;
+      new_weights[key] = new_weight;
+    }
+    denominator = sum;
+  }
+  __syncthreads();
+  for (unsigned d = threadIdx.x; d < HeadSize; d += kThreads) {
+    float numerator = 0.0F;
+    for (unsigned key = 0; key < count; ++key)
+      numerator = fmaf(new_weights[key], __bfloat162float(load(first + key, d, false)),
+                       numerator * old_weights[key]);
+    output[(std::size_t(row) * gemma4_31b::kQueryHeadCount + head) * HeadSize + d] =
+        __float2bfloat16_rn(numerator / denominator);
+  }
+}
+
+bool short_cached_chunk(unsigned base, unsigned rows) {
+  return base >= 16 && base < 1024 && rows < 32;
+}
+
 template <std::uint32_t HeadSize, std::uint32_t KvHeads, bool Local>
 __global__ void causal_gqa_attention_cached_chunk_kernel(
     const BFloat16* query_head_major,
@@ -45,17 +140,14 @@ __global__ void causal_gqa_attention_cached_chunk_kernel(
   float running_maximum = -__int_as_float(0x7f800000);
   float denominator = 0.0F;
 
-  std::uint32_t first_key_position =
+  const std::uint32_t first_key_position =
       Local && absolute_query_position >= gemma4_31b::kLocalWindowSize - 1
           ? absolute_query_position - (gemma4_31b::kLocalWindowSize - 1)
           : 0;
-  const bool image_query = absolute_query_position >= image_begin &&
+  const bool image_query = Local && absolute_query_position >= image_begin &&
                            absolute_query_position < image_end;
-  if (image_query) {
-    // The reference mask is sliding/causal OR same-image-block. Keep normal
-    // local history while restoring every earlier token in a long image.
-    first_key_position = min(first_key_position, image_begin);
-  }
+  // Gemma 4 uses causal global attention. Local attention adds same-image
+  // lookahead, but its past-window cutoff still applies inside long images.
   const std::uint32_t last_key_position =
       image_query ? image_end - 1 : absolute_query_position;
   std::uint32_t absolute_key_position = first_key_position;
@@ -156,8 +248,8 @@ __global__ void causal_gqa_attention_cached_chunk_global_compact_kernel(
     const BFloat16* global_k_norm_scale,
     std::uint32_t page_tokens, std::size_t layer_offset_elements,
     std::uint32_t base_position, std::uint32_t token_count,
-    std::uint32_t cache_capacity, std::uint32_t image_begin,
-    std::uint32_t image_end, BFloat16* context_token_major, kv_cache::Format format) {
+    std::uint32_t cache_capacity, BFloat16* context_token_major,
+    kv_cache::Format format) {
   constexpr std::uint32_t kHeadSize = gemma4_31b::kGlobalHeadSize;
   constexpr std::uint32_t kKvHeads = gemma4_31b::kGlobalKvHeadCount;
   constexpr unsigned kRepeats =
@@ -190,10 +282,7 @@ __global__ void causal_gqa_attention_cached_chunk_global_compact_kernel(
   float running_maximum = -__int_as_float(0x7f800000);
   float denominator = 0.0F;
 
-  const bool image_query = absolute_query_position >= image_begin &&
-                           absolute_query_position < image_end;
-  const std::uint32_t last_key_position =
-      image_query ? image_end - 1 : absolute_query_position;
+  const std::uint32_t last_key_position = absolute_query_position;
   std::uint32_t absolute_key_position = 0;
   while (true) {
     const bool current = absolute_key_position >= base_position;
@@ -510,6 +599,22 @@ void causal_gqa_attention_cached_chunk(
   check_chunk_cache(base_position, token_count, cache_capacity, kind,
                     "causal_gqa_attention_cached_chunk");
 
+  if (short_cached_chunk(base_position, token_count)) {
+    const dim3 grid(gemma4_31b::kQueryHeadCount, token_count);
+    if (kind == gemma4_31b::AttentionKind::global)
+      short_cached_attention_kernel<512, 4, false><<<grid, kThreads, 0, stream>>>(
+          query_head_major, current_key_head_major, current_value_token_major,
+          key_cache, value_cache, nullptr, nullptr, 0, 0, base_position,
+          token_count, cache_capacity, context_token_major, format);
+    else
+      short_cached_attention_kernel<256, 16, true><<<grid, kThreads, 0, stream>>>(
+          query_head_major, current_key_head_major, current_value_token_major,
+          key_cache, value_cache, nullptr, nullptr, 0, 0, base_position,
+          token_count, cache_capacity, context_token_major, format);
+    check_cuda(cudaGetLastError(), "short cached attention kernel launch");
+    return;
+  }
+
   if (kind == gemma4_31b::AttentionKind::global) {
     constexpr unsigned kGlobalRepeats =
         gemma4_31b::kQueryHeadCount / gemma4_31b::kGlobalKvHeadCount;
@@ -611,6 +716,16 @@ void causal_gqa_attention_cached_chunk_global_compact(
                     gemma4_31b::AttentionKind::global,
                     "causal_gqa_attention_cached_chunk_global_compact");
 
+  if (short_cached_chunk(base_position, token_count)) {
+    const dim3 grid(gemma4_31b::kQueryHeadCount, token_count);
+    short_cached_attention_kernel<512, 4, false, true><<<grid, kThreads, 0, stream>>>(
+        query_head_major, current_key_head_major, current_value_token_major,
+        compact_kv_cache, nullptr, nullptr, global_k_norm_scale, 0, 0,
+        base_position, token_count, cache_capacity, context_token_major, format);
+    check_cuda(cudaGetLastError(), "short compact-global attention kernel launch");
+    return;
+  }
+
   constexpr unsigned kGlobalRepeats =
       gemma4_31b::kQueryHeadCount /
       gemma4_31b::kGlobalKvHeadCount;
@@ -620,7 +735,7 @@ void causal_gqa_attention_cached_chunk_global_compact(
           query_head_major, current_key_head_major,
           current_value_token_major, compact_kv_cache, nullptr,
           global_k_norm_scale, 0, 0, base_position, token_count,
-          cache_capacity, 0, 0, context_token_major, format);
+          cache_capacity, context_token_major, format);
   check_cuda(cudaGetLastError(),
              "compact-global cached chunk attention kernel launch");
 }
@@ -661,7 +776,7 @@ void image_block_gqa_attention_cached_chunk_global_compact(
           query_head_major, current_key_head_major,
           current_value_token_major, compact_kv_cache, nullptr,
           global_k_norm_scale, 0, 0, base_position, token_count,
-          cache_capacity, image_begin, image_end, context_token_major, format);
+          cache_capacity, context_token_major, format);
   check_cuda(cudaGetLastError(),
              "image-block compact-global attention kernel launch");
 }
@@ -689,6 +804,17 @@ void causal_gqa_attention_cached_chunk_global_compact_paged(
       cache, base_position, token_count,
       "causal_gqa_attention_cached_chunk_global_compact_paged", true);
 
+  if (short_cached_chunk(base_position, token_count)) {
+    const dim3 grid(gemma4_31b::kQueryHeadCount, token_count);
+    short_cached_attention_kernel<512, 4, false, true, true><<<grid, kThreads, 0, stream>>>(
+        query_head_major, current_key_head_major, current_value_token_major,
+        cache.page_pool, nullptr, cache.page_offsets, global_k_norm_scale,
+        cache.page_tokens, cache.layer_offset_elements, base_position, token_count,
+        0, context_token_major, cache.format);
+    check_cuda(cudaGetLastError(), "short paged compact-global attention kernel launch");
+    return;
+  }
+
   constexpr unsigned kRepeats = gemma4_31b::kQueryHeadCount /
                                 gemma4_31b::kGlobalKvHeadCount;
   const dim3 grid(gemma4_31b::kGlobalKvHeadCount, token_count);
@@ -697,7 +823,7 @@ void causal_gqa_attention_cached_chunk_global_compact_paged(
           query_head_major, current_key_head_major, current_value_token_major,
           cache.page_pool, cache.page_offsets, global_k_norm_scale,
           cache.page_tokens, cache.layer_offset_elements, base_position,
-          token_count, 0, 0, 0, context_token_major, cache.format);
+          token_count, 0, context_token_major, cache.format);
   check_cuda(cudaGetLastError(),
              "paged compact-global cached chunk attention kernel launch");
 }
@@ -733,7 +859,7 @@ void image_block_gqa_attention_cached_chunk_global_compact_paged(
           query_head_major, current_key_head_major, current_value_token_major,
           cache.page_pool, cache.page_offsets, global_k_norm_scale,
           cache.page_tokens, cache.layer_offset_elements, base_position,
-          token_count, 0, image_begin, image_end, context_token_major, cache.format);
+          token_count, 0, context_token_major, cache.format);
   check_cuda(cudaGetLastError(),
              "paged image-block compact-global attention kernel launch");
 }

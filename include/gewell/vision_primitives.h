@@ -50,6 +50,13 @@ void head_tokens_to_token_heads(const BFloat16* input, BFloat16* output,
                                 std::uint32_t patch_rows,
                                 cudaStream_t stream = nullptr);
 
+// Full bidirectional attention, scale=1. Q/K/V are [16,patch_rows,72];
+// output is [patch_rows,16,72]. BF16 inputs/output, FP32 online softmax and
+// accumulation, with no materialized score/probability matrix or padding keys.
+void full_attention(const BFloat16* query, const BFloat16* key,
+                    const BFloat16* value, BFloat16* output,
+                    std::uint32_t patch_rows, cudaStream_t stream = nullptr);
+
 // Row-wise FP32 softmax with BF16 input and output. This is the boundary used
 // after the BF16 QK score matrix. columns may be at most kMaxPatchRows;
 // scores and probabilities may be the same pointer.

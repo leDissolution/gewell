@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 namespace gewell::runtime {
+class MtpStats;
+class MtpCapture;
 enum class Operation { generate, prefill, finish, stats };
 enum class BatchPhase { vacant, withheld, queued, waiting, decoding, finishing, responding, complete, cancelled };
 
@@ -79,6 +81,8 @@ struct BatchRequest {
   double prefill_gpu_seconds{}, decode_gpu_seconds{};
   std::uint64_t mtp_cycles{}, mtp_proposed{}, mtp_accepted{}, mtp_rejected_cycles{};
   std::vector<std::uint64_t> mtp_accepted_histogram;
+  std::uint32_t mtp_previous_depth{}, mtp_previous_accepted{};
+  std::unique_ptr<MtpTargetProbes> mtp_capture_probes;
 };
 
 struct BatchPrefixWork {
@@ -121,9 +125,16 @@ struct BatchLimits {
   kv_cache::Format local_kv_format{kv_cache::Format::bf16};
   kv_cache::Format global_kv_format{kv_cache::Format::bf16};
   std::uint32_t capacity{}, mtp_depth{}, plan_rows{}, max_horizon{};
+  // Target rows include one pending token per ready decode request. Zero width
+  // selects fixed maximum depth; the minimum takes precedence over the target.
+  std::uint32_t mtp_min_depth{}, decode_width{};
+  std::string mtp_stats_path;
+  std::uint32_t mtp_stats_window{64};
+  MtpCaptureSettings mtp_capture;
   std::uint32_t prefill_chunk_tokens{0};
+  std::uint32_t prefill_batch_tokens{0};
   // Soft prefill-token budget between decode passes; zero runs decode after
-  // each prefill chunk/head. Physical chunks and image spans remain atomic.
+  // each packed forward/head. Physical forwards and image spans remain atomic.
   std::uint32_t prefill_budget_tokens{};
   std::size_t kv_bytes{}, max_requests{4096};
   std::size_t cpu_bytes{}, index_bytes{kv_cache::kDefaultIndexBytes};
@@ -255,6 +266,9 @@ class BatchScheduler {
 
   BatchLimits limits;
   BatchCallbacks callbacks;
+  std::unique_ptr<MtpStats> mtp_stats;
+  std::unique_ptr<MtpCapture> mtp_capture;
+  std::uint64_t sequence_begin{};
   const std::uint32_t capacity, mtp_depth;
   std::unique_ptr<ExecutionBackend> owned_backend;
   ExecutionBackend& backend;

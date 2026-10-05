@@ -10,7 +10,6 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
   RuntimeBackend(const WeightArena& weights, const runtime::BatchLimits& limits,
                  nvfp4::ActivationPolicy policy)
       : weights_(weights), policy_(policy),
-        prefill_chunk_tokens_(checked_prefill_chunk_tokens(limits.prefill_chunk_tokens)),
         memory_(limits.kv_bytes, limits.capacity, limits.mtp_depth, limits.local_kv_format, limits.global_kv_format),
         config_(compact_pool_config(memory_.committed_kv_bytes, limits.cpu_bytes, limits.index_bytes, limits.local_kv_format, limits.global_kv_format)),
         execution_(memory_, limits.capacity, limits.mtp_depth) {
@@ -39,7 +38,7 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
                   const runtime::BatchLimits& limits) override {
     cache_ = std::make_unique<ExecutionCache>(cache);
     execution_.initialize_executor(weights_, *cache_, bootstrap, limits.plan_rows,
-        limits.max_horizon, limits.sampled, limits.prefill_chunk_tokens, policy_,
+        limits.max_horizon, limits.sampled, limits.prefill_chunk_tokens, limits.prefill_batch_tokens, policy_,
         limits.local_attention_compute, limits.global_attention_compute);
   }
   void initialize_outputs(bool captures, bool logprobs) override {
@@ -70,65 +69,62 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
   void begin_step(std::string_view op) override { execution_.begin_step(op); }
   void end_step(std::string_view op) override { execution_.end_step(op); }
   float elapsed(std::string_view op) const override { return execution_.elapsed(op); }
-  void prefill_step(kv_cache::ExecutionId id, const std::uint32_t* tokens,
-      std::uint32_t position, std::uint32_t rows, bool final, runtime::TerminalState hidden) override {
-    execution_.engine->prefill_step(id, tokens, position, rows, final,
-                                    static_cast<BFloat16*>(hidden.value));
-  }
-  std::uint32_t image_prefill_step(kv_cache::ExecutionId id, const std::uint32_t* tokens,
-      std::uint32_t total_rows, std::uint32_t begin, std::uint32_t end,
-      const std::vector<std::shared_ptr<const runtime::ImageInput>>& images,
-      runtime::TerminalState hidden, const std::function<bool()>& continue_prefill) override {
-    if (!weights_.has_vision()) fail("image prefill", "image input requires --vision PATH");
-    if (image_ || !tokens || !total_rows || total_rows > limits_.context_tokens ||
-        begin >= end || end > total_rows || images.empty() || !hidden.value)
-      fail("image prefill", "invalid image work range");
-    std::uint32_t previous_end = 0;
-    for (const auto& input : images) {
-      if (!input || input->begin < previous_end || input->begin >= input->end ||
-          input->end > total_rows || input->end - input->begin > limits_.max_image_tokens)
-        fail("image prefill", "invalid ordered image ranges");
-      const auto& image = *input;
-      if ((image.begin < begin && begin < image.end) ||
-          (image.begin < end && end < image.end))
-        fail("image prefill", "prefill range splits image features");
-      previous_end = image.end;
-      if (image.end <= begin || image.begin >= end) continue;
+  std::vector<bool> prefill_batch(const std::vector<runtime::BatchPrefillInput>& inputs,
+      const std::function<bool(std::size_t)>& continue_prefill) override {
+    std::size_t feature_bytes = 0;
+    for (const auto& input : inputs)
+      if (input.image) feature_bytes += std::size_t(input.rows) * model::kHiddenSize * sizeof(BFloat16);
+    // Text-only forwards already poll after dispatch. Avoid image staging and
+    // mid-selection admission/cancellation polls on that established path.
+    if (!feature_bytes) {
+      execution_.engine->prefill_batch(inputs, {});
+      return std::vector<bool>(inputs.size(), true);
+    }
+    if (feature_bytes && (!image_features_ || image_features_->size() < feature_bytes)) {
+      image_features_.reset();
+      image_features_ = std::make_unique<DeviceAllocation>(feature_bytes);
+    }
+    std::vector<VisionPromptSlice> images(inputs.size());
+    std::size_t offset = 0;
+    const auto stream = execution_.engine->stream();
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      const auto& input = inputs[i];
+      if (!input.image || !continue_prefill(i)) continue;
+      if (!weights_.has_vision()) fail("image prefill", "image input requires --vision PATH");
+      const auto& image = *input.image;
+      if (image.begin != input.position || image.end <= image.begin ||
+          image.end - image.begin != input.rows || input.rows > limits_.max_image_tokens ||
+          image.end > limits_.context_tokens)
+        fail("image prefill", "invalid whole-image segment");
       if (image.pixels.size() != vision_engine::prepared_pixel_bytes(image.padded_patch_rows) ||
           image.positions.size() != vision_engine::prepared_position_bytes(image.padded_patch_rows))
         fail("image prefill", "prepared tensor lengths disagree with patch rows");
       vision_engine::validate_prepared_image_bytes(image.pixels.data(), image.pixels.size(),
-          image.positions.data(), image.positions.size(), image.end - image.begin);
+          image.positions.data(), image.positions.size(), input.rows);
+      if (!image_) image_ = std::make_unique<PreparedImage>(weights_);
+      image_->prepare(image.pixels, image.positions, image.padded_patch_rows, input.rows, stream);
+      auto* features = static_cast<BFloat16*>(image_features_->data()) + offset;
+      // Retain this image before the next serial tower pass reuses its output.
+      check_cuda(cudaMemcpyAsync(features, image_->data(),
+          std::size_t(input.rows) * model::kHiddenSize * sizeof(BFloat16),
+          cudaMemcpyDeviceToDevice, stream), "retain packed image features");
+      images[i] = {features, image.begin, image.end};
+      offset += std::size_t(input.rows) * model::kHiddenSize;
     }
-    std::uint32_t base = begin;
-    std::size_t image_index = 0;
-    while (image_index < images.size() && images[image_index]->end <= begin) ++image_index;
-    while (base < end) {
-      if (!continue_prefill()) break;
-      const auto* image = image_index < images.size() && images[image_index]->begin < end
-          ? images[image_index].get() : nullptr;
-      const auto chunk_rows = multimodal_prefill_chunk_rows(base, end, prefill_chunk_tokens_,
-          image ? image->begin : 0, image ? image->end : 0);
-      VisionPromptSlice vision;
-      if (image && image->begin == base) {
-        // A preceding image's features may still be read by queued decoder work.
-        execution_.engine->synchronize("complete preceding image prefill");
-        image_.reset();
-        if (!continue_prefill()) break;
-        image_ = std::make_unique<PreparedImage>(weights_, image->pixels, image->positions,
-            image->padded_patch_rows, image->end - image->begin);
-        if (!continue_prefill()) break;
-        vision = {image_->data(), image->begin, image->end};
-        ++image_index;
-      }
-      execution_.engine->prefill_step(id, tokens + base, base, chunk_rows, false,
-          base + chunk_rows == end ? static_cast<BFloat16*>(hidden.value) : nullptr,
-          vision.soft_features ? &vision : nullptr);
-      base += chunk_rows;
+    std::vector<bool> completed(inputs.size(), false);
+    std::vector<runtime::BatchPrefillInput> active;
+    std::vector<VisionPromptSlice> active_images;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      if (!continue_prefill(i)) continue;
+      active.push_back(inputs[i]);
+      active_images.push_back(images[i]);
+      completed[i] = true;
     }
-    return base;
+    if (!active.empty()) execution_.engine->prefill_batch(active, active_images);
+    return completed;
   }
-  void release_image() override { image_.reset(); }
+  // Completion ends feature use; retain the bounded cohort buffer and tower workspace.
+  void release_image() override {}
   void prefix_head_step(kv_cache::ExecutionId id, runtime::TerminalState hidden) override {
     execution_.engine->prefix_head_step(id, nullptr, static_cast<const BFloat16*>(hidden.value));
   }
@@ -152,7 +148,7 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
       proposals.push_back({input.execution, input.pending_token, input.position, input.depth,
           static_cast<const BFloat16*>(input.target_hidden.value), input.temperature, input.top_p,
           input.top_k, input.return_probabilities, input.uniforms,
-          input.constraint_mask});
+          input.constraint_mask, input.capture, input.capture_next});
     }
     auto result = execution_.engine->run_batch_mtp(proposals);
     runtime::BatchMtpOutcome output;
@@ -216,16 +212,16 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
  private:
   const WeightArena& weights_;
   const nvfp4::ActivationPolicy policy_;
-  const std::uint32_t prefill_chunk_tokens_;
   const runtime::BackendLimits limits_{model::kVocabSize, primitives::kMaxContextTokenCount,
       kMaxBatchRows, mtp_target::kMaxDepth, mtp_target::kMaxDepth + 1,
-      kMaxPrefillChunkTokens, kLocalWindowTokens, kGenerationLogitRowBytes,
+      kMaxPrefillChunkTokens, kMaxPrefillBatchTokens, kLocalWindowTokens, kGenerationLogitRowBytes,
       {kGenerationStopTokenIds.begin(), kGenerationStopTokenIds.end()}, model::kVisionMaxSoftTokenCount};
   const BatchMemoryPlan memory_;
   const kv_cache::PoolConfig config_;
   std::unique_ptr<ExecutionCache> cache_;
   BatchExecution execution_;
   std::unique_ptr<PreparedImage> image_;
+  std::unique_ptr<DeviceAllocation> image_features_;
 };
 }
 std::unique_ptr<runtime::ExecutionBackend> make_runtime_backend(

@@ -176,10 +176,11 @@ void causal_gqa_attention_cached_chunk(
     cudaStream_t stream = nullptr,
     kv_cache::Format format = kv_cache::Format::bf16);
 
-// The Gemma 4 multimodal prefill mask is causal except that the contiguous
-// image-placeholder block attends bidirectionally within itself. The complete
-// image block must be contained in the current chunk. This is the only mask
-// deviation needed before ordinary M=1 cached decoding resumes.
+// Gemma 4 global layers remain causal for image tokens. Local layers use
+// (causal OR same-image-block) AND (key_position > query_position - 1024):
+// image lookahead is permitted, but earlier image tokens still expire from
+// the local window. The complete image block must be in the current chunk.
+// Ordinary M=1 cached decoding resumes after multimodal prefill.
 void image_block_gqa_attention_cached_chunk(
     const BFloat16* query_head_major,
     const BFloat16* current_key_head_major,
@@ -207,6 +208,9 @@ void image_block_gqa_attention_cached_chunk(
 // Supplying fp8 selects native E4M3 QK/PV operands, including current rows.
 // Softmax/state/output accumulation stay FP32. The FP8 context owns additional
 // packing scratch and prepares/caches host matmul plans for new query shapes.
+// A nonempty image_begin/image_end span adds same-image lookahead in local
+// layers, retaining the 1024-token past cutoff. Global layers stay causal.
+// Query slices still read the complete staged image; cache writes follow all slices.
 void causal_gqa_attention_cached_chunk_tensor(
     cublasHandle_t handle, const BFloat16* query_head_major,
     const BFloat16* current_key_head_major,
@@ -216,7 +220,8 @@ void causal_gqa_attention_cached_chunk_tensor(
     BFloat16* context_token_major, gemma4_31b::AttentionKind kind,
     cudaStream_t stream = nullptr,
     kv_cache::Format format = kv_cache::Format::bf16,
-    Fp8Attention* fp8 = nullptr);
+    Fp8Attention* fp8 = nullptr,
+    std::uint32_t image_begin = 0, std::uint32_t image_end = 0);
 
 // Commit current K [KV,token_count,D] and V [token_count,KV,D] after attention.
 // Local writes use the 1024-slot ring; global writes use absolute slots.
@@ -284,9 +289,8 @@ void causal_gqa_attention_cached_chunk_global_compact_paged(
     std::uint32_t token_count, BFloat16* context_token_major,
     cudaStream_t stream = nullptr);
 
-// Paged equivalent of the multimodal global prefill mask. The complete image
-// placeholder block remains in the current chunk, while the prefix is read
-// through the fixed page table.
+// Paged image prefill validates the complete image span in the current chunk,
+// then applies ordinary causal global attention through the fixed page table.
 void image_block_gqa_attention_cached_chunk_global_compact_paged(
     const BFloat16* query_head_major,
     const BFloat16* current_key_head_major,

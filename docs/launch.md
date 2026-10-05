@@ -61,6 +61,14 @@ falls back to zero.
 MTP defaults to zero; its speed depends on acceptance rate and workload, and
 its staging buffers count against the configured memory budget.
 
+Images default to a budget of 280 soft tokens each. Add
+`--image-max-soft-tokens 1120` after `serve-http` for a larger server default,
+or select a budget per request with
+`"mm_processor_kwargs":{"max_soft_tokens":1120}`. Supported budgets are
+70, 140, 280, 560, and 1120; requests can override the default in either
+direction. Larger budgets use more time and memory. See
+[image controls and capacity](http-api.md#images) for examples and buffer limits.
+
 Use `--kv-local-format fp8 --kv-global-format fp8` to opt into compressed KV
 storage. `--attention-global-compute fp8` separately opts into FP8 global
 attention matmuls for text prefill, decode, and both MTP paths. The independent

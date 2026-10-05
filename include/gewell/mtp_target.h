@@ -38,6 +38,10 @@ using Caches = std::array<CacheView, gemma4_31b::kLayerCount>;
 
 // Tokens occupy consecutive rows within each request. Every request supplies
 // private KV staging, whose physical slot stride may exceed its current rows.
+struct LayerCapture {
+  std::uint32_t completed_layers{};
+  BFloat16* output{};  // Device [request rows, hidden width], raw post-layer residual.
+};
 struct BatchInput {
   std::uint32_t base_position{};
   std::uint32_t rows{};
@@ -45,6 +49,7 @@ struct BatchInput {
   void* staging{};
   std::size_t staging_size{};
   std::uint32_t staging_capacity_rows{};
+  std::vector<LayerCapture> captures;
 };
 
 // Copy an accepted prefix from full-layout speculative KV into committed

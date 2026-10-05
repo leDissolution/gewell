@@ -1183,18 +1183,24 @@ BFloat16 uniform_image_block_context_reference(
     std::uint32_t image_end, bool local) {
   const bool image_query = absolute_query_position >= image_begin &&
                            absolute_query_position < image_end;
-  const std::uint32_t last_key_position =
-      image_query ? image_end - 1 : absolute_query_position;
-  std::uint32_t first_key_position =
-      local && absolute_query_position >= gemma4_31b::kLocalWindowSize - 1
-          ? absolute_query_position - (gemma4_31b::kLocalWindowSize - 1) : 0;
-  if (image_query) first_key_position = std::min(first_key_position, image_begin);
+  // Transformers create_masks_for_vision_model: global = causal;
+  // local = (causal OR same image) AND sliding_window_overlay(1024).
+  // Enumerate the mask independently of the kernel's contiguous key bounds.
   float numerator = 0.0F;
-  for (std::uint32_t key_position = first_key_position; key_position <= last_key_position;
-       ++key_position) {
+  std::uint32_t visible = 0;
+  const auto end = std::max(image_end, absolute_query_position + 1);
+  for (std::uint32_t key_position = 0; key_position < end; ++key_position) {
+    const bool causal = key_position <= absolute_query_position;
+    const bool same_image = image_query && key_position >= image_begin &&
+                            key_position < image_end;
+    const bool within_window = static_cast<std::int64_t>(key_position) >
+        static_cast<std::int64_t>(absolute_query_position) -
+            gemma4_31b::kLocalWindowSize;
+    if (!(local ? (causal || same_image) && within_window : causal)) continue;
     numerator += to_float(to_bf16(static_cast<float>(key_position + 1)));
+    ++visible;
   }
-  return to_bf16(numerator / static_cast<float>(last_key_position - first_key_position + 1));
+  return to_bf16(numerator / static_cast<float>(visible));
 }
 
 void check_uniform_image_block_context(
@@ -1314,6 +1320,17 @@ void test_image_block_cached_chunk(std::ostream& report,
   check_uniform_image_block_context(
       separate_context, kBasePosition, kChunkTokens, kImageBegin, kImageEnd,
       head_size, std::string(label) + "_separate");
+  CublasHandle handle;
+  GuardedTensorScratch tensor_scratch(kChunkTokens);
+  device_context.fill_byte(0xff);
+  causal_gqa_attention_cached_chunk_tensor(
+      handle.get(), device_query.get(), device_current_key.get(), device_current_value.get(),
+      device_key_cache.get(), device_value_cache.get(), kBasePosition, kChunkTokens,
+      cache_capacity, tensor_scratch.get(), device_context.get(), kind, nullptr,
+      gewell::kv_cache::Format::bf16, nullptr, kImageBegin, kImageEnd);
+  check_uniform_image_block_context(device_context.copy_to_host(), kBasePosition,
+      kChunkTokens, kImageBegin, kImageEnd, head_size, std::string(label) + "_tensor");
+  tensor_scratch.check_guards();
   require_equal(device_key_cache.copy_to_host(), key_cache,
                 std::string(label) + "_key_cache_read_only");
   require_equal(device_value_cache.copy_to_host(), value_cache,
@@ -1384,6 +1401,18 @@ void test_image_block_cached_chunk(std::ostream& report,
                   std::string(label) + "_paged_compact_cache_read_only");
     require_equal(device_scale.copy_to_host(), scale,
                   std::string(label) + "_scale_read_only");
+    causal_gqa_attention_cached_chunk_tensor_global_compact(handle.get(), device_query.get(),
+        device_current_key.get(), device_current_value.get(), device_compact_cache.get(),
+        device_scale.get(), kBasePosition, kChunkTokens, cache_capacity,
+        tensor_scratch.get(), device_context.get());
+    check_uniform_image_block_context(device_context.copy_to_host(), kBasePosition,
+        kChunkTokens, kImageBegin, kImageEnd, head_size, std::string(label) + "_tensor_compact");
+    causal_gqa_attention_cached_chunk_tensor_global_compact_paged(handle.get(), device_query.get(),
+        device_current_key.get(), device_current_value.get(), paged_view, device_scale.get(),
+        kBasePosition, kChunkTokens, tensor_scratch.get(), device_context.get());
+    check_uniform_image_block_context(device_context.copy_to_host(), kBasePosition,
+        kChunkTokens, kImageBegin, kImageEnd, head_size, std::string(label) + "_tensor_paged");
+    tensor_scratch.check_guards();
   }
 
   require_equal(device_query.copy_to_host(), query,
@@ -1403,17 +1432,14 @@ void test_image_block_cached_chunk(std::ostream& report,
 
 void test_long_local_image_block(std::ostream& report) {
   constexpr std::uint32_t kBasePosition = 0;
-  constexpr std::uint32_t kChunkTokens = 1'027;
+  constexpr std::uint32_t kChunkTokens = 1'122;
   constexpr std::uint32_t kImageBegin = 1;
-  constexpr std::uint32_t kImageEnd = 1'026;
-  constexpr std::uint32_t kImageTokens = kImageEnd - kImageBegin;
+  constexpr std::uint32_t kImageEnd = 1'121;
   constexpr std::uint32_t kHeadSize = gemma4_31b::kLocalHeadSize;
   constexpr std::uint32_t kKvHeads = gemma4_31b::kLocalKvHeadCount;
   constexpr std::uint32_t kCacheCapacity = gemma4_31b::kLocalWindowSize;
   const BFloat16 zero = to_bf16(0.0F);
-  const BFloat16 early_value = to_bf16(1'024.0F);
-  const BFloat16 expected =
-      to_bf16(to_float(early_value) / static_cast<float>(kImageTokens));
+  const BFloat16 marker = to_bf16(1'024.0F);
 
   std::vector<BFloat16> query(
       static_cast<std::size_t>(gemma4_31b::kQueryHeadCount) * kChunkTokens *
@@ -1424,10 +1450,15 @@ void test_long_local_image_block(std::ostream& report) {
   std::vector<BFloat16> current_value(
       static_cast<std::size_t>(kChunkTokens) * kKvHeads * kHeadSize, zero);
   for (std::uint32_t kv_head = 0; kv_head < kKvHeads; ++kv_head) {
-    const std::size_t row =
+    const std::size_t first_row =
         (static_cast<std::size_t>(kImageBegin) * kKvHeads + kv_head) *
         kHeadSize;
-    std::fill_n(current_value.begin() + row, kHeadSize, early_value);
+    const std::size_t last_row =
+        (static_cast<std::size_t>(kImageEnd - 1) * kKvHeads + kv_head) *
+        kHeadSize;
+    for (std::uint32_t dimension = 0; dimension < kHeadSize; ++dimension) {
+      current_value[(dimension % 2 == 0 ? first_row : last_row) + dimension] = marker;
+    }
   }
 
   const std::size_t cache_elements =
@@ -1452,40 +1483,56 @@ void test_long_local_image_block(std::ostream& report) {
       device_key_cache.get(), device_value_cache.get(), kBasePosition,
       kChunkTokens, kCacheCapacity, kImageBegin, kImageEnd,
       device_context.get(), gemma4_31b::AttentionKind::local);
-  const std::size_t last_image_row =
-      static_cast<std::size_t>(kImageEnd - 1) *
-      gemma4_31b::kQueryHeadCount * kHeadSize;
   const std::size_t context_row_elements =
       static_cast<std::size_t>(gemma4_31b::kQueryHeadCount) * kHeadSize;
-  const std::vector<BFloat16> separate =
-      device_context.copy_slice(last_image_row, context_row_elements);
-  for (std::size_t index = 0; index < separate.size(); ++index) {
-    if (bf16_bits(separate[index]) != bf16_bits(expected)) {
-      fail("long_local_image_block_separate",
-           "early same-image key was omitted at element " +
-               std::to_string(index));
-    }
-  }
-  const std::size_t suffix_row = static_cast<std::size_t>(kImageEnd) *
-                                 gemma4_31b::kQueryHeadCount * kHeadSize;
-  const std::vector<BFloat16> separate_suffix =
-      device_context.copy_slice(suffix_row, context_row_elements);
-  for (std::size_t index = 0; index < separate_suffix.size(); ++index) {
-    if (bf16_bits(separate_suffix[index]) != bf16_bits(zero)) {
-      fail("long_local_image_block_separate_suffix",
-           "suffix query retained the early image key at element " +
-               std::to_string(index));
+  struct ExpectedRow {
+    std::uint32_t position;
+    float early;
+    float late;
+  };
+  // Nonzero values at the two image endpoints distinguish past-window expiry
+  // from future image visibility. Positions are absolute, with a text prefix.
+  const ExpectedRow expected_rows[] = {
+      {0, 0.0F, 0.0F},
+      {1, 1024.0F / 1121, 1024.0F / 1121},
+      {1024, 1024.0F / 1120, 1024.0F / 1120},
+      {1025, 0.0F, 1024.0F / 1119},
+      {1120, 0.0F, 1.0F},
+      {1121, 0.0F, 1.0F},
+  };
+  for (const auto& expected : expected_rows) {
+    const auto actual = device_context.copy_slice(
+        static_cast<std::size_t>(expected.position) * context_row_elements,
+        context_row_elements);
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+      const BFloat16 value = to_bf16(index % 2 == 0 ? expected.early : expected.late);
+      if (bf16_bits(actual[index]) != bf16_bits(value)) {
+        fail("long_local_image_block",
+             "endpoint visibility differs at query " + std::to_string(expected.position) +
+                 " element " + std::to_string(index));
+      }
     }
   }
 
+  const auto scalar_context = device_context.copy_to_host();
+  CublasHandle handle;
+  GuardedTensorScratch tensor_scratch(kChunkTokens);
   device_context.fill_byte(0xff);
+  causal_gqa_attention_cached_chunk_tensor(handle.get(), device_query.get(),
+      device_current_key.get(), device_current_value.get(), device_key_cache.get(),
+      device_value_cache.get(), kBasePosition, kChunkTokens, kCacheCapacity,
+      tensor_scratch.get(), device_context.get(), gemma4_31b::AttentionKind::local,
+      nullptr, gewell::kv_cache::Format::bf16, nullptr, kImageBegin, kImageEnd);
+  require_equal(device_context.copy_to_host(), scalar_context,
+                "long_local_image_block_tensor_endpoints");
+  tensor_scratch.check_guards();
   require_equal(device_key_cache.copy_to_host(), key_cache,
                 "long_local_image_block_key_cache_read_only");
   require_equal(device_value_cache.copy_to_host(), value_cache,
                 "long_local_image_block_value_cache_read_only");
-  report << "prefill primitive long_local_image_block: image=[1,1026) "
-            "last_query_includes_position_1=exact "
-            "suffix_excludes_position_1=exact\n";
+  report << "prefill primitive long_local_image_block: image=[1,1121) "
+            "past_window_boundary=exact future_image_visibility=exact "
+            "text_prefix_suffix=exact\n";
 }
 
 void test_long_local_cache_commit(std::ostream& report,
@@ -1629,6 +1676,18 @@ void test_runtime_cached_chunk(std::ostream& report,
       device_key_cache.get(), device_value_cache.get(), base_position,
       token_count, cache_capacity, device_context.get(), kind);
   const std::vector<BFloat16> context = device_context.copy_to_host();
+  if (token_count <= 32) {
+    // A singleton image at the final row has the ordinary causal mask. This
+    // entry point retains the original serial kernel, independently checking
+    // the short-suffix kernel's exact arithmetic and ring-window behavior.
+    image_block_gqa_attention_cached_chunk(
+        device_query.get(), device_current_key.get(), device_current_value.get(),
+        device_key_cache.get(), device_value_cache.get(), base_position,
+        token_count, cache_capacity, base_position + token_count - 1,
+        base_position + token_count, device_context.get(), kind);
+    require_equal(device_context.copy_to_host(), context,
+                  std::string(label) + "_serial_arithmetic_exact");
+  }
   require_equal(device_key_cache.copy_to_host(), key_cache,
                 std::string(label) + "_attention_key_cache_read_only");
   require_equal(device_value_cache.copy_to_host(), value_cache,
@@ -2267,6 +2326,8 @@ bool run_tests(std::ostream& report, std::string* failure) {
         report, gemma4_31b::AttentionKind::global,
         "image_block_chunk_global_compact");
     test_long_local_image_block(report);
+    test_image_block_cached_chunk(report, gemma4_31b::AttentionKind::local,
+        "image_local_280", 511, 282, 512, 792);
     // A later image spans more than the local window after a wrapped prefix.
     // Its boundaries also cross global pages with reversed physical placement.
     test_image_block_cached_chunk(report, gemma4_31b::AttentionKind::local,
@@ -2299,6 +2360,16 @@ bool run_tests(std::ostream& report, std::string* failure) {
     test_runtime_compact_global_cached_chunk(
         report, kTokenCount, kTokenCount, 2 * kTokenCount,
         "runtime_chunk_compact_global_full_base1024");
+    for (const std::uint32_t rows : {1U, 3U, 17U, 31U, 32U}) {
+      for (const std::uint32_t base : {15U, 16U, 543U, 1023U, 1024U}) {
+        test_runtime_cached_chunk(report, gemma4_31b::AttentionKind::local,
+            base, rows, kTokenCount, "runtime_chunk_short_local");
+        test_runtime_cached_chunk(report, gemma4_31b::AttentionKind::global,
+            base, rows, base + rows, "runtime_chunk_short_global");
+        test_runtime_compact_global_cached_chunk(report, base, rows, base + rows,
+            "runtime_chunk_short_compact_global");
+      }
+    }
     for (const std::uint32_t rows : {1U, 17U, 33U, 501U, 509U, 973U, 1024U}) {
       constexpr std::uint32_t kLongBase = 20'477;
       test_runtime_cached_chunk(

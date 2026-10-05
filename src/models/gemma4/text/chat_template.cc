@@ -478,10 +478,8 @@ ChatTemplateOptions parse_chat_template_kwargs(const nlohmann::json& value) {
     throw std::invalid_argument("chat_template_kwargs must be an object or null");
   }
   for (const auto& field : value.items()) {
-    if (field.key() != "enable_thinking" && field.key() != "preserve_thinking") {
-      throw std::invalid_argument("chat_template_kwargs." + field.key() +
-                                  " is unsupported");
-    }
+    if (field.key() != "enable_thinking" && field.key() != "preserve_thinking")
+      continue;
     if (!field.value().is_boolean()) {
       throw std::invalid_argument("chat_template_kwargs." + field.key() +
                                   " must be boolean");

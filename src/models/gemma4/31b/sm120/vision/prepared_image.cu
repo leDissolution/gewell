@@ -1,40 +1,46 @@
 #include "prepared_image.h"
 
 namespace gewell::gemma4_31b::sm120 {
-PreparedImage::PreparedImage(const WeightArena& weights, const std::vector<std::uint8_t>& pixels,
-    const std::vector<std::uint8_t>& positions, std::uint32_t padded_patch_rows,
-    std::uint32_t soft_token_count)
-    : features_(std::size_t(soft_token_count) * model::kHiddenSize * sizeof(BFloat16)) {
-    DeviceAllocation device_pixels(pixels.size());
-    DeviceAllocation device_positions(positions.size());
-    check_cuda(cudaMemcpy(device_pixels.data(), pixels.data(), pixels.size(),
-                          cudaMemcpyHostToDevice),
-               "copy prepared pixels to device");
-    check_cuda(cudaMemcpy(device_positions.data(), positions.data(),
-                          positions.size(), cudaMemcpyHostToDevice),
-               "copy prepared positions to device");
+namespace {
+void reserve(std::unique_ptr<DeviceAllocation>& buffer, std::size_t bytes) {
+  if (buffer && buffer->size() >= bytes) return;
+  // cudaFree waits for prior uses. Release before growing so a new largest
+  // image does not require both the old and new workspace simultaneously.
+  buffer.reset();
+  buffer = std::make_unique<DeviceAllocation>(bytes);
+}
+}
 
-    vision_executor::VisionExecutor tower(
-        {weights.pointer(model::kVisionPatchProjectionPhysicalId),
-         vision_executor::kVisionWeightSliceBytes},
-        soft_token_count);
-    scratch_bytes_ = tower.scratch_bytes();
-    DeviceAllocation vision_scratch(scratch_bytes_);
-    const vision_engine::PrefillRequest request{
-        {static_cast<const float*>(device_pixels.data()),
-         static_cast<const std::int32_t*>(device_positions.data()),
-         padded_patch_rows, soft_token_count},
-        features_.data(), soft_token_count};
-    CudaEvent begin;
-    CudaEvent end;
-    check_cuda(cudaEventRecord(begin.get()), "record prepared vision start");
-    tower.run(request, vision_scratch.data(), vision_scratch.size(), nullptr,
-              nullptr);
-    check_cuda(cudaEventRecord(end.get()), "record prepared vision end");
-    check_cuda(cudaEventSynchronize(end.get()),
-               "synchronize prepared vision execution");
-    check_cuda(cudaEventElapsedTime(&gpu_milliseconds_, begin.get(),
-                                    end.get()),
-               "measure prepared vision execution");
+PreparedImage::PreparedImage(const WeightArena& weights)
+    : tower_({weights.pointer(model::kVisionPatchProjectionPhysicalId),
+              vision_executor::kVisionWeightSliceBytes}, 1) {}
+
+void PreparedImage::prepare(const std::vector<std::uint8_t>& pixels,
+    const std::vector<std::uint8_t>& positions, std::uint32_t padded_patch_rows,
+    std::uint32_t soft_token_count, cudaStream_t stream) {
+  tower_.set_soft_token_count(soft_token_count);
+  reserve(pixels_, pixels.size());
+  reserve(positions_, positions.size());
+  reserve(features_, std::size_t(soft_token_count) * model::kHiddenSize * sizeof(BFloat16));
+  reserve(scratch_, tower_.scratch_bytes());
+  check_cuda(cudaMemcpyAsync(pixels_->data(), pixels.data(), pixels.size(),
+                            cudaMemcpyHostToDevice, stream), "copy prepared pixels to device");
+  check_cuda(cudaMemcpyAsync(positions_->data(), positions.data(), positions.size(),
+                            cudaMemcpyHostToDevice, stream), "copy prepared positions to device");
+  const vision_engine::PrefillRequest request{
+      {static_cast<const float*>(pixels_->data()),
+       static_cast<const std::int32_t*>(positions_->data()), padded_patch_rows, soft_token_count},
+      features_->data(), soft_token_count};
+  check_cuda(cudaEventRecord(begin_.get(), stream), "record prepared vision start");
+  tower_.run(request, scratch_->data(), scratch_->size(), stream);
+  check_cuda(cudaEventRecord(end_.get(), stream), "record prepared vision end");
+}
+
+float PreparedImage::gpu_milliseconds() const {
+  check_cuda(cudaEventSynchronize(end_.get()), "synchronize prepared vision execution");
+  float milliseconds;
+  check_cuda(cudaEventElapsedTime(&milliseconds, begin_.get(), end_.get()),
+             "measure prepared vision execution");
+  return milliseconds;
 }
 }

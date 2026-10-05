@@ -68,6 +68,7 @@ class Work {
   // complete_step must follow synchronization, including a failed GPU step.
   // Text stops before the next image. Image features dispatch as one complete
   // span even when their row count exceeds max_rows.
+  [[nodiscard]] Step next_step(std::uint32_t max_rows) const;
   [[nodiscard]] Step begin_step(std::uint32_t max_rows);
   void complete_step(bool success);
 

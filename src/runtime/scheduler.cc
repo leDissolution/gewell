@@ -1,4 +1,6 @@
 #include "gewell/runtime/scheduler.h"
+#include "gewell/runtime/mtp_stats.h"
+#include "gewell/runtime/mtp_capture.h"
 #include "gewell/console.h"
 #include <algorithm>
 #include <cmath>
@@ -36,13 +38,20 @@ BatchScheduler::BatchScheduler(std::unique_ptr<ExecutionBackend> executor, Batch
         cache(config, backend.cache_storage_factory(), cache_event_sink()) {
     const auto& supported = backend.limits();
     if (!capacity || capacity > supported.max_batch_rows ||
-        mtp_depth > supported.max_mtp_depth ||
+        mtp_depth > supported.max_mtp_depth || limits.mtp_min_depth > mtp_depth ||
         (mtp_depth && std::uint64_t(capacity) * (mtp_depth + 1) > supported.max_verifier_rows) ||
         !limits.max_requests || capacity > limits.max_requests ||
         !limits.prefill_chunk_tokens || limits.prefill_chunk_tokens > supported.max_prefill_chunk_tokens ||
+        limits.prefill_batch_tokens < limits.prefill_chunk_tokens ||
+        limits.prefill_batch_tokens > supported.max_prefill_batch_tokens ||
         !limits.plan_rows || limits.plan_rows > limits.prefill_chunk_tokens ||
         limits.max_horizon < limits.plan_rows || limits.max_horizon > supported.context_tokens)
       fail("batch configuration", "invalid scheduler limits");
+    if (!limits.mtp_stats_path.empty()) mtp_stats = std::make_unique<MtpStats>(limits);
+    if (!limits.mtp_capture.path.empty()) mtp_capture = std::make_unique<MtpCapture>(limits);
+    // Both sinks use the same admission sequence, including after a restart.
+    if (mtp_stats) sequence_begin = mtp_stats->next_sequence();
+    if (mtp_capture) sequence_begin = std::max(sequence_begin, mtp_capture->next_sequence());
     requests.reserve(limits.max_requests);
     active.reserve(capacity);
     works.reserve(2 * limits.max_requests);
@@ -65,6 +74,9 @@ BatchScheduler::~BatchScheduler() {
     backend.wait();
     backend.release_image();
     for (auto& request : requests) {
+      if (mtp_stats && !request.reported) {
+        try { mtp_stats->finish(request, "interrupted"); } catch (...) {}
+      }
       if (callbacks.drain) {
         try { callbacks.drain(request); } catch (...) {}
       }
@@ -413,7 +425,7 @@ std::size_t BatchScheduler::submit(BatchRequest request) {
       requests.push_back(std::move(request));
       slot = requests.end() - 1;
     } else *slot = std::move(request);
-    slot->accepted_order = submitted++;
+    slot->accepted_order = sequence_begin + submitted++;
     slot->accepted_at = std::chrono::steady_clock::now();
     if (slot->metrics_arrival == std::chrono::steady_clock::time_point{})
       slot->metrics_arrival = slot->accepted_at;
@@ -540,11 +552,30 @@ bool BatchScheduler::step() {
     }
     std::optional<std::size_t> blocked_request;
     const auto run_prefill = [&] {
-      for (std::size_t attempt = 0; attempt < works.size(); ++attempt) {
+      struct Selected {
+        std::size_t work, owner;
+        pending_prefix::Step step;
+        bool image;
+        std::string trace;
+      };
+      std::vector<Selected> selected;
+      std::vector<BatchPrefillInput> inputs;
+      std::uint32_t rows = 0;
+      for (std::size_t attempt = 0; attempt < works.size() &&
+           selected.size() < capacity && rows < limits.prefill_batch_tokens; ++attempt) {
         const auto wi = prefill_turn++ % works.size();
         auto* work = works[wi].get();
         if (!work || !work->execution || work->path.at_boundary() || work->path.releasable()) continue;
         if (!work->runnable && runnable_count() >= capacity) continue;
+        const bool image_step = std::any_of(work->path.images().begin(), work->path.images().end(),
+            [&](const auto& image) { return image.begin == work->path.completed(); });
+        const auto planned = work->path.next_step(prefill_rows(*work));
+        // Packing must not introduce new attention/cache chunk boundaries just
+        // to consume a small remainder. The candidate leads the next forward.
+        if (!selected.empty() && planned.end - planned.begin > limits.prefill_batch_tokens - rows) {
+          --prefill_turn;
+          break;
+        }
         if (!cache.try_resize_batch(work->execution, work_horizon(*work))) {
           work->runnable = false;
           blocked_request = work->path.dependents().front().request_id;
@@ -553,51 +584,71 @@ bool BatchScheduler::step() {
         work->runnable = true;
         const auto step = work->path.begin_step(prefill_rows(*work));
         const auto owner = work->path.dependents().front().request_id;
-        const bool image_step = std::any_of(work->path.images().begin(), work->path.images().end(),
-            [&](const auto& image) { return image.begin == step.begin && image.end == step.end; });
         const auto trace = number("work", work->serial) + "," + named(owner) + "," +
             number("execution", work->execution) + "," + number("begin", step.begin) + "," +
             number("end", step.end) + ",\"image\":" + (image_step ? "true" : "false");
-        stop_waiting(requests[owner]);
-        const auto wall = std::chrono::steady_clock::now();
-        backend.begin_step("start shared prefill");
-        auto processed = step.begin;
-        try {
-          log_event("prefill", trace);
-          if (image_step) {
-            processed = backend.image_prefill_step(work->execution, work->path.prompt()->data(),
-                work->path.prompt()->size(), step.begin, step.end, work->images, work->hidden, [&] {
-                  poll(true);
-                  return !work->path.dependents().empty();
-                });
-          } else {
-            backend.prefill_step(work->execution, work->path.prompt()->data() + step.begin,
-                step.begin, step.end - step.begin, false, work->hidden);
-            processed = step.end;
-          }
-          backend.end_step("end shared prefill");
-          poll(true);
-          synchronize_prefill();
-          backend.release_image();
-          if (processed < step.begin || processed > step.end ||
-              (processed != step.end && !work->path.dependents().empty()))
-            fail("shared prefill", "processed prefix disagrees with completed range");
-          work->path.complete_step(processed == step.end);
-          if (work->path.at_boundary()) work->runnable = false;
-          if (processed == step.end) {
-            log_event("prefill_complete", trace);
-            if (image_step) log_event("image_encode", trace);
-          }
-        } catch (const std::exception& error) {
-          reject_work(wi, error);
-          if (!limits.live) throw;
-          progressed = true;
-          return true;
+        selected.push_back({wi, owner, step, image_step, trace});
+        inputs.push_back({work->execution, work->path.prompt()->data() + step.begin,
+                          step.begin, step.end - step.begin, work->hidden});
+        if (image_step) {
+          const auto image = std::find_if(work->images.begin(), work->images.end(),
+              [&](const auto& input) { return input->begin == step.begin; });
+          if (image == work->images.end()) fail("shared prefill", "missing image input");
+          inputs.back().image = *image;
         }
-        const float milliseconds = backend.elapsed("time shared prefill");
-        prefill_gpu_seconds += milliseconds / 1000.0;
+        rows += step.end - step.begin;
+        stop_waiting(requests[owner]);
+      }
+      if (selected.empty()) return false;
+      const auto wall = std::chrono::steady_clock::now();
+      backend.begin_step("start shared prefill");
+      std::vector<bool> completed;
+      try {
+        for (const auto& item : selected) log_event("prefill", item.trace);
+        log_event("prefill_batch", number("segments", selected.size()) + "," + number("tokens", rows));
+        completed = backend.prefill_batch(inputs, [&](std::size_t index) {
+          poll(true);
+          return !works[selected[index].work]->path.dependents().empty();
+        });
+        backend.end_step("end shared prefill");
+        poll(true);
+        synchronize_prefill();
+        backend.release_image();
+        if (completed.size() != selected.size()) fail("shared prefill", "invalid completion count");
+        for (std::size_t i = 0; i < selected.size(); ++i) {
+          const auto& item = selected[i];
+          auto& work = *works[item.work];
+          if (!completed[i] && !work.path.dependents().empty())
+            fail("shared prefill", "processed prefix disagrees with completed range");
+          work.path.complete_step(completed[i]);
+          if (work.path.at_boundary()) work.runnable = false;
+          if (completed[i]) {
+            log_event("prefill_complete", item.trace);
+            if (item.image) log_event("image_encode", item.trace);
+          }
+        }
+      } catch (const std::exception& error) {
+        // All selected executions may have pending writes. Retire this cohort
+        // after GPU completion; unrelated work remains schedulable.
+        for (const auto& item : selected)
+          if (works[item.work]) reject_work(item.work, error);
+        if (!limits.live) throw;
+        progressed = true;
+        return true;
+      }
+      const float milliseconds = backend.elapsed("time shared prefill");
+      const auto seconds = seconds_since(wall);
+      prefill_gpu_seconds += milliseconds / 1000.0;
+      for (std::size_t i = 0; i < selected.size(); ++i) {
+        const auto& item = selected[i];
+        auto* work = works[item.work].get();
+        const auto owner = item.owner;
+        const auto step = item.step;
+        const auto processed = completed[i] ? step.end : step.begin;
+        // As with decode, each owner observes the full batch duration, while
+        // aggregate GPU time above counts the physical forward only once.
         requests[owner].prefill_gpu_seconds += milliseconds / 1000.0;
-        requests[owner].prefill_seconds += seconds_since(wall);
+        requests[owner].prefill_seconds += seconds;
         requests[owner].prefill_tokens += processed - step.begin;
         requests[owner].cursor = processed;
         prefill_tokens += processed - step.begin;
@@ -613,12 +664,11 @@ bool BatchScheduler::step() {
         work->captured_endpoint = false;
         work->capture_suppressed = false;
         capture_work(*work);
-        drop_work(wi);
-        prefer_prefill = false;
-        progressed = true;
-        return true;
+        drop_work(item.work);
       }
-      return false;
+      prefer_prefill = false;
+      progressed = true;
+      return true;
     };
     // Alternate heads and chunks when both can run. If a chunk is blocked,
     // try heads in this same turn so pressure cannot prevent forward progress.
@@ -775,7 +825,7 @@ bool BatchScheduler::step() {
         break;
       }
     }
-    // Each turn runs one head or one bounded prefill chunk, then one decode
+    // Each turn runs one head or one bounded packed forward, then one decode
     // batch. Save terminal hidden at every chunk so exact-cursor late joins
     // remain usable after unrelated work overwrites executor scratch.
     for (auto index : active) {
@@ -801,7 +851,7 @@ bool BatchScheduler::step() {
     }
     if (!ran_prefill) ran_prefill = run_prefill();
     // Batch scheduling work, not GPU rows: retain the selected microbatch
-    // shapes and return through poll/retire between every chunk. Charge a
+    // shapes and return through poll/retire between forwards. Charge a
     // head as one token so a stream of cache-hit requests cannot starve decode.
     // If no prefill can run, decode immediately, including under KV pressure.
     if (prefill_work) {
@@ -824,8 +874,14 @@ bool BatchScheduler::step() {
     if (!inputs.empty()) {
       const auto wall = std::chrono::steady_clock::now();
       const auto outputs_before = outputs;
+      std::vector<MtpStatsSample> stats(mtp_stats && mtp_stats->enabled() ? inputs.size() : 0);
       backend.begin_step("start batch decode");
-      const bool speculate = mtp_depth && std::any_of(indices.begin(), indices.end(),
+      const auto rows_per_request = limits.decode_width / inputs.size();
+      const auto depth = limits.decode_width
+          ? std::clamp<std::uint32_t>(rows_per_request ? rows_per_request - 1 : 0,
+                                      limits.mtp_min_depth, mtp_depth)
+          : mtp_depth;
+      const bool speculate = depth && std::any_of(indices.begin(), indices.end(),
           [&](std::size_t i) { return !requests[i].ordinary_decode &&
               requests[i].outputs.size() + 1 < requests[i].max_new_tokens; });
       if (callbacks.trace) {
@@ -835,11 +891,13 @@ bool BatchScheduler::step() {
           if (!requests[i].image_spans.empty()) image_ids.push_back(requests[i].id);
         }
         log_event("decode", "\"requests\":" + ids.dump() + ",\"image_requests\":" + image_ids.dump() +
-            ",\"mtp\":" + (speculate ? "true" : "false"));
+            ",\"mtp\":" + (speculate ? "true" : "false") + "," + number("mtp_depth", depth));
       }
       if (speculate) {
         std::vector<BatchMtpInput> proposals;
         proposals.reserve(indices.size());
+        std::vector<MtpCaptureFeatures> captures(mtp_capture ? indices.size() : 0);
+        std::vector<MtpTargetProbes> next_probes(mtp_capture && mtp_capture->enabled() ? indices.size() : 0);
         std::uint32_t verifier_rows = 0;
         for (std::size_t row = 0; row < indices.size(); ++row) {
           auto& request = requests[indices[row]];
@@ -848,9 +906,23 @@ bool BatchScheduler::step() {
           proposal.pending_token = inputs[row].token;
           proposal.target_hidden = request.terminal_hidden;
           proposal.position = inputs[row].position;
-          proposal.depth = request.ordinary_decode ? 0 : std::min<std::uint32_t>(mtp_depth,
+          proposal.depth = request.ordinary_decode ? 0 : std::min<std::uint32_t>(depth,
               request.max_new_tokens - request.outputs.size() - 1);
           proposal.depth = std::min(proposal.depth, checkpoint_distance(request, proposal.position) - 1);
+          if (request.mtp_capture_probes) {
+            // Pair probes from the preceding committed target row with this
+            // round, never with the round that produced those probes.
+            const auto& probes = *request.mtp_capture_probes;
+            if (proposal.depth && probes.position == proposal.position && probes.pending_token == proposal.pending_token) {
+              captures[row].probes = std::move(*request.mtp_capture_probes);
+              proposal.capture = &captures[row];
+            }
+            request.mtp_capture_probes.reset();
+          }
+          if (!next_probes.empty() && proposal.depth && mtp_capture->select(request.accepted_order, request.mtp_cycles)) {
+            next_probes[row].layers = limits.mtp_capture.layers;
+            proposal.capture_next = &next_probes[row];
+          }
           verifier_rows += proposal.depth + 1;
           proposal.temperature = request.sampling.temperature;
           proposal.top_p = request.sampling.top_p;
@@ -883,6 +955,15 @@ bool BatchScheduler::step() {
         for (std::size_t row = 0; row < indices.size(); ++row) {
           auto& request = requests[indices[row]];
           const auto& selected = result.requests[row];
+          if (!stats.empty()) {
+            auto& sample = stats[row];
+            sample.speculative = true;
+            sample.depth = proposals[row].depth;
+            sample.failed = !selected.error.empty();
+            sample.draft_seconds = result.draft_gpu_milliseconds / 1000.0;
+            sample.verify_seconds = result.verify_gpu_milliseconds / 1000.0;
+            sample.select_seconds = result.select_gpu_milliseconds / 1000.0;
+          }
           if (!selected.error.empty()) {
             if (!limits.live) throw std::runtime_error(selected.error);
             callbacks.reject(request, selected.error, BatchFailure::execution);
@@ -894,12 +975,23 @@ bool BatchScheduler::step() {
             for (std::uint32_t i = 0; i < count; ++i)
               if (backend.is_stop_token(selected.tokens[i])) { count = i + 1; break; }
           emitted[row] = count;
+          if (proposals[row].capture)
+            mtp_capture->record(request, proposals[row], selected, decode_batches + 1, indices.size(), count);
+          if (proposals[row].capture_next && count == selected.tokens.size()) {
+            auto& probes = next_probes[row];
+            probes.position = proposals[row].position + count;
+            probes.pending_token = selected.tokens.back();
+            request.mtp_capture_probes = std::make_unique<MtpTargetProbes>(std::move(probes));
+          }
+          if (!stats.empty()) stats[row].accepted = std::min(selected.verification.accepted_drafts, count);
           commits.push_back({static_cast<std::uint32_t>(row), request.execution,
               inputs[row].position, count, request.terminal_hidden,
               request.capture_logits, request.logprobs,
               request.top_logprobs});
           if (proposals[row].depth) {
             const auto accepted = std::min(selected.verification.accepted_drafts, count);
+            request.mtp_previous_depth = proposals[row].depth;
+            request.mtp_previous_accepted = selected.verification.accepted_drafts;
             ++request.mtp_cycles;
             request.mtp_proposed += proposals[row].depth;
             request.mtp_accepted += accepted;
@@ -947,6 +1039,7 @@ bool BatchScheduler::step() {
             callbacks.emit(request, tokens.data(), emitted[row], bytes, scores);
         }
       } else {
+        for (const auto index : indices) requests[index].mtp_capture_probes.reset();
         backend.decode_batch(inputs);
         for (std::uint32_t row = 0; row < indices.size(); ++row) {
           auto& request = requests[indices[row]];
@@ -979,6 +1072,17 @@ bool BatchScheduler::step() {
       decode_tokens += outputs - outputs_before;
       ++decode_batches;
       ++occupancy[inputs.size()];
+      for (std::size_t row = 0; row < stats.size(); ++row) {
+        const auto& request = requests[indices[row]];
+        auto& sample = stats[row];
+        sample.batch_id = decode_batches;
+        sample.batch_size = inputs.size();
+        sample.output_begin = inputs[row].position - request.prompt->size() + 1;
+        sample.emitted = request.outputs.size() - sample.output_begin;
+        sample.wall_seconds = elapsed;
+        sample.gpu_seconds = milliseconds / 1000.0;
+        mtp_stats->observe(request, sample);
+      }
       progressed = true;
       if (decode_batches % 128 == 0)
         console::event("batch_progress",
@@ -1121,6 +1225,8 @@ bool BatchScheduler::retire() {
       if (!limits.live) callbacks.finish(request);
       release_request_cache(request);
       request.images.clear();
+      request.mtp_capture_probes.reset();
+      if (mtp_stats) mtp_stats->finish(request, request.phase == BatchPhase::cancelled ? "cancelled" : "complete");
       request.reported = true;
       if (callbacks.done) callbacks.done(request);
       std::vector<std::uint32_t>().swap(request.outputs);
@@ -1136,7 +1242,9 @@ void BatchScheduler::write_live_stats(std::ostream& out) const {
     for (const auto& request : requests)
       live_requests += request.phase != BatchPhase::vacant && !request.reported;
     for (const auto& work : works) live_works += bool(work);
-    out << "{\"active_requests\":" << live_requests << ",\"live_works\":" << live_works
+    out << std::setprecision(12)
+        << "{\"wall_seconds\":" << seconds_since(started)
+        << ",\"active_requests\":" << live_requests << ",\"live_works\":" << live_works
         << ",\"request_slots\":" << requests.size() << ",\"work_slots\":" << works.size()
         << ",\"retained_prompt_bytes\":" << retained_prompt_bytes()
         << ",\"execution_count\":" << stats.execution_count
@@ -1145,6 +1253,7 @@ void BatchScheduler::write_live_stats(std::ostream& out) const {
         << ",\"cold_restore_count\":" << telemetry.cold_restore_count
         << ",\"cold_restore_bytes\":" << telemetry.cold_restore_bytes
         << ",\"prefill_tokens\":" << prefill_tokens << ",\"shared_tokens\":" << shared_tokens
+        << ",\"prefill_gpu_seconds\":" << prefill_gpu_seconds
         << ",\"joins\":" << inflight_joins << ",\"completed\":" << completed
         << ",\"cancelled\":" << cancelled << ",\"kv_peak_bytes\":"
         << stats.gpu.peak_used + memory.staging_bytes + memory.hidden_staging_bytes
@@ -1154,7 +1263,10 @@ void BatchScheduler::write_live_stats(std::ostream& out) const {
         << ",\"constraint_mask_bytes\":" << constraint_mask_bytes
         << ",\"host_sampling_scratch_bytes\":" << backend.host_scratch_bytes()
         << ",\"device_sampling_scratch_bytes\":" << backend.sampling_scratch_bytes()
+        << ",\"decode_tokens\":" << decode_tokens << ",\"decode_batches\":" << decode_batches
         << ",\"decode_gpu_seconds\":" << decode_gpu_seconds
+        << ",\"mtp_cycles\":" << mtp_cycles << ",\"mtp_proposed\":" << mtp_proposed
+        << ",\"mtp_accepted\":" << mtp_accepted << ",\"mtp_verifier_rows\":" << mtp_verifier_rows
         << ",\"mtp_draft_gpu_seconds\":" << mtp_draft_gpu_seconds
         << ",\"mtp_verify_gpu_seconds\":" << mtp_verify_gpu_seconds
         << ",\"mtp_select_gpu_seconds\":" << mtp_select_gpu_seconds
@@ -1414,6 +1526,7 @@ void BatchScheduler::write_summary(std::ostream& summary) const {
       fail("batch cleanup", "request allocations remain live");
   summary << "{\"requests\":" << submitted << ",\"outputs\":" << outputs
           << ",\"prefill_chunk_tokens\":" << limits.prefill_chunk_tokens
+          << ",\"prefill_batch_tokens\":" << limits.prefill_batch_tokens
           << ",\"prefill_budget_tokens\":" << limits.prefill_budget_tokens
           << ",\"completed_requests\":" << completed << ",\"cancelled_requests\":" << cancelled
           << ",\"cancelled_outputs\":" << cancelled_outputs
@@ -1432,7 +1545,9 @@ void BatchScheduler::write_summary(std::ostream& summary) const {
           << ",\"prefill_gpu_seconds\":" << prefill_gpu_seconds
           << ",\"wall_seconds\":" << elapsed << ",\"peak_batch_size\":" << peak_batch
           << ",\"kv_peak_bytes\":" << stats.gpu.peak_used + memory.staging_bytes + memory.hidden_staging_bytes
-          << ",\"mtp_depth\":" << mtp_depth << ",\"mtp_staging_bytes\":" << memory.staging_bytes
+          << ",\"mtp_depth\":" << mtp_depth << ",\"mtp_min_depth\":" << limits.mtp_min_depth
+          << ",\"decode_width\":" << limits.decode_width
+          << ",\"mtp_staging_bytes\":" << memory.staging_bytes
           << ",\"mtp_cycles\":" << mtp_cycles << ",\"mtp_proposed\":" << mtp_proposed
           << ",\"mtp_accepted\":" << mtp_accepted << ",\"mtp_rejected_cycles\":" << mtp_rejected_cycles
           << ",\"mtp_verifier_rows\":" << mtp_verifier_rows

@@ -50,16 +50,24 @@ int main(int argc, char** argv) {
     std::ifstream stream(argv[1]);
     const auto fixture = nlohmann::json::parse(stream);
     for (const auto& test : fixture.at("cases")) {
-      const auto image = gewell::gemma4::prepare_image_data_url(test.at("data_url").get<std::string>());
       const std::string name = test.at("name");
-      if (image.padded_patch_rows != 2520 || image.soft_token_count != test.at("soft_token_count") ||
-          image.pixels.size() != 7741440 || image.positions.size() != 20160 ||
-          sha256(image.pixels) != test.at("pixels_sha256") || sha256(image.positions) != test.at("positions_sha256")) {
-        std::cerr << name << ": pixels=" << sha256(image.pixels) << " positions=" << sha256(image.positions)
-                  << " soft_tokens=" << image.soft_token_count << '\n';
-        throw std::runtime_error(name + " differs from pinned processor");
+      for (const auto& expected : test.at("budgets")) {
+        const auto budget = expected.at("max_soft_tokens").get<std::uint32_t>();
+        const auto image = gewell::gemma4::prepare_image_data_url(test.at("data_url").get<std::string>(), budget);
+        if (image.padded_patch_rows != budget * 9 || image.soft_token_count != expected.at("soft_token_count") ||
+            image.pixels.size() != std::size_t(budget) * 9 * 768 * 4 || image.positions.size() != budget * 9 * 8 ||
+            sha256(image.pixels) != expected.at("pixels_sha256") || sha256(image.positions) != expected.at("positions_sha256")) {
+          std::cerr << name << " budget=" << budget << ": pixels=" << sha256(image.pixels)
+                    << " positions=" << sha256(image.positions) << " soft_tokens=" << image.soft_token_count << '\n';
+          throw std::runtime_error(name + " differs from pinned processor");
+        }
+        if (budget == 280) {
+          const auto defaulted = gewell::gemma4::prepare_image_data_url(test.at("data_url").get<std::string>());
+          if (defaulted.pixels != image.pixels || defaulted.positions != image.positions)
+            throw std::runtime_error(name + " default differs from explicit 280 budget");
+        }
+        std::cout << name << " budget=" << budget << " exact\n";
       }
-      std::cout << name << " exact\n";
     }
     for (const auto& test : fixture.at("rejected")) {
       require_invalid(test.at("data_url").get<std::string>(), test.at("name").get<std::string>());
@@ -71,6 +79,12 @@ int main(int argc, char** argv) {
       require_invalid(bad, "malformed URL");
     }
     auto valid = fixture.at("cases").at(0).at("data_url").get<std::string>();
+    for (const auto budget : {0U, 1U, 71U, 281U, 1280U, 0xffffffffU}) {
+      bool rejected = false;
+      try { (void)gewell::gemma4::prepare_image_data_url(valid, budget); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      if (!rejected) throw std::runtime_error("unsupported image budget was accepted");
+    }
     auto mime = valid;
     mime.replace(11, 3, "jpeg");
     require_invalid(mime, "MIME mismatch");

@@ -109,6 +109,29 @@ void request_cases(const text::Tokenizer& tokenizer, constraint::Compiler& compi
       rejects(400, "logprobs", [&] { (void)parse(tokenizer, compiler, extended, route); });
     }
   }
+  for (const auto* route : {"/v1/chat/completions", "/v1/cache/prefill"}) {
+    for (const auto& options : std::vector<json>{json::object(),
+        {{"enable_thinking", true}, {"preserve_thinking", true}}}) {
+      auto body = json{{"model", kModel}, {"messages", chat_body["messages"]},
+          {"chat_template_kwargs", options}};
+      const auto expected = parse(tokenizer, compiler, body, route);
+      body["chat_template_kwargs"]["clear_thinking"] = true;
+      body["chat_template_kwargs"]["vendor_options"] = {{"nested", json::array({nullptr, false, "future"})}};
+      body["chat_template_kwargs"]["unknown"] = nullptr;
+      const auto actual = parse(tokenizer, compiler, body, route);
+      require(*actual.prompt == *expected.prompt &&
+          actual.enable_thinking == expected.enable_thinking &&
+          actual.initial_reasoning == expected.initial_reasoning,
+          "ignored template option changed chat request semantics");
+    }
+    for (const auto& options : std::vector<json>{true, "thinking", json::array(),
+        {{"clear_thinking", true}, {"enable_thinking", "true"}},
+        {{"clear_thinking", true}, {"preserve_thinking", nullptr}}}) {
+      const auto body = json{{"model", kModel}, {"messages", chat_body["messages"]},
+          {"chat_template_kwargs", options}};
+      rejects(400, "chat_template_kwargs", [&] { (void)parse(tokenizer, compiler, body, route); });
+    }
+  }
   auto scored_chat = chat_body;
   scored_chat["logprobs"] = true;
   const auto default_scores = parse(tokenizer, compiler, scored_chat, "/v1/chat/completions");
@@ -168,7 +191,6 @@ void request_cases(const text::Tokenizer& tokenizer, constraint::Compiler& compi
   rejects(400, "model", [&] { (void)parse(tokenizer, compiler, {{"prompt", "Hi"}}); });
   rejects(404, "model", [&] { (void)parse(tokenizer, compiler, {{"model", "other"}, {"prompt", "Hi"}}); });
   rejects(400, "messages", [&] { (void)parse(tokenizer, compiler, {{"model", kModel}, {"messages", json::array({{{"role", "tool"}, {"content", "x"}}})}}, "/v1/chat/completions"); });
-  rejects(400, "chat_template_kwargs", [&] { auto body = chat_body; body["chat_template_kwargs"] = {{"wrong", true}}; (void)parse(tokenizer, compiler, body, "/v1/chat/completions"); });
   rejects(400, "stream_options.include_usage", [&] { auto body = raw; body["stream"] = true; body["stream_options"] = {{"include_usage", 1}}; (void)parse(tokenizer, compiler, body); });
   rejects(400, "stream_options.wrong", [&] { auto body = raw; body["stream"] = true; body["stream_options"] = {{"wrong", nullptr}}; (void)parse(tokenizer, compiler, body); });
   std::vector<std::uint32_t> full_context(262144, 7);
@@ -250,14 +272,18 @@ void image_request_cases(const text::Tokenizer& tokenizer, constraint::Compiler&
   images.image_token = model::kImageTokenId;
   images.end_token = model::kEndImageTokenId;
   images.max_image_tokens = 1120;
-  images.prepare = [&](std::string_view url) {
+  images.default_max_soft_tokens = 280;
+  images.prepared_bytes = {{70, 8}, {140, 8}, {280, 8}, {560, 8}, {1120, 8}};
+  std::vector<std::uint32_t> prepared_budgets;
+  images.prepare = [&](std::string_view url, std::uint32_t max_soft_tokens) {
     ++prepared;
+    prepared_budgets.push_back(max_soft_tokens);
     const bool second = url == "data:image/png;base64,second";
     if (!second && url != "data:image/png;base64,fixture") throw std::invalid_argument("invalid fixture image");
     auto image = std::make_shared<gewell::runtime::ImageInput>();
     image->pixels = {std::uint8_t(second ? 9 : 1), 2, 3, 4};
     image->positions = {5, 6, 7, 8};
-    image->padded_patch_rows = 2520;
+    image->padded_patch_rows = max_soft_tokens * 9;
     image->end = second ? 3 : 6;
     allocations.push_back(image);
     return image;
@@ -272,6 +298,7 @@ void image_request_cases(const text::Tokenizer& tokenizer, constraint::Compiler&
     return http::parse_request("POST", route, body.dump(), tokenizer, kModel, compiler, images);
   };
   const auto request = parse_image(original);
+  require(prepared_budgets.back() == 280, "image server default budget was lost");
   require(prepared == 1 && request.images.size() == 1 && request.images[0]->end - request.images[0]->begin == 6 &&
       request.prompt->at(request.images[0]->begin - 1) == model::kBeginImageTokenId &&
       request.prompt->at(request.images[0]->end) == model::kEndImageTokenId &&
@@ -315,6 +342,47 @@ void image_request_cases(const text::Tokenizer& tokenizer, constraint::Compiler&
   history["messages"].push_back({{"role", "user"}, {"content", json::array({second_part,
       {{"type", "text"}, {"text", "Compare it to the earlier image."}}})}});
   verify_order(history, {6, 3}, {1, 9});
+  for (const auto budget : {70U, 140U, 280U, 560U, 1120U}) {
+    auto budgeted = multiple;
+    budgeted["mm_processor_kwargs"] = {{"max_soft_tokens", budget}};
+    const auto parsed = parse_image(budgeted);
+    require(prepared_budgets[prepared_budgets.size() - 2] == budget && prepared_budgets.back() == budget &&
+        parsed.images[0]->padded_patch_rows == budget * 9 && parsed.images[1]->padded_patch_rows == budget * 9,
+        "request budget was not applied to every image");
+  }
+  images.default_max_soft_tokens = 560;
+  (void)parse_image(original);
+  require(prepared_budgets.back() == 560, "configured server default was ignored");
+  for (const auto options : {json(), json::object()}) {
+    auto defaulted = original;
+    defaulted["mm_processor_kwargs"] = options;
+    (void)parse_image(defaulted);
+    require(prepared_budgets.back() == 560, "empty processor options changed the server default");
+  }
+  auto overridden = original;
+  overridden["mm_processor_kwargs"] = {{"max_soft_tokens", 70}};
+  (void)parse_image(overridden);
+  require(prepared_budgets.back() == 70, "request budget did not override the server default");
+  images.default_max_soft_tokens = 280;
+  const auto before_bad_budget = prepared;
+  for (const auto value : {json(0), json(71), json(1280), json(-1), json(280.0), json("280"), json(true), json()}) {
+    auto bad_budget = original;
+    bad_budget["mm_processor_kwargs"] = {{"max_soft_tokens", value}};
+    rejects(400, "mm_processor_kwargs.max_soft_tokens", [&] { (void)parse_image(bad_budget); });
+  }
+  for (const auto options : {json::array(), json("invalid"), json(280)}) {
+    auto bad_budget = original;
+    bad_budget["mm_processor_kwargs"] = options;
+    rejects(400, "mm_processor_kwargs", [&] { (void)parse_image(bad_budget); });
+  }
+  auto bad_budget = original;
+  bad_budget["mm_processor_kwargs"] = {{"min_pixels", 1}};
+  rejects(400, "mm_processor_kwargs.min_pixels", [&] { (void)parse_image(bad_budget); });
+  const json raw_budget{{"model", kModel}, {"prompt", "Hi"},
+      {"mm_processor_kwargs", {{"max_soft_tokens", 280}}}};
+  for (const auto route : {"/v1/completions", "/v1/cache/prefill"})
+    rejects(400, "mm_processor_kwargs", [&] { (void)parse_image(raw_budget, route); });
+  require(prepared == before_bad_budget, "invalid image budget allocated tensors");
   history["messages"].push_back({{"role", "assistant"}, {"content", "They differ."}});
   history["messages"].push_back({{"role", "user"}, {"content", "Which came first?"}});
   verify_order(history, {6, 3}, {1, 9});
@@ -353,10 +421,13 @@ void image_request_cases(const text::Tokenizer& tokenizer, constraint::Compiler&
   auto warm_body = multiple;
   warm_body.erase("seed"); warm_body.erase("max_tokens"); warm_body.erase("logprobs");
   warm_body["cache"] = {{"prompt_id", "image-warm"}};
+  warm_body["mm_processor_kwargs"] = {{"max_soft_tokens", 1120}};
   const auto warm = parse_image(warm_body, "/v1/cache/prefill");
   require(warm.operation == http::Operation::prefill && warm.images.size() == 2 &&
       warm.max_tokens == 0 && warm.cache.prompt_id == "image-warm",
       "image cache prefill lost images or owner controls");
+  require(prepared_budgets.back() == 1120 && prepared_budgets[prepared_budgets.size() - 2] == 1120,
+      "cache prefill did not use the request image budget");
   warm_body["cache"] = {{"mode", "reuse_only"}};
   rejects(400, "cache", [&] { (void)parse_image(warm_body, "/v1/cache/prefill"); });
   auto long_prompt = original;

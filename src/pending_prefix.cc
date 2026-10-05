@@ -138,7 +138,7 @@ bool Work::at_boundary() const {
   return !failed_ && !inflight() && !dependents_.empty() && completed_ == next_boundary();
 }
 
-Step Work::begin_step(std::uint32_t max_rows) {
+Step Work::next_step(std::uint32_t max_rows) const {
   require(!failed_, "failed work cannot dispatch");
   require(!inflight(), "step already in flight");
   require(!dependents_.empty(), "no dependents to process");
@@ -152,8 +152,13 @@ Step Work::begin_step(std::uint32_t max_rows) {
     break;
   }
   require(end <= boundary, "step crosses a known boundary");
-  dispatched_end_ = end;
   return {completed_, end};
+}
+
+Step Work::begin_step(std::uint32_t max_rows) {
+  const auto step = next_step(max_rows);
+  dispatched_end_ = step.end;
+  return step;
 }
 
 void Work::complete_step(bool success) {

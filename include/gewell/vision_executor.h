@@ -48,7 +48,7 @@ class CaptureSink {
   virtual void capture(const CaptureTensor& tensor, cudaStream_t stream) = 0;
 };
 
-// Request-shaped, batch-one, prefill-only Gemma 4 vision executor. The object
+// Batch-one, prefill-only Gemma 4 vision executor. The object
 // owns CUDA library descriptors but no activation storage. Weights, scratch,
 // request buffers, stream, and their lifetimes remain caller-owned.
 class VisionExecutor {
@@ -64,6 +64,11 @@ class VisionExecutor {
   [[nodiscard]] std::uint32_t soft_token_count() const;
   [[nodiscard]] std::uint32_t patch_rows() const;
   [[nodiscard]] std::size_t scratch_bytes() const;
+
+  // Update row-dependent layouts without rebuilding handles or weight bindings.
+  // Already enqueued calls retain their launch parameters. Subsequent run()
+  // calls must provide scratch_bytes() bytes for the new shape.
+  void set_soft_token_count(std::uint32_t soft_token_count);
 
   // Enqueues the complete tower and bridge on stream. scratch_device must be
   // 256-byte aligned, provide scratch_bytes() bytes, and not overlap inputs,

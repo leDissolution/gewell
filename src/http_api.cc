@@ -337,11 +337,35 @@ std::vector<std::uint32_t> chat_prompt(const json& body, const text::Tokenizer& 
   }
 }
 
+std::uint32_t image_budget(const json& body, bool chat, const ImageSupport& images) {
+  if (!present(body, "mm_processor_kwargs")) return images.default_max_soft_tokens;
+  if (!chat)
+    invalid("mm_processor_kwargs", "mm_processor_kwargs requires messages", "unsupported_parameter");
+  const auto& options = body["mm_processor_kwargs"];
+  if (!options.is_object())
+    invalid("mm_processor_kwargs", "mm_processor_kwargs must be an object or null");
+  allow_keys(options, {"max_soft_tokens"}, "mm_processor_kwargs.");
+  if (!options.contains("max_soft_tokens")) return images.default_max_soft_tokens;
+  const std::string param = "mm_processor_kwargs.max_soft_tokens";
+  if (!images.prepare)
+    invalid(param, "image budget requires --vision PATH", "unsupported_parameter");
+  const auto budget = static_cast<std::uint32_t>(integer(
+      options["max_soft_tokens"], param, 1, images.max_image_tokens));
+  if (!images.prepared_bytes.count(budget)) {
+    std::string supported;
+    for (const auto& entry : images.prepared_bytes)
+      supported += (supported.empty() ? "" : ", ") + std::to_string(entry.first);
+    invalid(param, "max_soft_tokens must be one of " + supported);
+  }
+  return budget;
+}
+
 // Collect image parts in conversation order and validate the complete message
 // structure before allocating decoded tensors. Each preparation retains its
 // own transport memory lease until the request retires.
 std::vector<std::shared_ptr<runtime::ImageInput>> prepare_chat_images(
-    json& body, const text::Tokenizer& tokenizer, const ImageSupport& images) {
+    json& body, const text::Tokenizer& tokenizer, const ImageSupport& images,
+    std::uint32_t max_soft_tokens) {
   if (!body.contains("messages") || !body["messages"].is_array()) return {};
   struct PendingImage {
     json* part;
@@ -385,9 +409,10 @@ std::vector<std::shared_ptr<runtime::ImageInput>> prepare_chat_images(
   std::uint64_t image_tokens = 0;
   for (auto& image : pending) {
     std::shared_ptr<runtime::ImageInput> value;
-    try { value = images.prepare(image.url); }
+    try { value = images.prepare(image.url, max_soft_tokens); }
     catch (const std::invalid_argument& error) { invalid(image.param + ".image_url.url", error.what(), "invalid_image"); }
-    if (!value || value->begin || !value->end || value->end > images.max_image_tokens)
+    if (!value || value->begin || !value->end || value->end > max_soft_tokens ||
+        value->end > images.max_image_tokens)
       execution_error("image processor returned an invalid feature span");
     image_tokens += std::uint64_t(value->end) + 2;
     if (image_tokens > tokenizer.contract().context_tokens)
@@ -591,7 +616,8 @@ Request parse_request(std::string_view method, std::string_view path,
   }
   if (request.operation == Operation::prefill) {
     allow_keys(body, {"model", "messages", "prompt", "cache", "chat_template_kwargs",
-                      "tools", "tool_choice", "parallel_tool_calls", "reasoning_effort"});
+                      "tools", "tool_choice", "parallel_tool_calls", "reasoning_effort",
+                      "mm_processor_kwargs"});
     if (body.contains("messages") == body.contains("prompt"))
       invalid("prompt", "prefill requires exactly one of messages or prompt");
     request.chat = body.contains("messages");
@@ -626,7 +652,8 @@ Request parse_request(std::string_view method, std::string_view path,
   if (request.operation == Operation::prefill && (request.cache.reuse_only || request.cache.finished))
     invalid("cache", "prefill requires mode=auto and finished=false");
   std::vector<std::uint32_t> prompt;
-  auto prepared_images = request.chat ? prepare_chat_images(body, tokenizer, images)
+  const auto max_soft_tokens = image_budget(body, request.chat, images);
+  auto prepared_images = request.chat ? prepare_chat_images(body, tokenizer, images, max_soft_tokens)
                                       : std::vector<std::shared_ptr<runtime::ImageInput>>{};
   json tools;
   if (request.chat) {

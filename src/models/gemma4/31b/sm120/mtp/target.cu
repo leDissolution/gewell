@@ -389,6 +389,7 @@ void Verifier::run_batch(const std::uint32_t* tokens,
   if (!tokens || inputs.empty())
     throw std::invalid_argument("MTP target batch requires tokens and requests");
   std::uint32_t rows = 0;
+  bool capture_layers = false;
   for (const auto& input : inputs) {
     valid_rows(input.rows);
     valid_rows(input.staging_capacity_rows);
@@ -398,6 +399,11 @@ void Verifier::run_batch(const std::uint32_t* tokens,
         input.base_position == 0 ||
         std::uint64_t(input.base_position) + input.rows > s.context_capacity)
       throw std::invalid_argument("MTP target inputs or staging outside capacity");
+    for (const auto& capture : input.captures) {
+      if (!capture.output || !capture.completed_layers || capture.completed_layers > m::kLayerCount)
+        throw std::invalid_argument("MTP target capture layer outside model");
+      capture_layers = true;
+    }
     rows += input.rows;
   }
   prepare(rows);
@@ -552,6 +558,17 @@ void Verifier::run_batch(const std::uint32_t* tokens,
     detail::residual_norm<true><<<rows, detail::kNormThreads, 0, stream>>>(
         h0, weight(11 + shift), h2, weight(12 + shift), s.weights[next_norm], h1);
     check(cudaGetLastError(), "MTP post-feedforward residual norm");
+    if (capture_layers) {
+      std::size_t offset = 0;
+      for (const auto& input : inputs) {
+        for (const auto& capture : input.captures)
+          if (capture.completed_layers == i + 1)
+            check(cudaMemcpyAsync(capture.output, h0 + offset * H,
+                std::size_t(input.rows) * H * sizeof(BFloat16), cudaMemcpyDeviceToDevice, stream),
+                "capture target layer residual");
+        offset += input.rows;
+      }
+    }
     staging_layer_elements += 2 * heads * d;
   }
   plan.head.run(s.handle, h1, s.weights[0], s.at(l.logits), stream);

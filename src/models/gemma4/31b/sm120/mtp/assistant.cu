@@ -371,6 +371,8 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
   }
   norm(s.hidden, s.weights.assistant[45], s.normalized, rows, stream);
   if (trace) capture(trace->final_norm, s.normalized);
+  for (unsigned row = 0; row < rows; ++row)
+    capture(inputs[row].capture_hidden, s.normalized + std::size_t(row) * kHidden);
   p.head.run(handle, s.normalized, s.weights.assistant[0], s.logits, stream);
   p.post.run(handle, s.normalized, s.weights.assistant[47], s.feedback, stream);
   for (unsigned row = 0; row < rows; ++row) {

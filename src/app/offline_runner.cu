@@ -271,7 +271,8 @@ Json result(const BatchRequest& request, std::uint32_t mtp_depth) {
 
 int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
              RuntimeSettings settings, const std::string& qdq_mask_path) {
-  settings.mtp_depth = effective_mtp_depth(settings.mtp_depth, settings.assistant_path);
+  settings.mtp_depth = effective_mtp_depth(settings.mtp_depth, settings.assistant_path, settings.mtp_min_depth);
+  if (!settings.mtp_depth) settings.mtp_min_depth = 0;
   const auto limits = live_batch_limits(max_batch, settings, 256);
   Signals signals;
   DiagnosticsToStderr diagnostics;
@@ -432,9 +433,11 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
   current = &scheduler;
   scheduler.write_startup_capacity();
   channel.event(Json{{"event", "offline_ready"}, {"max_batch", max_batch}, {"max_pending", limits.max_requests},
-      {"prefill_chunk_tokens", limits.prefill_chunk_tokens}, {"prefill_budget_tokens", limits.prefill_budget_tokens},
+      {"prefill_chunk_tokens", limits.prefill_chunk_tokens}, {"prefill_batch_tokens", limits.prefill_batch_tokens},
+      {"prefill_budget_tokens", limits.prefill_budget_tokens},
       {"max_context_tokens", limits.max_horizon}, {"vocab_size", gemma4::text_contract_31b().vocabulary_size},
-      {"mtp_depth", limits.mtp_depth}, {"max_logit_chunk_bytes",
+      {"mtp_depth", limits.mtp_depth}, {"mtp_min_depth", limits.mtp_min_depth},
+      {"decode_width", limits.decode_width}, {"max_logit_chunk_bytes",
           (std::size_t(limits.mtp_depth) + 1) * gemma4::text_contract_31b().vocabulary_size * 2}}.dump());
   while (!shutdown && (!channel.eof() || scheduler.has_pending() || !channel.empty())) {
     const bool progressed = scheduler.step();

@@ -5,7 +5,6 @@
 #include "gewell/vision_primitives.h"
 
 #include <cublasLt.h>
-#include <cublas_v2.h>
 
 #include <array>
 #include <algorithm>
@@ -91,26 +90,6 @@ class LtHandle {
   cublasLtHandle_t handle_{};
 };
 
-class CublasHandle {
- public:
-  CublasHandle() {
-    check_cublas(cublasCreate(&handle_), "cublasCreate");
-    check_cublas(cublasSetMathMode(handle_, CUBLAS_TENSOR_OP_MATH),
-                 "set vision attention tensor-op math mode");
-  }
-  ~CublasHandle() {
-    if (handle_ != nullptr) {
-      cublasDestroy(handle_);
-    }
-  }
-  CublasHandle(const CublasHandle&) = delete;
-  CublasHandle& operator=(const CublasHandle&) = delete;
-  [[nodiscard]] cublasHandle_t get() const { return handle_; }
-
- private:
-  cublasHandle_t handle_{};
-};
-
 class MatrixLayout {
  public:
   MatrixLayout(std::uint64_t rows, std::uint64_t columns,
@@ -132,6 +111,11 @@ class MatrixLayout {
   MatrixLayout(const MatrixLayout&) = delete;
   MatrixLayout& operator=(const MatrixLayout&) = delete;
   [[nodiscard]] cublasLtMatrixLayout_t get() const { return layout_; }
+  void set_rows(std::uint64_t rows) {
+    check_cublas(cublasLtMatrixLayoutSetAttribute(
+        layout_, CUBLASLT_MATRIX_LAYOUT_ROWS, &rows, sizeof(rows)),
+        "set vision linear rows");
+  }
 
  private:
   cublasLtMatrixLayout_t layout_{};
@@ -165,6 +149,11 @@ class LinearPlan {
   }
   LinearPlan(const LinearPlan&) = delete;
   LinearPlan& operator=(const LinearPlan&) = delete;
+
+  void set_rows(std::uint32_t rows) {
+    input_.set_rows(rows);
+    output_.set_rows(rows);
+  }
 
   void run(cublasLtHandle_t handle, const BFloat16* input,
            const BFloat16* weight, BFloat16* output,
@@ -210,9 +199,6 @@ class ScratchLayout {
     const std::size_t mlp_bytes =
         static_cast<std::size_t>(patch_rows) * model::kVisionMlpSize *
         sizeof(BFloat16);
-    const std::size_t score_bytes =
-        static_cast<std::size_t>(model::kVisionHeadCount) * patch_rows *
-        patch_rows * sizeof(BFloat16);
     const std::size_t pool_bytes =
         static_cast<std::size_t>(patch_rows / 9) *
         model::kVisionHiddenSize * sizeof(float);
@@ -227,7 +213,7 @@ class ScratchLayout {
     gate = take(mlp_bytes);
     up = take(mlp_bytes);
     product = take(mlp_bytes);
-    scores = take(std::max(score_bytes, pool_bytes));
+    pooled = take(pool_bytes);
     bytes = align_up(cursor_, kScratchAlignment);
   }
 
@@ -241,7 +227,7 @@ class ScratchLayout {
   std::size_t gate{};
   std::size_t up{};
   std::size_t product{};
-  std::size_t scores{};
+  std::size_t pooled{};
   std::size_t bytes{};
 
  private:
@@ -290,6 +276,19 @@ class VisionExecutor::Impl {
   [[nodiscard]] std::uint32_t patch_rows() const { return patch_rows_; }
   [[nodiscard]] std::size_t scratch_bytes() const { return scratch_.bytes; }
 
+  void set_soft_token_count(std::uint32_t soft_token_count) {
+    const auto patch_rows = checked_patch_rows(soft_token_count);
+    if (soft_token_count == soft_token_count_) return;
+    patch_plan_.set_rows(patch_rows);
+    hidden_plan_.set_rows(patch_rows);
+    hidden_to_mlp_.set_rows(patch_rows);
+    mlp_to_hidden_.set_rows(patch_rows);
+    bridge_.set_rows(soft_token_count);
+    soft_token_count_ = soft_token_count;
+    patch_rows_ = patch_rows;
+    scratch_ = ScratchLayout(patch_rows);
+  }
+
   void run(const vision_engine::PrefillRequest& request, void* scratch_device,
            std::size_t scratch_capacity_bytes, cudaStream_t stream,
            CaptureSink* captures) const {
@@ -310,8 +309,6 @@ class VisionExecutor::Impl {
       throw std::invalid_argument("vision executor scratch capacity is too small");
     }
     validate_scratch_ranges(request, scratch_device);
-    check_cublas(cublasSetStream(attention_handle_.get(), stream),
-                 "set vision attention stream");
 
     auto* const base = static_cast<std::uint8_t*>(scratch_device);
     BFloat16* const h0 = at<BFloat16>(base, scratch_.h0);
@@ -324,7 +321,7 @@ class VisionExecutor::Impl {
     BFloat16* const gate = at<BFloat16>(base, scratch_.gate);
     BFloat16* const up = at<BFloat16>(base, scratch_.up);
     BFloat16* const product = at<BFloat16>(base, scratch_.product);
-    BFloat16* const scores = at<BFloat16>(base, scratch_.scores);
+    float* const pooled = at<float>(base, scratch_.pooled);
     const auto* const positions = request.image.position_ids_device;
 
     capture(captures, "input.pixel_values",
@@ -360,7 +357,7 @@ class VisionExecutor::Impl {
                                     model::kVisionHeadSize, 1.0e-6F, stream);
       vision::token_heads_to_head_tokens(h2, value, patch_rows_, stream);
 
-      attention(query, key, value, scores, raw, stream);
+      vision::full_attention(query, key, value, raw, patch_rows_, stream);
       hidden_plan_.run(linear_handle_.get(), raw, weight.o_proj, h2, stream);
       primitives::rms_norm(h2, weight.post_attention_norm, h1, patch_rows_,
                            model::kVisionHiddenSize, 1.0e-6F, stream);
@@ -390,7 +387,6 @@ class VisionExecutor::Impl {
               stream);
     }
 
-    auto* const pooled = reinterpret_cast<float*>(scores);
     vision::pool_3x3_scaled(h0, positions, pooled, patch_rows_, stream);
     capture(captures, "vision.post_pool_scaled", pooled, CaptureDType::f32,
             soft_token_count_, model::kVisionHiddenSize, stream);
@@ -521,46 +517,6 @@ class VisionExecutor::Impl {
                                     patch_rows_, stream);
   }
 
-  void attention(BFloat16* query, const BFloat16* key,
-                 const BFloat16* value, BFloat16* probabilities,
-                 BFloat16* context, cudaStream_t stream) const {
-    const int rows = static_cast<int>(patch_rows_);
-    constexpr int kHeadSize = static_cast<int>(model::kVisionHeadSize);
-    constexpr int kHeads = static_cast<int>(model::kVisionHeadCount);
-    const long long head_stride =
-        static_cast<long long>(patch_rows_) * model::kVisionHeadSize;
-    const long long score_stride =
-        static_cast<long long>(patch_rows_) * patch_rows_;
-    const float alpha = 1.0F;
-    const float beta = 0.0F;
-
-    // Row-major Q*K^T is the transpose of the column-major K*Q^T below.
-    check_cublas(cublasGemmStridedBatchedEx(
-                     attention_handle_.get(), CUBLAS_OP_T, CUBLAS_OP_N, rows,
-                     rows, kHeadSize, &alpha, key, CUDA_R_16BF, kHeadSize,
-                     head_stride, query, CUDA_R_16BF, kHeadSize, head_stride,
-                     &beta, probabilities, CUDA_R_16BF, rows, score_stride,
-                     kHeads, CUBLAS_COMPUTE_32F,
-                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                 "vision QK matmul");
-    vision::softmax_rows(probabilities, probabilities,
-                         model::kVisionHeadCount * patch_rows_, patch_rows_,
-                         stream);
-
-    // Column-major V^T*P^T writes one row-major [M,D] result per head.
-    // Query is dead after QK, so reuse it for that head-major result and then
-    // transpose to the token-major layout consumed by the output projection.
-    check_cublas(cublasGemmStridedBatchedEx(
-                     attention_handle_.get(), CUBLAS_OP_N, CUBLAS_OP_N,
-                     kHeadSize, rows, rows, &alpha, value, CUDA_R_16BF,
-                     kHeadSize, head_stride, probabilities, CUDA_R_16BF, rows,
-                     score_stride, &beta, query, CUDA_R_16BF, kHeadSize,
-                     head_stride, kHeads, CUBLAS_COMPUTE_32F,
-                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                 "vision PV matmul");
-    vision::head_tokens_to_token_heads(query, context, patch_rows_, stream);
-  }
-
   static void capture(CaptureSink* sink, std::string_view name,
                       const void* data, CaptureDType dtype,
                       std::uint32_t rows, std::uint32_t columns,
@@ -580,7 +536,6 @@ class VisionExecutor::Impl {
   std::uint32_t patch_rows_{};
   ScratchLayout scratch_;
   LtHandle linear_handle_;
-  CublasHandle attention_handle_;
   LinearPlan patch_plan_;
   LinearPlan hidden_plan_;
   LinearPlan hidden_to_mlp_;
@@ -610,6 +565,10 @@ std::uint32_t VisionExecutor::patch_rows() const { return impl_->patch_rows(); }
 
 std::size_t VisionExecutor::scratch_bytes() const {
   return impl_->scratch_bytes();
+}
+
+void VisionExecutor::set_soft_token_count(std::uint32_t soft_token_count) {
+  impl_->set_soft_token_count(soft_token_count);
 }
 
 void VisionExecutor::run(const vision_engine::PrefillRequest& request,

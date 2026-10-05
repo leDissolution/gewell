@@ -832,7 +832,6 @@ struct Fixture {
       }
       equal(tensor ? "FP8 tensor prefill differs from decoded reference" : "FP8 scalar prefill differs from decoded reference");
     }
-    cublasDestroy(handle);
     fp8_compute();
     for (unsigned control = 0; control < 2; ++control) {
       const auto& c = control ? ref : cache;
@@ -842,6 +841,48 @@ struct Fixture {
       else p::image_block_gqa_attention_cached_chunk(query.get(), key.get(), value.get(), c.key, c.value, Base, rows, capacity, Base, Base + rows, out, kind, nullptr, c.format);
     }
     equal("FP8 image attention differs from decoded reference");
+    std::vector<BF16> image_reference(output.bytes / sizeof(BF16));
+    check(cudaMemcpy(image_reference.data(), output.get(), output.bytes, cudaMemcpyDeviceToHost));
+    for (unsigned control = 0; control < 2; ++control) {
+      const auto& c = control ? ref : cache;
+      auto* out = control ? reference.get() : output.get();
+      if (paged) p::causal_gqa_attention_cached_chunk_tensor_global_compact_paged(handle,
+          query.get(), key.get(), value.get(), control ? ref_page : page, norm.get(),
+          Base, rows, scratch.get<void>(), out);
+      else if (global) p::causal_gqa_attention_cached_chunk_tensor_global_compact(handle,
+          query.get(), key.get(), value.get(), c.key, norm.get(), Base, rows, capacity,
+          scratch.get<void>(), out, nullptr, c.format);
+      else p::causal_gqa_attention_cached_chunk_tensor(handle, query.get(), key.get(), value.get(),
+          c.key, c.value, Base, rows, capacity, scratch.get<void>(), out, kind, nullptr,
+          c.format, nullptr, Base, Base + rows);
+    }
+    equal("FP8 image tensor attention differs from decoded reference");
+    std::vector<BF16> image_tensor(image_reference.size());
+    check(cudaMemcpy(image_tensor.data(), output.get(), output.bytes, cudaMemcpyDeviceToHost));
+    // Tensor attention rounds both the softmax numerator weights and their
+    // denominator to BF16 (unit roundoff 1/256). With |V| <= 16, their
+    // combined error is bounded by 2*16/255, plus output rounding. Also bound
+    // vector error so cancellation near zero cannot hide broad disagreement.
+    double error_squared = 0, reference_squared = 0;
+    float maximum_error = 0;
+    for (std::size_t i = 0; i < image_reference.size(); ++i) {
+      const float error = fp(image_tensor[i]) - fp(image_reference[i]);
+      error_squared += double(error) * error;
+      reference_squared += double(fp(image_reference[i])) * fp(image_reference[i]);
+      maximum_error = std::max(maximum_error, std::abs(error));
+      require(std::isfinite(fp(image_tensor[i])) &&
+              std::abs(error) <= 32.0F / 255 + std::abs(fp(image_reference[i])) / 128,
+              ("Image tensor attention differs from the nonuniform scalar reference: global=" +
+              std::to_string(global) + " paged=" + std::to_string(paged) + " rows=" + std::to_string(rows) +
+              " index=" + std::to_string(i) + " actual=" + std::to_string(fp(image_tensor[i])) +
+              " expected=" + std::to_string(fp(image_reference[i]))).c_str());
+    }
+    const double relative_l2 = std::sqrt(error_squared / reference_squared);
+    require(relative_l2 <= 1.0 / 128, "Image tensor attention relative L2 exceeds BF16 tolerance");
+    std::cout << "Image tensor vs scalar global=" << global << " paged=" << paged
+              << " rows=" << rows << " relative_l2=" << relative_l2
+              << " max_abs=" << maximum_error << '\n';
+    cublasDestroy(handle);
     for (unsigned control = 0; control < 2; ++control)
       a::run(query.get(), key.get(), value.get(), control ? ref : cache, norm.get(), Base, rows,
           kind, control ? reference.get() : output.get(), scratch.get<void>(), scratch.bytes, nullptr);
@@ -1141,6 +1182,14 @@ int main(int argc, char** argv) {
     }
     quantization_rounding();
     packed_loads();
+    // Exercise short cached suffixes with packed storage and an independently
+    // decoded BF16 cache, including the local-window boundary.
+    for (unsigned base : {16U, 543U, 1023U})
+      for (unsigned rows : {1U, 17U, 31U})
+        for (unsigned layout = 0; layout < 3; ++layout) {
+          Fixture fixture(layout != 0, layout == 2, rows, base);
+          fixture.run();
+        }
     for (unsigned rows : {1U, 4U, 8U})
       for (unsigned layout = 0; layout < 3; ++layout) {
         Fixture fixture(layout != 0, layout == 2, rows);

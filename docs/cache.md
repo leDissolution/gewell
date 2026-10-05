@@ -156,7 +156,8 @@ There is no need to send that ID to benefit from its prefix.
 
 Supply exactly one of `messages` or `prompt`. `messages` uses the same chat
 rendering and image support as Chat Completions, including `tools`,
-`tool_choice`, `parallel_tool_calls`, and `chat_template_kwargs`. `prompt`
+`tool_choice`, `parallel_tool_calls`, `chat_template_kwargs`, `reasoning_effort`,
+and the [image budget](http-api.md#images) in `mm_processor_kwargs`. `prompt`
 accepts a string or a token-ID array as in Completions. `model` is optional
 for this endpoint; if supplied, it must match the served model.
 

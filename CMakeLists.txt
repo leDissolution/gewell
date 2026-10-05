@@ -91,7 +91,7 @@ add_library(gewell_cache STATIC src/kv_cache.cc src/prefix_index.cc src/pending_
 target_include_directories(gewell_cache PUBLIC include)
 target_compile_features(gewell_cache PUBLIC cxx_std_17)
 
-add_library(gewell_runtime STATIC src/runtime/cache.cc src/runtime/scheduler.cc src/runtime/image.cc)
+add_library(gewell_runtime STATIC src/runtime/cache.cc src/runtime/scheduler.cc src/runtime/image.cc src/runtime/mtp_stats.cc src/runtime/mtp_capture.cc)
 target_include_directories(gewell_runtime PUBLIC include)
 target_include_directories(gewell_runtime SYSTEM PUBLIC vendor/nlohmann)
 target_compile_features(gewell_runtime PUBLIC cxx_std_17)
@@ -112,7 +112,7 @@ if(BUILD_TESTING)
   target_link_libraries(gewell_image_processor_test PRIVATE gewell_gemma4_image_processor OpenSSL::Crypto)
   add_test(NAME gewell_image_processor_test COMMAND gewell_image_processor_test
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/image_processor.json")
-  foreach(suite IN ITEMS runtime_cache runtime_scheduler image_identity)
+  foreach(suite IN ITEMS runtime_cache runtime_scheduler runtime_mtp_stats runtime_mtp_capture image_identity)
     add_executable(gewell_${suite}_test tests/${suite}_test.cc)
     target_link_libraries(gewell_${suite}_test PRIVATE gewell_runtime)
     add_test(NAME gewell_${suite}_test COMMAND gewell_${suite}_test)
@@ -156,11 +156,15 @@ FetchContent_Declare(cutlass
 )
 FetchContent_MakeAvailable(cutlass)
 set_property(SOURCE src/nvfp4_linear.cu src/fp8_linear.cu
-  src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu APPEND PROPERTY
+  src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu
+  src/models/gemma4/31b/sm120/vision/attention.cu APPEND PROPERTY
   INCLUDE_DIRECTORIES "${cutlass_SOURCE_DIR}/include" "${cutlass_SOURCE_DIR}/tools/util/include")
 set_property(SOURCE src/nvfp4_linear.cu src/fp8_linear.cu
-  src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu APPEND PROPERTY
+  src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu
+  src/models/gemma4/31b/sm120/vision/attention.cu APPEND PROPERTY
   COMPILE_OPTIONS --expt-relaxed-constexpr)
+set_property(SOURCE src/models/gemma4/31b/sm120/vision/attention.cu APPEND PROPERTY
+  INCLUDE_DIRECTORIES "${cutlass_SOURCE_DIR}/examples/41_fused_multi_head_attention")
 
 function(gewell_cuda_target target)
   target_include_directories(${target} PRIVATE include src)
@@ -200,6 +204,7 @@ add_library(gewell_gemma4_31b_sm120 STATIC
   src/replay_metrics.cu
   src/models/gemma4/31b/sm120/vision/engine.cc
   src/models/gemma4/31b/sm120/vision/executor.cu
+  src/models/gemma4/31b/sm120/vision/attention.cu
   src/models/gemma4/31b/sm120/vision/primitives.cu
   src/models/gemma4/31b/sm120/vision/prepared_image.cu
   src/weight_qdq.cu

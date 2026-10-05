@@ -6,6 +6,7 @@
 #include "gewell/app.h"
 #include "gewell/offline_runner.h"
 #include "gewell/text_codec_cli.h"
+#include "gewell/vision_engine.h"
 
 #include <cublasLt.h>
 #include <cuda_runtime.h>
@@ -65,21 +66,35 @@ std::uint64_t parse_nonnegative_u64(std::string_view text,
   return value;
 }
 
-std::uint32_t parse_mtp_depth(std::string_view text) {
+std::uint32_t parse_mtp_depth(std::string_view text, std::string_view option = "--mtp-depth") {
   std::uint32_t value = 0;
   const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
   if (text.empty() || parsed.ec != std::errc{} ||
       parsed.ptr != text.data() + text.size() || value > 1279) {
     throw std::runtime_error(
-        "--mtp-depth must be an integer in 0..1279; adaptive is deferred");
+        std::string(option) + " must be an integer in 0..1279");
   }
   return value;
+}
+
+std::uint32_t parse_decode_width(std::string_view text) {
+  const auto value = parse_nonnegative_u64(text, "--decode-width");
+  if (value > std::numeric_limits<std::uint32_t>::max())
+    throw std::runtime_error("--decode-width must be in 0..4294967295");
+  return static_cast<std::uint32_t>(value);
 }
 
 std::uint32_t parse_prefill_chunk_tokens(std::string_view text) {
   const auto value = parse_positive_u32(text, "--prefill-chunk-tokens");
   if (value > gewell::gemma4_31b::sm120::kMaxPrefillChunkTokens)
     throw std::runtime_error("--prefill-chunk-tokens must be in 1..4096");
+  return value;
+}
+
+std::uint32_t parse_prefill_batch_tokens(std::string_view text) {
+  const auto value = parse_positive_u32(text, "--prefill-batch-tokens");
+  if (value > gewell::gemma4_31b::sm120::kMaxPrefillBatchTokens)
+    throw std::runtime_error("--prefill-batch-tokens must be in 1..4096");
   return value;
 }
 
@@ -116,6 +131,20 @@ float parse_sampling_float(const char* text, const char* option) {
   return value;
 }
 
+std::vector<std::uint32_t> parse_capture_layers(std::string_view value) {
+  std::vector<std::uint32_t> layers;
+  while (true) {
+    const auto comma = value.find(',');
+    const auto layer = parse_positive_u32(value.substr(0, comma), "--mtp-capture-layers");
+    if (layer > model::kLayerCount || (!layers.empty() && layer <= layers.back()))
+      throw std::runtime_error("--mtp-capture-layers must be increasing completed-layer counts in 1..60");
+    layers.push_back(layer);
+    if (comma == std::string_view::npos) break;
+    value.remove_prefix(comma + 1);
+  }
+  return layers;
+}
+
 bool parse_runtime_option(std::string_view option, std::string_view value,
                           app::RuntimeSettings& settings) {
   if (option == "--attention-local-compute") {
@@ -128,8 +157,28 @@ bool parse_runtime_option(std::string_view option, std::string_view value,
     settings.global_kv_format = parse_kv_format(value);
   } else if (option == "--mtp-depth") {
     settings.mtp_depth = parse_mtp_depth(value);
+  } else if (option == "--mtp-min-depth") {
+    settings.mtp_min_depth = parse_mtp_depth(value, option);
+  } else if (option == "--decode-width") {
+    settings.decode_width = parse_decode_width(value);
+  } else if (option == "--mtp-stats") {
+    if (value.empty() || value.substr(0, 2) == "--") throw std::runtime_error("--mtp-stats requires a path");
+    settings.mtp_stats_path = value;
+  } else if (option == "--mtp-capture") {
+    if (value.empty() || value.substr(0, 2) == "--") throw std::runtime_error("--mtp-capture requires a path");
+    settings.mtp_capture.path = value;
+  } else if (option == "--mtp-capture-layers") {
+    settings.mtp_capture.layers = parse_capture_layers(value);
+  } else if (option == "--mtp-capture-every") {
+    settings.mtp_capture.every = parse_positive_u32(value, option);
+  } else if (option == "--mtp-capture-max-samples") {
+    settings.mtp_capture.max_samples = parse_positive_u32(value, option);
+  } else if (option == "--mtp-stats-window") {
+    settings.mtp_stats_window = parse_positive_u32(value, option);
   } else if (option == "--prefill-chunk-tokens") {
     settings.prefill_chunk_tokens = parse_prefill_chunk_tokens(value);
+  } else if (option == "--prefill-batch-tokens") {
+    settings.prefill_batch_tokens = parse_prefill_batch_tokens(value);
   } else if (option == "--prefill-budget-tokens") {
     settings.prefill_budget_tokens = parse_prefill_budget_tokens(value);
   } else if (option == "--nvfp4-activation-policy") {
@@ -375,10 +424,20 @@ Options
                                      accepted before or after the command
   --assistant PATH                   Original assistant model.safetensors; loaded only for positive MTP depth
   --vision PATH                      Extracted vision + projector safetensors; omission disables image input
-  --mtp-depth N                      Speculative decoding depth (0 disables MTP);
+  --mtp-depth N                      Maximum proposal depth, 0..1279 (default 0 disables MTP);
                                      warns and falls back to 0 without --assistant
-  --prefill-chunk-tokens N            Text prefill cap, 1..4096 (default 1024)
-  --prefill-budget-tokens N           Prefill tokens between batch decodes (0: each chunk/head)
+  --mtp-min-depth N                  Minimum adaptive proposal depth (default 0, <= --mtp-depth)
+  --decode-width N                   Target pending + proposal rows per decode batch;
+                                     0 (default) uses fixed --mtp-depth; batch commands only
+  --mtp-stats PATH                   Append windowed MTP statistics to a JSONL file (batch commands)
+  --mtp-stats-window N               Decode cycles per request window (default 64, positive)
+  --mtp-capture DIR                  Append sampled training pairs in a directory (batch commands)
+  --mtp-capture-every N              Capture approximately 1/N MTP rounds (default 32, positive)
+  --mtp-capture-max-samples N        Capture attempts per launch (default 250000, positive)
+  --mtp-capture-layers LIST          Completed target layers to probe (default 4,12,24,40,56; 1..60)
+  --prefill-chunk-tokens N            Per-prompt text chunk cap, 1..4096 (default 1024)
+  --prefill-batch-tokens N            Combined text GEMM rows, 1..4096 (default 2048, >= chunk cap)
+  --prefill-budget-tokens N           Prefill tokens between batch decodes (0: each forward/head)
   --nvfp4-activation-policy POLICY   always (default) or prefill; prefill keeps NVFP4 decode/MTP activations BF16
   --attention-local-compute bf16|fp8 Local text attention, including MTP (default bf16)
   --attention-global-compute bf16|fp8 Global text attention, including MTP (default bf16)
@@ -392,6 +451,7 @@ HTTP options (after serve-http)
   --host HOST                        IPv4 bind address (default 127.0.0.1)
   --port N                           HTTP port (default 6311)
   --model NAME                       Public model name
+  --image-max-soft-tokens N           Default tokens per image: 70, 140, 280 (default), 560, 1120
   --max-connections N                 Accepted connection limit
   --max-body-bytes N                  Per-request input limit
   --max-body-total-bytes N            Combined input limit
@@ -402,7 +462,7 @@ HTTP options (after serve-http)
 Generation options (before generate/caption)
   --temperature T  --top-p P  --top-k K  --seed S  --mtp-depth N
   Batch and server sampling settings belong to individual requests.
-  --mtp-depth, --prefill-chunk-tokens, --prefill-budget-tokens may precede batching commands.
+  --mtp-depth, --mtp-min-depth, --decode-width, and prefill options may precede batching commands.
   --prefill-chunk-tokens leaves the one-chunk image limit at 1280.
   --qdq-mask PATH precedes generate/generate-batch/run-jobs/replay-rollout.
 
@@ -443,24 +503,54 @@ int main(int argc, char** argv) {
     bool generation_options = false;
     bool batch_sampling_options = false;
     bool prefill_budget_option = false;
+    bool prefill_batch_option = false;
+    bool adaptive_depth_options = false;
+    bool mtp_stats_options = false;
+    bool mtp_capture_options = false;
     while (argc >= 2) {
       const std::string_view option(argv[1]);
-      if (option != "--mtp-depth" && option != "--temperature" && option != "--top-p" &&
-          option != "--top-k" && option != "--seed" && option != "--prefill-chunk-tokens" && option != "--prefill-budget-tokens" &&
+      if (option != "--mtp-depth" && option != "--mtp-min-depth" && option != "--decode-width" &&
+          option != "--mtp-stats" && option != "--mtp-stats-window" &&
+          option != "--mtp-capture" && option != "--mtp-capture-every" && option != "--mtp-capture-max-samples" && option != "--mtp-capture-layers" &&
+          option != "--temperature" && option != "--top-p" &&
+          option != "--top-k" && option != "--seed" && option != "--prefill-chunk-tokens" && option != "--prefill-batch-tokens" && option != "--prefill-budget-tokens" &&
           option != "--nvfp4-activation-policy" && option != "--kv-local-format" &&
           option != "--kv-global-format" && option != "--attention-local-compute" && option != "--attention-global-compute") break;
       if (argc < 3) throw std::runtime_error(std::string(option) + " requires a value");
       generation_options = true;
       prefill_budget_option |= option == "--prefill-budget-tokens";
-      batch_sampling_options |= option != "--mtp-depth" && option != "--prefill-chunk-tokens" && option != "--prefill-budget-tokens" && option != "--nvfp4-activation-policy" && option != "--kv-local-format" && option != "--kv-global-format" && option != "--attention-local-compute" && option != "--attention-global-compute";
+      prefill_batch_option |= option == "--prefill-batch-tokens";
+      adaptive_depth_options |= option == "--mtp-min-depth" || option == "--decode-width";
+      mtp_stats_options |= option == "--mtp-stats" || option == "--mtp-stats-window";
+      const bool capture_option = option == "--mtp-capture" || option == "--mtp-capture-every" || option == "--mtp-capture-max-samples" || option == "--mtp-capture-layers";
+      mtp_capture_options |= capture_option;
+      batch_sampling_options |= !capture_option && option != "--mtp-stats" && option != "--mtp-stats-window" &&
+          option != "--mtp-depth" && option != "--mtp-min-depth" && option != "--decode-width" && option != "--prefill-chunk-tokens" && option != "--prefill-batch-tokens" && option != "--prefill-budget-tokens" && option != "--nvfp4-activation-policy" && option != "--kv-local-format" && option != "--kv-global-format" && option != "--attention-local-compute" && option != "--attention-global-compute";
       if (option == "--nvfp4-activation-policy") generation_settings.nvfp4_activation_policy = parse_nvfp4_activation_policy(argv[2]);
       if (option == "--prefill-chunk-tokens") generation_settings.prefill_chunk_tokens = parse_prefill_chunk_tokens(argv[2]);
+      if (option == "--prefill-batch-tokens") generation_settings.prefill_batch_tokens = parse_prefill_batch_tokens(argv[2]);
       if (option == "--prefill-budget-tokens") generation_settings.prefill_budget_tokens = parse_prefill_budget_tokens(argv[2]);
       if (option == "--attention-local-compute") generation_settings.local_attention_compute = parse_attention_compute(argv[2]);
       if (option == "--attention-global-compute") generation_settings.global_attention_compute = parse_attention_compute(argv[2]);
       if (option == "--kv-local-format") generation_settings.local_kv_format = parse_kv_format(argv[2]);
       if (option == "--kv-global-format") generation_settings.global_kv_format = parse_kv_format(argv[2]);
       if (option == "--mtp-depth") generation_settings.mtp_depth = parse_mtp_depth(argv[2]);
+      if (option == "--mtp-min-depth") generation_settings.mtp_min_depth = parse_mtp_depth(argv[2], option);
+      if (option == "--decode-width") generation_settings.decode_width = parse_decode_width(argv[2]);
+      if (option == "--mtp-stats-window") generation_settings.mtp_stats_window = parse_positive_u32(argv[2], option);
+      if (option == "--mtp-capture-layers") generation_settings.mtp_capture.layers = parse_capture_layers(argv[2]);
+      if (option == "--mtp-capture-every") generation_settings.mtp_capture.every = parse_positive_u32(argv[2], option);
+      if (option == "--mtp-capture-max-samples") generation_settings.mtp_capture.max_samples = parse_positive_u32(argv[2], option);
+      if (option == "--mtp-capture") {
+        if (!argv[2][0] || std::string_view(argv[2]).substr(0, 2) == "--")
+          throw std::runtime_error("--mtp-capture requires a path");
+        generation_settings.mtp_capture.path = argv[2];
+      }
+      if (option == "--mtp-stats") {
+        if (!argv[2][0] || std::string_view(argv[2]).substr(0, 2) == "--")
+          throw std::runtime_error("--mtp-stats requires a path");
+        generation_settings.mtp_stats_path = argv[2];
+      }
       if (option == "--temperature") generation_settings.temperature = parse_sampling_float(argv[2], "--temperature");
       if (option == "--top-p") {
         generation_settings.top_p = parse_sampling_float(argv[2], "--top-p");
@@ -482,6 +572,17 @@ int main(int argc, char** argv) {
     }
     if (generation_options && argc >= 2) {
       const std::string_view command(argv[1]);
+      if (mtp_capture_options && command != "generate-batch" &&
+          command != "serve-http" && command != "run-jobs")
+        throw std::runtime_error("--mtp-capture options require a batching command");
+      if (mtp_stats_options && command != "generate-batch" &&
+          command != "serve-http" && command != "run-jobs")
+        throw std::runtime_error("--mtp-stats and --mtp-stats-window require a batching command");
+      if (adaptive_depth_options && command != "generate-batch" &&
+          command != "serve-http" && command != "run-jobs")
+        throw std::runtime_error("--mtp-min-depth and --decode-width require a batching command");
+      if (prefill_batch_option && command != "generate-batch" && command != "run-jobs" && command != "serve-http")
+        throw std::runtime_error("--prefill-batch-tokens requires a batch command");
       if (prefill_budget_option && command != "generate-batch" &&
           command != "serve-http" && command != "run-jobs")
         throw std::runtime_error("--prefill-budget-tokens requires a batching command");
@@ -518,10 +619,11 @@ int main(int argc, char** argv) {
       return app::run_generate_batch(argv[2], argv[3],
           parse_positive_u32(argv[4], "MAX_BATCH"),
           parse_nonnegative_u64(argv[5], "KV_MIB"), argv[6], qdq_mask, generation_settings.mtp_depth,
-          argc == 8 ? argv[7] : "", generation_settings.prefill_chunk_tokens, generation_settings.nvfp4_activation_policy,
+          argc == 8 ? argv[7] : "", generation_settings.prefill_chunk_tokens, generation_settings.prefill_batch_tokens, generation_settings.nvfp4_activation_policy,
           generation_settings.local_kv_format, generation_settings.global_kv_format,
           generation_settings.local_attention_compute, generation_settings.global_attention_compute, assistant_path, vision_path,
-          generation_settings.prefill_budget_tokens);
+          generation_settings.prefill_budget_tokens, generation_settings.mtp_min_depth, generation_settings.decode_width,
+          generation_settings.mtp_stats_path, generation_settings.mtp_stats_window, generation_settings.mtp_capture);
     }
     if (argc >= 2 && std::string_view(argv[1]) == "serve-http") {
       if (batch_sampling_options) throw std::runtime_error("serve-http sampling settings belong to each request");
@@ -529,7 +631,13 @@ int main(int argc, char** argv) {
       settings.assistant_path = assistant_path;
       settings.vision_path = vision_path;
       settings.mtp_depth = generation_settings.mtp_depth;
+      settings.mtp_min_depth = generation_settings.mtp_min_depth;
+      settings.decode_width = generation_settings.decode_width;
+      settings.mtp_stats_path = generation_settings.mtp_stats_path;
+      settings.mtp_stats_window = generation_settings.mtp_stats_window;
+      settings.mtp_capture = generation_settings.mtp_capture;
       settings.prefill_chunk_tokens = generation_settings.prefill_chunk_tokens;
+      settings.prefill_batch_tokens = generation_settings.prefill_batch_tokens;
       settings.prefill_budget_tokens = generation_settings.prefill_budget_tokens;
       settings.nvfp4_activation_policy = generation_settings.nvfp4_activation_policy;
       settings.local_attention_compute = generation_settings.local_attention_compute;
@@ -550,6 +658,11 @@ int main(int argc, char** argv) {
         else if (option == "--port") http_settings.port = parse_port(argv[index + 1]);
         else if (option == "--max-batch") max_batch = parse_positive_u32(argv[index + 1], "--max-batch");
         else if (option == "--model") http_settings.model = argv[index + 1];
+        else if (option == "--image-max-soft-tokens") {
+          settings.image_max_soft_tokens = parse_positive_u32(argv[index + 1], option);
+          if (!gewell::vision_engine::is_supported_soft_token_capacity(settings.image_max_soft_tokens))
+            throw std::runtime_error("--image-max-soft-tokens must be one of 70, 140, 280, 560, 1120");
+        }
         else if (option == "--qdq-mask") mask = argv[index + 1];
         else if (option == "--max-connections") http_settings.max_connections = parse_positive_u32(argv[index + 1], "--max-connections");
         else if (option == "--max-body-bytes") http_settings.max_body_bytes = parse_positive_u32(argv[index + 1], "--max-body-bytes");
@@ -577,7 +690,13 @@ int main(int argc, char** argv) {
       settings.vision_path = vision_path;
       settings.kv_cache_gpu_mib = parse_nonnegative_u64(argv[4], "KV_MIB");
       settings.mtp_depth = generation_settings.mtp_depth;
+      settings.mtp_min_depth = generation_settings.mtp_min_depth;
+      settings.decode_width = generation_settings.decode_width;
+      settings.mtp_stats_path = generation_settings.mtp_stats_path;
+      settings.mtp_stats_window = generation_settings.mtp_stats_window;
+      settings.mtp_capture = generation_settings.mtp_capture;
       settings.prefill_chunk_tokens = generation_settings.prefill_chunk_tokens;
+      settings.prefill_batch_tokens = generation_settings.prefill_batch_tokens;
       settings.prefill_budget_tokens = generation_settings.prefill_budget_tokens;
       settings.nvfp4_activation_policy = generation_settings.nvfp4_activation_policy;
       settings.local_attention_compute = generation_settings.local_attention_compute;

@@ -236,13 +236,14 @@ __global__ void gather_tensor_attention_tile_global_compact_paged_kernel(
   staged_value[staged_index] = value;
 }
 
-template <std::uint32_t HeadSize, bool Local, bool Fp8 = false>
+template <std::uint32_t HeadSize, bool Local, bool Fp8 = false, bool Image = false>
 __global__ void tensor_attention_softmax_update_kernel(
     const float* scores, BFloat16* probabilities, float* numerator,
     float* row_maximum, float* row_denominator,
     std::uint32_t base_position, std::uint32_t token_count,
     std::uint32_t tile_start, std::uint32_t tile_count, bool first_tile,
     const float* query_scales, const float* key_scales,
+    std::uint32_t image_begin, std::uint32_t image_end,
     const float* value_token_scales = nullptr, const float* value_output_scales = nullptr) {
   static_assert(HeadSize <= kTensorAttentionMaximumHeadSize);
   // One warp owns a row: eight rows share a CTA, and all reductions and
@@ -266,9 +267,11 @@ __global__ void tensor_attention_softmax_update_kernel(
   for (unsigned i = 0; i < kScoresPerLane; ++i) {
     const unsigned position = lane + i * kWarpSize;
     const unsigned absolute_key = tile_start + position;
+    const bool same_image = Image && absolute_query_position >= image_begin &&
+        absolute_query_position < image_end && absolute_key >= image_begin && absolute_key < image_end;
     const bool visible = position < tile_count &&
-        absolute_key <= absolute_query_position &&
-        (!Local || absolute_query_position - absolute_key <
+        (absolute_key <= absolute_query_position || same_image) &&
+        (!Local || (Image && absolute_key >= absolute_query_position) || absolute_query_position - absolute_key <
                        gemma4_31b::kLocalWindowSize);
     float score = visible ? scores[tile_row + position] : 0.0F;
     if constexpr (Fp8) {
@@ -401,7 +404,7 @@ enum class TensorCacheLayout {
 };
 
 template <std::uint32_t HeadSize, std::uint32_t KvHeads, bool Local,
-          TensorCacheLayout CacheLayout>
+          TensorCacheLayout CacheLayout, bool Image = false>
 void causal_gqa_attention_cached_chunk_tensor_impl(
     cublasHandle_t handle, const BFloat16* query_head_major,
     const BFloat16* current_key_head_major,
@@ -411,7 +414,7 @@ void causal_gqa_attention_cached_chunk_tensor_impl(
     std::uint32_t base_position, std::uint32_t token_count,
     std::uint32_t cache_capacity, void* scratch,
     BFloat16* context_token_major, cudaStream_t stream, kv_cache::Format format,
-    Fp8Attention* fp8) {
+    Fp8Attention* fp8, std::uint32_t image_begin = 0, std::uint32_t image_end = 0) {
   static_assert(gemma4_31b::kQueryHeadCount % KvHeads == 0);
   static_assert((CacheLayout != TensorCacheLayout::compact_global &&
                  CacheLayout != TensorCacheLayout::paged_compact_global) ||
@@ -474,7 +477,9 @@ void causal_gqa_attention_cached_chunk_tensor_impl(
         Local && query_base >= gemma4_31b::kLocalWindowSize - 1
             ? query_base - (gemma4_31b::kLocalWindowSize - 1)
             : 0;
-    const std::uint32_t visible_end = query_base + query_count;
+    const std::uint32_t query_end = query_base + query_count;
+    const std::uint32_t visible_end = Image && query_base < image_end && query_end > image_begin
+        ? std::max(query_end, image_end) : query_end;
     bool first_tile = true;
     for (std::uint32_t tile_start = visible_begin; tile_start < visible_end;) {
       const std::uint32_t tile_count =
@@ -553,17 +558,17 @@ void causal_gqa_attention_cached_chunk_tensor_impl(
       const dim3 state_grid(gemma4_31b::kQueryHeadCount,
                             (query_count + kWarpsPerBlock - 1) / kWarpsPerBlock);
       if (fp8) {
-        tensor_attention_softmax_update_kernel<HeadSize, Local, true>
+        tensor_attention_softmax_update_kernel<HeadSize, Local, true, Image>
             <<<state_grid, kThreads, 0, stream>>>(
                 scores, probabilities, numerator, row_maximum, row_denominator,
                 query_base, query_count, tile_start, tile_count, first_tile,
-                fp8->query_scales(), fp8->key_scales(), fp8->value_token_scales(),
+                fp8->query_scales(), fp8->key_scales(), image_begin, image_end, fp8->value_token_scales(),
                 fp8->value_output_scales());
-      } else tensor_attention_softmax_update_kernel<HeadSize, Local>
+      } else tensor_attention_softmax_update_kernel<HeadSize, Local, false, Image>
           <<<state_grid, kThreads, 0, stream>>>(
               scores, probabilities, numerator, row_maximum, row_denominator,
               query_base, query_count, tile_start, tile_count, first_tile,
-              nullptr, nullptr);
+              nullptr, nullptr, image_begin, image_end);
       check_cuda(cudaGetLastError(),
                  "tensor attention softmax update kernel launch");
 
@@ -609,7 +614,8 @@ void causal_gqa_attention_cached_chunk_tensor(
     std::uint32_t token_count, std::uint32_t cache_capacity, void* scratch,
     BFloat16* context_token_major, gemma4_31b::AttentionKind kind,
     cudaStream_t stream,
-    kv_cache::Format format, Fp8Attention* fp8) {
+    kv_cache::Format format, Fp8Attention* fp8,
+    std::uint32_t image_begin, std::uint32_t image_end) {
   check_tensor_chunk_range(base_position, token_count,
                            "causal_gqa_attention_cached_chunk_tensor");
   if (handle == nullptr) {
@@ -631,6 +637,9 @@ void causal_gqa_attention_cached_chunk_tensor(
   check_kind(kind, "causal_gqa_attention_cached_chunk_tensor");
   check_chunk_cache(base_position, token_count, cache_capacity, kind,
                     "causal_gqa_attention_cached_chunk_tensor");
+  if (image_begin || image_end)
+    check_image_block(base_position, token_count, image_begin, image_end,
+                      "causal_gqa_attention_cached_chunk_tensor");
 
   if (kind == gemma4_31b::AttentionKind::global) {
     causal_gqa_attention_cached_chunk_tensor_impl<
@@ -640,7 +649,17 @@ void causal_gqa_attention_cached_chunk_tensor(
         current_value_token_major, key_cache, value_cache, nullptr, nullptr,
         base_position, token_count, cache_capacity, scratch,
         context_token_major, stream, format, fp8);
+  } else if (image_end) {
+    causal_gqa_attention_cached_chunk_tensor_impl<
+        gemma4_31b::kLocalHeadSize, gemma4_31b::kLocalKvHeadCount, true,
+        TensorCacheLayout::separate, true>(
+        handle, query_head_major, current_key_head_major,
+        current_value_token_major, key_cache, value_cache, nullptr, nullptr,
+        base_position, token_count, cache_capacity, scratch,
+        context_token_major, stream, format, fp8, image_begin, image_end);
   } else {
+    // Compile out image predicates on text: they otherwise increase register
+    // pressure, particularly in the FP8 softmax specialization.
     causal_gqa_attention_cached_chunk_tensor_impl<
         gemma4_31b::kLocalHeadSize, gemma4_31b::kLocalKvHeadCount, true,
         TensorCacheLayout::separate>(

@@ -184,7 +184,8 @@ void invalid_inputs(const text::Tokenizer& tokenizer) {
   rejects("empty normalized messages", [] { (void)contract.render_chat({}); });
   rejects("invalid normalized role", [] { (void)contract.render_chat({{"tool", "hi"}}); });
 
-  for (const auto& value : std::vector<json>{nullptr, json::object()}) {
+  for (const auto& value : std::vector<json>{nullptr, json::object(),
+      {{"clear_thinking", true}, {"unknown", json::array({nullptr, 1, "future"})}}}) {
     const auto options = contract.template_options(value);
     require(!options.enable_thinking && !options.preserve_thinking,
             "template defaults differ");
@@ -192,7 +193,8 @@ void invalid_inputs(const text::Tokenizer& tokenizer) {
   for (bool enable : {false, true}) {
     for (bool preserve : {false, true}) {
       const auto options = contract.template_options({
-          {"enable_thinking", enable}, {"preserve_thinking", preserve}});
+          {"enable_thinking", enable}, {"preserve_thinking", preserve},
+          {"clear_thinking", true}, {"vendor_options", {{"nested", "future"}}}});
       require(options.enable_thinking == enable &&
                   options.preserve_thinking == preserve,
               "template boolean controls differ");
@@ -204,7 +206,7 @@ void invalid_inputs(const text::Tokenizer& tokenizer) {
               !preserve_only.enable_thinking && preserve_only.preserve_thinking,
           "omitted template control is not false");
   const std::vector<json> invalid_kwargs = {
-      false, "thinking", json::array(), {{"unknown", false}},
+      false, "thinking", json::array(),
       {{"enable_thinking", nullptr}}, {{"enable_thinking", 1}},
       {{"enable_thinking", "true"}}, {{"preserve_thinking", nullptr}},
       {{"preserve_thinking", 1}}, {{"preserve_thinking", "true"}}};

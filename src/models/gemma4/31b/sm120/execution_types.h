@@ -53,6 +53,14 @@ inline std::uint32_t checked_prefill_chunk_tokens(std::uint32_t tokens) {
   return tokens;
 }
 
+inline std::uint32_t checked_prefill_batch_tokens(std::uint32_t tokens, std::uint32_t chunk_tokens) {
+  if (!tokens || tokens > kMaxPrefillBatchTokens)
+    fail("prefill batch", "token cap must be in 1..4096");
+  if (tokens < chunk_tokens)
+    fail("prefill batch", "batch token cap must be at least the per-prompt chunk cap");
+  return tokens;
+}
+
 inline std::uint32_t generation_prefill_chunk_tokens(std::size_t prompt_tokens,
                                               std::uint32_t chunk_cap = kRuntimeChunkTokens) {
   checked_prefill_chunk_tokens(chunk_cap);

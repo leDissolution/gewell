@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -33,9 +34,11 @@ struct CacheControls {
 // Selected by the loaded model. Preparation runs on the HTTP worker; only
 // the resident GPU owner interprets the resulting patch tensors.
 struct ImageSupport {
-  std::function<std::shared_ptr<runtime::ImageInput>(std::string_view)> prepare;
+  std::function<std::shared_ptr<runtime::ImageInput>(std::string_view, std::uint32_t)> prepare;
   std::uint32_t begin_token{}, image_token{}, end_token{}, max_image_tokens{};
-  std::size_t prepared_bytes{};
+  std::uint32_t default_max_soft_tokens{};
+  // Supported token budgets and their per-image host tensor reservations.
+  std::map<std::uint32_t, std::size_t> prepared_bytes;
 };
 
 struct Request {

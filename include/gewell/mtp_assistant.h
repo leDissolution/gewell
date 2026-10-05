@@ -69,6 +69,8 @@ struct Input {
   FrozenCache cache{};
   BFloat16* logits{};
   BFloat16* feedback{};
+  // Optional device row [1024], captured after final normalization.
+  BFloat16* capture_hidden{};
 };
 
 class Executor final {

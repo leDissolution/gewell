@@ -1269,6 +1269,65 @@ void dense_zero_mass_rounding_test() {
   std::cout << "mtp_dense_rounding: proposal_bonus_correction_support_ok\n";
 }
 
+void capture_scores_test() {
+  constexpr unsigned vocabulary = 5, depth = 2;
+  Fixture fixture(vocabulary);
+  Device<float> target(vocabulary * depth), draft(vocabulary * depth);
+  Device<std::uint32_t> ids(depth), greedy(depth);
+  Device<gewell::MtpCaptureScores> scores(depth);
+  const std::vector<float> p = {0.25F,0,0.75F,0,0, 0,0,0,1,0};
+  const std::vector<float> q = {0.5F,0,0.5F,0,0, 0,0,0,0.25F,0.75F};
+  target.put(p); draft.put(q); ids.put({2,4}); greedy.put({2,3}); fixture.clear();
+  mtp::capture_scores(target.get(), draft.get(), ids.get(), depth, vocabulary, 0,
+      nullptr, fixture.status.get(), scores.get());
+  fixture.success();
+  const auto dense = scores.read(depth);
+  expect(dense[0].draft_probability == 0.5F && dense[0].target_probability == 0.75F &&
+      dense[1].draft_probability == 0.75F && dense[1].target_probability == 0 &&
+      std::abs(dense[0].draft_entropy - std::log(2.0F)) < 1e-6F &&
+      dense[1].draft_max_probability == 0.75F, "dense capture alignment or entropy changed");
+  Device<mtp::TokenProbability> compact_target(4), compact_draft(4);
+  compact_target.put({{0,0.25F},{2,0.75F},{1,0},{3,1}});
+  compact_draft.put({{0,0.5F},{2,0.5F},{3,0.25F},{4,0.75F}});
+  mtp::capture_scores(compact_target.get(), compact_draft.get(), ids.get(), depth, vocabulary, 2,
+      nullptr, fixture.status.get(), scores.get());
+  const auto compact = scores.read(depth);
+  for (unsigned i = 0; i < depth; ++i)
+    expect(compact[i].draft_probability == dense[i].draft_probability &&
+        compact[i].target_probability == dense[i].target_probability &&
+        std::abs(compact[i].draft_entropy - dense[i].draft_entropy) < 1e-6F &&
+        compact[i].draft_max_probability == dense[i].draft_max_probability,
+        "compact capture differs from dense with disjoint support");
+  mtp::capture_scores(nullptr, nullptr, ids.get(), depth, vocabulary, 0,
+      greedy.get(), fixture.status.get(), scores.get());
+  const auto winners = scores.read(depth);
+  expect(winners[0].target_probability == 1 && winners[1].target_probability == 0 &&
+      winners[1].draft_probability == 1 && winners[1].draft_entropy == 0 &&
+      winners[1].draft_max_probability == 1, "ID-only greedy capture read probability scratch");
+  expect(target.read(p.size()) == p && draft.read(q.size()) == q && ids.read(depth) == std::vector<std::uint32_t>({2,4}),
+      "capture mutated inference inputs");
+  fixture.status.put({mtp::Status::invalid_distribution});
+  mtp::capture_scores(nullptr, nullptr, ids.get(), depth, vocabulary, 0,
+      greedy.get(), fixture.status.get(), scores.get());
+  expect(scores.read(depth)[0].draft_probability == 0 &&
+      fixture.status.read(1)[0] == mtp::Status::invalid_distribution, "capture changed failed status");
+  Device<std::uint16_t> probes(12), selected_rows(4);
+  Device<mtp::Result> result(1);
+  probes.put({10,11,20,21,30,31, 40,41,50,51,60,61});
+  fixture.clear();
+  for (unsigned count : {1U,2U,3U}) {
+    result.put({{count - 1, count, count - 1}});
+    mtp::gather_capture_rows(probes.get(), 2, 3, 2, result.get(), fixture.status.get(), selected_rows.get());
+    const std::vector<std::uint16_t> expected = {std::uint16_t(count * 10), std::uint16_t(count * 10 + 1),
+        std::uint16_t(count * 10 + 30), std::uint16_t(count * 10 + 31)};
+    expect(selected_rows.read(4) == expected, "target probes did not select the last committed input row");
+  }
+  fixture.status.put({mtp::Status::invalid_distribution});
+  mtp::gather_capture_rows(probes.get(), 2, 3, 2, result.get(), fixture.status.get(), selected_rows.get());
+  expect(selected_rows.read(4) == std::vector<std::uint16_t>(4, 0), "failed verifier leaked stale probe rows");
+  std::cout << "mtp_capture_scores: dense_compact_greedy_entropy_and_read_only_ok\n";
+}
+
 void partitioned_validation_test() {
   constexpr unsigned vocabulary = 8193, depth = 3;
   Verification test(vocabulary, depth);
@@ -1299,12 +1358,16 @@ void partitioned_validation_test() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--capture") == 0) {
+      capture_scores_test(); return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--compact-batch") == 0) {
       compact_batch_tests();
       std::cout << "mtp_sampling_compact_batch: PASS\n";
       return 0;
     }
     expect(argc == 1, "expected no arguments or --compact-batch");
+    capture_scores_test();
     logprob_summary_tests();
     full_top_logprob_summary_test();
     invalid_logprob_argument_tests();

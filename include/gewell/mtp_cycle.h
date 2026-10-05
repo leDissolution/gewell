@@ -2,6 +2,7 @@
 
 #include "gewell/mtp_sampling.h"
 #include "gewell/mtp_target.h"
+#include "gewell/mtp_capture.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -101,6 +102,8 @@ struct BatchInput {
   bool return_probabilities{true};
   std::vector<float> uniforms;
   ConstraintMask constraint_mask;
+  MtpCaptureFeatures* capture{};
+  MtpTargetProbes* capture_next{};
 };
 
 struct BatchOutcome {

@@ -241,6 +241,62 @@ void test_softmax_in_place() {
   }
 }
 
+void test_full_attention() {
+  constexpr std::uint32_t heads = 16, width = 72, guard = 16;
+  // Both tile edges, odd image shapes, and the largest supported image. The
+  // independent FP64 reference samples every head at early/middle/final rows.
+  for (const auto rows : {1U, 63U, 64U, 65U, 257U, 630U, 1535U, 1536U,
+                           2520U, 3072U, 3073U, 8191U, 8192U, 10080U}) {
+    const std::size_t elements = std::size_t(heads) * rows * width;
+    std::vector<BFloat16> q(elements), k(elements), v(elements);
+    for (std::uint32_t h = 0; h < heads; ++h) {
+      for (std::uint32_t r = 0; r < rows; ++r) {
+        for (std::uint32_t d = 0; d < width; ++d) {
+          const auto i = (std::size_t(h) * rows + r) * width + d;
+          q[i] = bf16((int((r * 17 + d * 13 + h * 7) % 101) - 50) * (h % 3 ? 0.014F : 0.08F));
+          k[i] = bf16((int((r * 29 + d * 19 + h * 3) % 97) - 48) * 0.014F);
+          v[i] = bf16((int((r * 11 + d * 31 + h * 5) % 103) - 51) * 0.016F + h * 0.04F);
+        }
+      }
+    }
+    DeviceBuffer<BFloat16> dq(elements), dk(elements), dv(elements), out(elements + 2 * guard);
+    dq.copy_from(q); dk.copy_from(k); dv.copy_from(v);
+    out.copy_from(std::vector<BFloat16>(elements + 2 * guard, bf16(123.0F)));
+    gewell::vision_primitives::full_attention(dq.get(), dk.get(), dv.get(), out.get() + guard, rows);
+    const auto actual = out.copy_to_host();
+    for (std::size_t i = 0; i < guard; ++i)
+      if (bits(actual[i]) != bits(bf16(123.0F)) || bits(actual[guard + elements + i]) != bits(bf16(123.0F)))
+        fail("fused attention", "output guard overwritten");
+    for (std::uint32_t h = 0; h < heads; ++h) {
+      for (const auto r : {0U, rows / 2, rows - 1}) {
+        std::vector<double> scores(rows);
+        double maximum = -INFINITY;
+        for (std::uint32_t j = 0; j < rows; ++j) {
+          double dot = 0;
+          for (std::uint32_t d = 0; d < width; ++d)
+            dot += double(fp32(q[(std::size_t(h) * rows + r) * width + d])) *
+                   fp32(k[(std::size_t(h) * rows + j) * width + d]);
+          maximum = std::max(maximum, scores[j] = dot);
+        }
+        double sum = 0;
+        for (auto& score : scores) { score = std::exp(score - maximum); sum += score; }
+        for (std::uint32_t d = 0; d < width; ++d) {
+          double expected = 0;
+          for (std::uint32_t j = 0; j < rows; ++j)
+            expected += scores[j] * fp32(v[(std::size_t(h) * rows + j) * width + d]);
+          expected /= sum;
+          const float observed = fp32(actual[guard + (std::size_t(r) * heads + h) * width + d]);
+          if (!std::isfinite(observed) || std::abs(observed - expected) > 0.004)
+            fail("fused attention", "FP64 mismatch at rows=" + std::to_string(rows) +
+                " head=" + std::to_string(h) + " query=" + std::to_string(r) +
+                " channel=" + std::to_string(d) + " expected=" + std::to_string(expected) +
+                " observed=" + std::to_string(observed));
+        }
+      }
+    }
+  }
+}
+
 void test_pool_and_standardize() {
   constexpr std::size_t kHidden = gewell::gemma4_31b::kVisionHiddenSize;
   constexpr std::uint32_t kPatchRows = 9;
@@ -324,6 +380,7 @@ int main() {
     test_position_add_in_place();
     test_rope_and_transposes();
     test_softmax_in_place();
+    test_full_attention();
     test_pool_and_standardize();
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
     std::cout << "vision primitives: PASS\n";

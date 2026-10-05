@@ -115,10 +115,12 @@ int main(int argc, char** argv) {
     images.image_token = gewell::gemma4_31b::kImageTokenId;
     images.end_token = gewell::gemma4_31b::kEndImageTokenId;
     images.max_image_tokens = 1120;
-    images.prepared_bytes = 16384;
-    images.prepare = [](std::string_view url) {
+    images.default_max_soft_tokens = 280;
+    images.prepared_bytes = {{70, 4096}, {140, 8192}, {280, 16384}, {560, 32768}, {1120, 65536}};
+    images.prepare = [](std::string_view url, std::uint32_t max_soft_tokens) {
       // Deliberately tiny synthetic processor output isolates transport leases
       // from decoder correctness, covered by the native processor fixtures.
+      std::cout << "http_test_image_prepare_budget: " << max_soft_tokens << '\n' << std::flush;
       if (url == "data:image/png;base64,slow") {
         std::cout << "http_test_image_preparing: true\n" << std::flush;
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -128,7 +130,7 @@ int main(int argc, char** argv) {
         throw std::invalid_argument("invalid fixture image");
       }
       auto image = std::make_shared<gewell::runtime::ImageInput>();
-      image->pixels.resize(16376);
+      image->pixels.resize(std::size_t(max_soft_tokens) * 16384 / 280 - 8);
       image->positions.resize(8);
       image->padded_patch_rows = 1;
       image->end = 1;

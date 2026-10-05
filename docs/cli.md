@@ -58,28 +58,58 @@ Sampling parameters for HTTP and batch/jobs are supplied per request.
 ## Execution and cache
 
 The first seven options below apply to serving, jobs, generation, captioning,
-and offline batches. The logical prefill budget applies only to serving, jobs,
-and offline batches. Cache budget/checkpoint options apply to serving and jobs.
+and offline batches. The physical prefill batch cap, logical prefill budget, minimum MTP depth, decode
+width, and MTP statistics apply only to serving, jobs, and offline batches.
+Cache budget/checkpoint options apply to serving and jobs.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--mtp-depth N` | `0` | Assistant proposal depth, `0..1279`; zero disables MTP |
-| `--prefill-chunk-tokens N` | `1024` | Text prefill cap, `1..4096`; images retain their complete image spans |
+| `--mtp-depth N` | `0` | Maximum assistant proposal depth, `0..1279`; zero disables MTP |
+| `--prefill-chunk-tokens N` | `1024` | Per-prompt text chunk cap, `1..4096`; images retain separate complete spans |
 | `--nvfp4-activation-policy POLICY` | `always` | `always` or `prefill`; the latter keeps NVFP4 decode/MTP activations BF16 |
 | `--kv-local-format FORMAT` | `bf16` | Local KV storage: `bf16` or `fp8` |
 | `--kv-global-format FORMAT` | `bf16` | Compact global KV storage: `bf16` or `fp8` |
 | `--attention-local-compute FORMAT` | `bf16` | Local text attention (prefill, decode, MTP): `bf16` or `fp8` |
 | `--attention-global-compute FORMAT` | `bf16` | Global text attention (prefill, decode, MTP): `bf16` or `fp8` |
-| `--prefill-budget-tokens N` | `0` | Soft prefill token budget between decode opportunities; 0 runs decode after each chunk/head |
+| `--prefill-batch-tokens N` | `2048` | Combined text/image projection/MLP rows per forward, `1..4096`, at least the per-prompt chunk cap |
+| `--prefill-budget-tokens N` | `0` | Soft prefill token budget between decode opportunities; 0 runs decode after each packed forward/head |
+| `--mtp-min-depth N` | `0` | Minimum adaptive proposal depth, `0..mtp_depth`; request correctness limits can shorten it |
+| `--decode-width N` | `0` | Target pending + proposal rows, `0..4294967295`; 0 keeps fixed maximum depth |
 | `--kv-cache-gpu-mib N` | required for `serve-http`; positional for `run-jobs` | Positive GPU KV budget |
 | `--kv-cache-cpu-mib N` | `0` | Host prefix-cache budget; zero disables cold storage |
 | `--kv-cache-index-mib N` | `512` | Positive host cache-index budget |
 | `--kv-checkpoint-interval-tokens N` | `8192` | Periodic checkpoint spacing; zero disables periodic captures |
 
+Serving, jobs, and offline batches pack whole ready text chunks and image spans into each
+forward without waiting for arrivals. Positions and attention histories stay
+independent. With the defaults, `--prefill-chunk-tokens 1024 --prefill-batch-tokens 2048`,
+two prompts can each contribute 1024 rows to one dense forward while their attention
+stays in separate 1024-row chunks. Larger batch caps allocate more dense
+activation workspace; attention workspace follows the per-prompt cap and image
+minimum. Image spans stay complete, with private attention histories. Tower
+passes run serially before the packed decoder forward. An image larger than the
+batch cap runs alone without splitting.
+The best total cap depends on prompt lengths: the measured caption workload
+benefits from larger batches, while four full 1024-row chunks per GEMM were
+slower than one on the tested G0 setup.
+The 2048 default fits two full chunks and was neutral on that workload.
+
+Add `--prefill-budget-tokens 8192` to allow roughly four full forwards before
+a decode opportunity. This can build decode concurrency faster, trading longer TTFT for higher average throughput. The default
+logical budget remains 0: one forward/head, then a decode opportunity. Both
+larger physical batches and larger logical budgets can lengthen decode gaps.
+
+With positive decode width `W`, each decode pass chooses
+`clamp(max(0, floor(W / B) - 1), mtp_min_depth, mtp_depth)` using its actual
+ready decode batch `B`. Minimum 0 permits ordinary decoding. The minimum can
+exceed the width target; output limits, checkpoints, and ordinary-only requests
+can shorten individual depths. Staging is still reserved for the maximum, so
+`capacity * (mtp_depth + 1) <= 1280` and the GPU KV budget must hold.
+
 Positive logical budgets group existing microbatches; they do not enlarge GPU
-microbatches or reserve additional KV. Chunks/image spans remain atomic and
-may overshoot the budget; first-token heads count as one token. Polling and
-first-token emission continue between chunks. Blocked prefill falls back to
+microbatches or reserve additional KV. Packed forwards and image spans remain
+atomic and may overshoot the budget; first-token heads count as one token. Polling
+and first-token emission continue between forwards. Blocked prefill falls back to
 decode immediately. Larger budgets can improve throughput at the cost of
 longer inter-token gaps; TTFT depends on the workload.
 
@@ -94,15 +124,21 @@ All HTTP options follow `serve-http`.
 | `--host HOST` | `127.0.0.1` | IPv4 bind address |
 | `--port N` | `6311` | HTTP port |
 | `--model NAME` | `gewell-gemma-4-31b-bf16` | Public model ID required in generation requests |
+| `--image-max-soft-tokens N` | `280` | Default per-image budget: `70`, `140`, `280`, `560`, or `1120`; requests may override it |
 | `--max-connections N` | `64` | Accepted connection limit |
 | `--max-body-bytes N` | `8388608` | Per-request body limit |
-| `--max-body-total-bytes N` | `268435456` | Combined buffered input limit |
+| `--max-body-total-bytes N` | `268435456` | Combined encoded-body and prepared-image tensor limit |
 | `--max-output-bytes N` | `8388608` | Buffered output limit per connection |
 | `--socket-timeout-seconds N` | `60` | Connection timeout |
 
 The transport limits above require positive integers. The listener has no
 API-key flag; expose a non-loopback bind only behind appropriate network
 controls.
+
+Image input requires `--vision PATH`. The server image budget is a default,
+not a ceiling: [image requests](http-api.md#images) can select any supported
+budget with `mm_processor_kwargs.max_soft_tokens`. This is independent of
+the text prefill chunk size and logical prefill budget.
 
 ## Single-request sampling
 

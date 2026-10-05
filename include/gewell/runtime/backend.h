@@ -4,6 +4,7 @@
 #include "gewell/runtime/image.h"
 #include "gewell/runtime/cache_storage.h"
 #include "gewell/logprobs.h"
+#include "gewell/mtp_capture.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -25,7 +26,7 @@ struct SamplingSettings {
 };
 struct BackendLimits {
   std::uint32_t vocab_size{}, context_tokens{}, max_batch_rows{}, max_mtp_depth{};
-  std::uint32_t max_verifier_rows{}, max_prefill_chunk_tokens{}, local_window_tokens{};
+  std::uint32_t max_verifier_rows{}, max_prefill_chunk_tokens{}, max_prefill_batch_tokens{}, local_window_tokens{};
   std::size_t logit_row_bytes{};
   std::vector<std::uint32_t> stop_tokens;
   std::uint32_t max_image_tokens{};
@@ -37,6 +38,13 @@ struct BatchDecodeInput {
   kv_cache::ExecutionId execution{};
   std::uint32_t position{}, token{};
 };
+struct BatchPrefillInput {
+  kv_cache::ExecutionId execution{};
+  const std::uint32_t* tokens{};
+  std::uint32_t position{}, rows{};
+  TerminalState hidden;
+  std::shared_ptr<const ImageInput> image;
+};
 struct BatchMtpInput {
   kv_cache::ExecutionId execution{};
   std::uint32_t pending_token{}, position{}, depth{};
@@ -44,6 +52,8 @@ struct BatchMtpInput {
   float temperature{}, top_p{1.0F};
   std::uint32_t top_k{};
   bool return_probabilities{};
+  MtpCaptureFeatures* capture{};
+  MtpTargetProbes* capture_next{};
   std::vector<float> uniforms;
   std::function<void(const std::uint32_t*, std::uint32_t, std::uint32_t*)> constraint_mask;
 };
@@ -107,16 +117,13 @@ class ExecutionBackend {
   virtual void begin_step(std::string_view) = 0;
   virtual void end_step(std::string_view) = 0;
   virtual float elapsed(std::string_view) const = 0;
-  virtual void prefill_step(kv_cache::ExecutionId, const std::uint32_t*, std::uint32_t,
-                            std::uint32_t, bool, TerminalState) = 0;
-  // Processes [begin,end) in the complete prompt and saves its terminal hidden
-  // state at end. Returns an absolute prefix, possibly partial on cancellation.
-  // Range boundaries must not split image features; consumed images may have
-  // released their prepared tensors. The scheduler retires scratch per range.
-  virtual std::uint32_t image_prefill_step(kv_cache::ExecutionId, const std::uint32_t*,
-      std::uint32_t total_rows, std::uint32_t begin, std::uint32_t end,
-      const std::vector<std::shared_ptr<const ImageInput>>&, TerminalState,
-      const std::function<bool()>& continue_prefill) = 0;
+  // One bounded forward over independent text or whole-image segments. Image
+  // features stay live through the shared forward. Poll between serial image
+  // encodes and before their decoder dispatch; false skips a cancelled segment.
+  // All-text forwards poll at the scheduler's completion boundary. The returned
+  // flags identify segments whose decoder work was enqueued in full.
+  virtual std::vector<bool> prefill_batch(const std::vector<BatchPrefillInput>&,
+      const std::function<bool(std::size_t)>& continue_prefill) = 0;
   // The scheduler calls this only after queued prefill work has completed.
   virtual void release_image() = 0;
   virtual void prefix_head_step(kv_cache::ExecutionId, TerminalState) = 0;

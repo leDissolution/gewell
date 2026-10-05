@@ -805,7 +805,10 @@ int run_loaded_generation(const WeightArena& weights,
 
 }  // namespace
 
-std::uint32_t effective_mtp_depth(std::uint32_t depth, const std::string& assistant_path) {
+std::uint32_t effective_mtp_depth(std::uint32_t depth, const std::string& assistant_path,
+                                  std::uint32_t min_depth) {
+  if (min_depth > depth)
+    throw std::runtime_error("--mtp-min-depth must not exceed --mtp-depth");
   if (depth && assistant_path.empty()) {
     console::event("mtp_disabled", {{"requested_depth", depth}, {"effective_depth", 0}},
                    "Warning: --mtp-depth requires --assistant PATH; forcing depth to 0.", true);
@@ -981,7 +984,7 @@ int run_caption(const std::string& artifact_path,
   console::field("caption_fed_token_capacity", cache_capacity);
   console::section("Sampling");
   if (console::json_enabled())
-    console::field("caption_prefill_mask", "causal_or_same_image_block");
+    console::field("caption_prefill_mask", "global_causal_local_sliding_causal_or_same_image");
   if (console::json_enabled())
     console::field("caption_sampling", "softcap_30_temperature_top_k_top_p");
   console::field("caption_mtp_depth", settings.mtp_depth);
@@ -1007,7 +1010,8 @@ int run_caption(const std::string& artifact_path,
   WeightArena weights(file, qdq::Mask{}, settings.mtp_depth ? settings.assistant_path : "", settings.vision_path);
   const double load_seconds = seconds_since(load_started);
 
-  PreparedImage soft_features(weights, pixels, positions, padded_patch_rows, soft_token_count);
+  PreparedImage soft_features(weights);
+  soft_features.prepare(pixels, positions, padded_patch_rows, soft_token_count);
   const auto vision_milliseconds = soft_features.gpu_milliseconds();
   const auto vision_scratch_bytes = soft_features.scratch_bytes();
   console::section("Vision encoder");
@@ -1312,13 +1316,16 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
                        std::uint32_t max_batch, std::uint64_t kv_cache_gpu_mib,
                        const std::string& output_directory, const std::string& qdq_mask_path,
                        std::uint32_t mtp_depth, const std::string& events_path,
-                       std::uint32_t prefill_chunk_tokens,
+                       std::uint32_t prefill_chunk_tokens, std::uint32_t prefill_batch_tokens,
                        gewell::nvfp4::ActivationPolicy activation_policy,
                        kv_cache::Format local_kv_format, kv_cache::Format global_kv_format,
                        attention::Compute local_attention_compute, attention::Compute global_attention_compute,
                        const std::string& assistant_path, const std::string& vision_path,
-                       std::uint32_t prefill_budget_tokens) {
-  mtp_depth = effective_mtp_depth(mtp_depth, assistant_path);
+                       std::uint32_t prefill_budget_tokens, std::uint32_t mtp_min_depth,
+                       std::uint32_t decode_width, const std::string& mtp_stats_path,
+                       std::uint32_t mtp_stats_window, const MtpCaptureSettings& mtp_capture) {
+  mtp_depth = effective_mtp_depth(mtp_depth, assistant_path, mtp_min_depth);
+  if (!mtp_depth) mtp_min_depth = 0;
   if (!max_batch || max_batch > kMaxBatchRows || !kv_cache_gpu_mib ||
       kv_cache_gpu_mib > std::numeric_limits<std::size_t>::max() / kv_cache::kMib)
     fail("batch configuration", "invalid batch capacity or GPU KV budget");
@@ -1328,7 +1335,13 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
   limits.capacity = std::min<std::uint32_t>(max_batch, requests.size());
   limits.kv_bytes = kv_cache_gpu_mib * kv_cache::kMib;
   limits.mtp_depth = mtp_depth;
+  limits.mtp_min_depth = mtp_min_depth;
+  limits.decode_width = decode_width;
+  limits.mtp_stats_path = mtp_stats_path;
+  limits.mtp_stats_window = mtp_stats_window;
+  limits.mtp_capture = mtp_capture;
   limits.prefill_chunk_tokens = checked_prefill_chunk_tokens(prefill_chunk_tokens);
+  limits.prefill_batch_tokens = checked_prefill_batch_tokens(prefill_batch_tokens, limits.prefill_chunk_tokens);
   limits.prefill_budget_tokens = prefill_budget_tokens;
   limits.local_attention_compute = local_attention_compute;
   limits.global_attention_compute = global_attention_compute;
@@ -1370,6 +1383,8 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
   console::field("batch_requests", requests.size());
   console::field("batch_capacity", limits.capacity);
   console::field("batch_mtp_depth", mtp_depth);
+  console::field("batch_mtp_min_depth", mtp_min_depth);
+  console::field("batch_decode_width", decode_width);
   console::field("batch_mtp_staging_bytes", staging_bytes);
   if (console::json_enabled())
     console::field("payload_sha256", artifact::digest_hex(file.header().payload_sha256));
@@ -1476,13 +1491,19 @@ BatchLimits live_batch_limits(std::uint32_t max_batch, const RuntimeSettings& se
   const auto mtp_depth = settings.mtp_depth;
   if (!max_connections || max_connections > 256 || !max_batch || max_batch > std::min<std::size_t>(max_connections, kMaxBatchRows) ||
       !kv_cache_gpu_mib || kv_cache_gpu_mib > std::numeric_limits<std::size_t>::max() / kv_cache::kMib ||
-      mtp_depth > mtp_target::kMaxDepth ||
+      mtp_depth > mtp_target::kMaxDepth || settings.mtp_min_depth > mtp_depth ||
       (mtp_depth && std::uint64_t(max_batch) * (mtp_depth + 1) > mtp_target::kMaxDepth + 1))
     fail("batch server", "invalid batch, depth, or GPU budget");
   BatchLimits limits;
   limits.capacity = max_batch;
   limits.mtp_depth = mtp_depth;
+  limits.mtp_min_depth = settings.mtp_min_depth;
+  limits.decode_width = settings.decode_width;
+  limits.mtp_stats_path = settings.mtp_stats_path;
+  limits.mtp_stats_window = settings.mtp_stats_window;
+  limits.mtp_capture = settings.mtp_capture;
   limits.prefill_chunk_tokens = checked_prefill_chunk_tokens(settings.prefill_chunk_tokens);
+  limits.prefill_batch_tokens = checked_prefill_batch_tokens(settings.prefill_batch_tokens, limits.prefill_chunk_tokens);
   limits.prefill_budget_tokens = settings.prefill_budget_tokens;
   limits.local_attention_compute = settings.local_attention_compute;
   limits.global_attention_compute = settings.global_attention_compute;
@@ -1515,7 +1536,8 @@ BatchLimits live_batch_limits(std::uint32_t max_batch, const RuntimeSettings& se
 int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
                     RuntimeSettings settings, const http::Settings& http_settings,
                     const std::string& qdq_mask_path) {
-  settings.mtp_depth = effective_mtp_depth(settings.mtp_depth, settings.assistant_path);
+  settings.mtp_depth = effective_mtp_depth(settings.mtp_depth, settings.assistant_path, settings.mtp_min_depth);
+  if (!settings.mtp_depth) settings.mtp_min_depth = 0;
   auto limits = live_batch_limits(max_batch, settings, http_settings.max_connections);
   limits.captures = false;
   limits.logprobs = true;
@@ -1529,11 +1551,14 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
     images.image_token = model::kImageTokenId;
     images.end_token = model::kEndImageTokenId;
     images.max_image_tokens = model::kVisionMaxSoftTokenCount;
-    const auto image_rows = vision_engine::padded_patch_rows_for_capacity(gemma4::kImageMaxSoftTokens);
-    images.prepared_bytes = vision_engine::prepared_pixel_bytes(image_rows) +
-        vision_engine::prepared_position_bytes(image_rows);
-    images.prepare = [](std::string_view url) {
-      auto prepared = gemma4::prepare_image_data_url(url);
+    images.default_max_soft_tokens = settings.image_max_soft_tokens;
+    for (const auto budget : vision_engine::kSupportedSoftTokenCapacities) {
+      const auto image_rows = vision_engine::padded_patch_rows_for_capacity(budget);
+      images.prepared_bytes.emplace(budget, vision_engine::prepared_pixel_bytes(image_rows) +
+          vision_engine::prepared_position_bytes(image_rows));
+    }
+    images.prepare = [](std::string_view url, std::uint32_t max_soft_tokens) {
+      auto prepared = gemma4::prepare_image_data_url(url, max_soft_tokens);
       auto image = std::make_shared<runtime::ImageInput>();
       image->pixels = std::move(prepared.pixels);
       image->positions = std::move(prepared.positions);
@@ -1665,7 +1690,10 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
   console::section("Serving");
   console::field("server_batch_capacity", max_batch);
   console::field("server_mtp_depth", settings.mtp_depth);
+  console::field("server_mtp_min_depth", settings.mtp_min_depth);
+  console::field("server_decode_width", settings.decode_width);
   console::field("server_prefill_chunk_tokens", settings.prefill_chunk_tokens);
+  console::field("server_prefill_batch_tokens", settings.prefill_batch_tokens);
   console::field("server_prefill_budget_tokens", settings.prefill_budget_tokens);
   scheduler.write_startup_capacity();
   publish_observability(scheduler, transport, metrics, http_settings.model, true);
@@ -1680,8 +1708,8 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
   console::field("server_socket_timeout_seconds", http_settings.socket_timeout_seconds);
   console::field("server_image_limit", 1);
   console::field("server_image_prompt_tokens", kMultimodalChunkTokens);
-  console::field("server_image_max_soft_tokens", gemma4::kImageMaxSoftTokens);
-  console::field("server_image_admission", "exclusive");
+  console::field("server_image_max_soft_tokens", settings.image_max_soft_tokens);
+  console::field("server_image_admission", "packed_prefill");
   console::field("server_image_prefix_cache", true);
   if (console::json_enabled()) {
     console::field("server_mode", "native_http");

@@ -32,13 +32,14 @@ class BatchExecution {
   }
   void initialize_executor(const WeightArena& weights, ExecutionCache& cache,
       kv_cache::ExecutionId bootstrap, std::uint32_t plan_rows, std::uint32_t max_horizon,
-      bool sampled, std::uint32_t prefill_chunk_tokens, nvfp4::ActivationPolicy activation_policy,
+      bool sampled, std::uint32_t prefill_chunk_tokens, std::uint32_t prefill_batch_tokens,
+      nvfp4::ActivationPolicy activation_policy,
       attention::Compute local_compute, attention::Compute global_compute) {
       engine = std::make_unique<Executor>(
           weights, plan_rows, max_horizon - plan_rows + 1,
           false, SamplingSettings{}, &cache, bootstrap, std::vector<CheckpointTrigger>{},
           0, std::nullopt, prefill_chunk_tokens, activation_policy, capacity,
-          kv_cache::Format::bf16, kv_cache::Format::bf16, local_compute, global_compute);
+          kv_cache::Format::bf16, kv_cache::Format::bf16, local_compute, global_compute, prefill_batch_tokens);
       engine->initialize_batch(capacity, sampled, mtp_depth,
                               staging ? staging->data() : nullptr, memory.staging_bytes);
   }

@@ -1,4 +1,5 @@
 #include "gewell/models/gemma4/image_processor.h"
+#include "gewell/vision_engine.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,7 +19,6 @@ namespace {
 
 constexpr std::uint32_t kPatchSize = 16;
 constexpr std::uint32_t kPoolSize = 3;
-constexpr std::uint32_t kPatchRows = kImageMaxSoftTokens * kPoolSize * kPoolSize;
 
 [[noreturn]] void invalid(const char* message) {
   throw std::invalid_argument(message);
@@ -208,18 +208,19 @@ RgbImage decode_jpeg(const std::vector<std::uint8_t>& encoded) {
   return std::move(state->image);
 }
 
-std::pair<std::uint32_t, std::uint32_t> resized_shape(const RgbImage& image) {
+std::pair<std::uint32_t, std::uint32_t> resized_shape(
+    const RgbImage& image, std::uint32_t max_soft_tokens) {
   constexpr std::uint32_t multiple = kPatchSize * kPoolSize;
-  const double factor = std::sqrt(static_cast<double>(kPatchRows * kPatchSize * kPatchSize) /
+  const double factor = std::sqrt(static_cast<double>(max_soft_tokens * multiple * multiple) /
                                   (static_cast<double>(image.width) * image.height));
   auto width = static_cast<std::uint32_t>(std::floor(factor * image.width / multiple)) * multiple;
   auto height = static_cast<std::uint32_t>(std::floor(factor * image.height / multiple)) * multiple;
   if (!width) {
     width = multiple;
-    height = std::min(image.height / image.width, kImageMaxSoftTokens) * multiple;
+    height = std::min(image.height / image.width, max_soft_tokens) * multiple;
   } else if (!height) {
     height = multiple;
-    width = std::min(image.width / image.height, kImageMaxSoftTokens) * multiple;
+    width = std::min(image.width / image.height, max_soft_tokens) * multiple;
   }
   return {width, height};
 }
@@ -321,14 +322,14 @@ void write_u32(std::uint8_t* bytes, std::uint32_t value) {
   bytes[3] = static_cast<std::uint8_t>(value >> 24);
 }
 
-PreparedImage patchify(const RgbImage& image) {
+PreparedImage patchify(const RgbImage& image, std::uint32_t max_soft_tokens) {
   PreparedImage prepared;
-  prepared.padded_patch_rows = kPatchRows;
+  prepared.padded_patch_rows = max_soft_tokens * kPoolSize * kPoolSize;
   const std::uint32_t patch_width = image.width / kPatchSize;
   const std::uint32_t patch_height = image.height / kPatchSize;
   prepared.soft_token_count = patch_width * patch_height / (kPoolSize * kPoolSize);
-  prepared.pixels.resize(static_cast<std::size_t>(kPatchRows) * kPatchSize * kPatchSize * 3 * sizeof(float));
-  prepared.positions.resize(static_cast<std::size_t>(kPatchRows) * 2 * sizeof(std::int32_t), 0xff);
+  prepared.pixels.resize(static_cast<std::size_t>(prepared.padded_patch_rows) * kPatchSize * kPatchSize * 3 * sizeof(float));
+  prepared.positions.resize(static_cast<std::size_t>(prepared.padded_patch_rows) * 2 * sizeof(std::int32_t), 0xff);
   constexpr float factor = 1.0f / 255.0f;
   std::size_t offset = 0;
   for (std::uint32_t py = 0; py < patch_height; ++py) {
@@ -354,7 +355,9 @@ PreparedImage patchify(const RgbImage& image) {
 
 }  // namespace
 
-PreparedImage prepare_image_data_url(std::string_view data_url) {
+PreparedImage prepare_image_data_url(std::string_view data_url, std::uint32_t max_soft_tokens) {
+  if (!vision_engine::is_supported_soft_token_capacity(max_soft_tokens))
+    invalid("max_soft_tokens must be one of 70, 140, 280, 560, 1120");
   if (data_url.size() > kImageMaxDataUrlBytes) invalid("image data URL exceeds 8 MiB");
   constexpr std::string_view png_prefix = "data:image/png;base64,";
   constexpr std::string_view jpeg_prefix = "data:image/jpeg;base64,";
@@ -376,8 +379,8 @@ PreparedImage prepare_image_data_url(std::string_view data_url) {
     }
   }
   auto image = png ? decode_png(encoded) : decode_jpeg(encoded);
-  const auto [width, height] = resized_shape(image);
-  return patchify(resize(std::move(image), width, height));
+  const auto [width, height] = resized_shape(image, max_soft_tokens);
+  return patchify(resize(std::move(image), width, height), max_soft_tokens);
 }
 
 }  // namespace gewell::gemma4
