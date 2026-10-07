@@ -179,6 +179,7 @@ struct BatchMtpInput {
   std::function<void(const std::uint32_t*, std::uint32_t, std::uint32_t*)> constraint_mask;
   MtpCaptureFeatures* capture{};
   MtpTargetProbes* capture_next{};
+  mtp_cycle::DeviceProbes depth_probes;
 };
 
 struct BatchMtpCommitInput {
@@ -437,9 +438,11 @@ class Executor {
           rows, model::kHiddenSize, model::kVocabSize));
     }
     if (mtp_depth)
-      batch_mtp_ = std::make_unique<mtp_cycle::Batch>(handle_.get(), weights_.pointers(),
+      batch_mtp_ = std::make_unique<mtp_cycle::Batch>(handle_.get(),
+          mtp_cycle::make_31b_batch_target(handle_.get(), weights_.pointers(),
+              capacity * (mtp_depth + 1), global_capacity_, &weights_.native_weights(),
+              activation_policy_, &weights_.fp8_weights(), local_compute_, global_compute_),
           global_capacity_, capacity, mtp_depth, staging, staging_bytes,
-          &weights_.native_weights(), activation_policy_, &weights_.fp8_weights(),
           local_compute_, global_compute_);
   }
 
@@ -535,6 +538,7 @@ class Executor {
       proposal.target_hidden = input.target_hidden;
       proposal.position = input.position;
       proposal.depth = input.depth;
+      proposal.caches.resize(model::kLayerCount);
       for (std::size_t layer = 0; layer < proposal.caches.size(); ++layer)
         proposal.caches[layer] = persistent_cache_->layer(input.execution, layer);
       proposal.temperature = input.temperature;
@@ -545,13 +549,14 @@ class Executor {
       proposal.uniforms = input.uniforms;
       proposal.capture = input.capture;
       proposal.capture_next = input.capture_next;
+      proposal.depth_probes = input.depth_probes;
       proposals.push_back(std::move(proposal));
     }
     return batch_mtp_->run(proposals, stream_.get());
   }
 
   void commit_batch_mtp(const std::vector<BatchMtpCommitInput>& inputs) {
-    std::vector<mtp_target::Caches> views(inputs.size());
+    std::vector<mtp_cycle::BatchCaches> views(inputs.size(), mtp_cycle::BatchCaches(model::kLayerCount));
     std::vector<mtp_cycle::BatchCommitInput> commits;
     commits.reserve(inputs.size());
     for (std::size_t i = 0; i < inputs.size(); ++i) {
@@ -793,7 +798,7 @@ class Executor {
           fp8_inputs[row] = {q, nullptr, nullptr, cache, input.position + 1, 1, result};
       }
       if (fp8_compute)
-        mtp_attention::run_fp8_batch(fp8_inputs, weight.k_norm, kind,
+        mtp_attention::run_fp8_batch(32, fp8_inputs, weight.k_norm, kind,
             attention_scratch_.data(), attention_scratch_.size(), stream, true);
       else if (rows > 1)
         primitives::decode_attention_batch(attention_inputs, weight.k_norm,
@@ -1653,7 +1658,7 @@ class Executor {
 
       if (fp8_compute) {
         fp8_inputs[0] = {q_rope, nullptr, nullptr, cache, position + 1, 1, context};
-        mtp_attention::run_fp8_batch(fp8_inputs, weight.k_norm, kind,
+        mtp_attention::run_fp8_batch(32, fp8_inputs, weight.k_norm, kind,
             attention_scratch_.data(), attention_scratch_.size(), stream, true);
       }
 

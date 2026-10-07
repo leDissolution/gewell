@@ -34,20 +34,21 @@ int main(int argc, char** argv) {
       if (command == "graph-decode") return pair::run_graph_decode(argv[2], output);
       if (argc == 3 && command == "profile-decode") return pair::run_profile_decode(argv[2]);
     }
-    if (argc == 7 && std::string_view(argv[1]) == "vision") {
+    if (argc == 7 && (std::string_view(argv[1]) == "vision" || std::string_view(argv[1]) == "vision26")) {
       const std::string_view text = argv[5];
       std::uint32_t tokens = 0;
       const auto parsed = std::from_chars(text.data(), text.data() + text.size(), tokens);
       if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || tokens == 0)
         throw std::runtime_error("SOFT_TOKENS must be an integer in 1..4294967295");
-      return gewell::vision_runner::run(argv[2], argv[3], argv[4], tokens, argv[6]);
+      return gewell::vision_runner::run(std::string_view(argv[1]) == "vision26"
+          ? gewell::vision_engine::Model::gemma4_26b_a4b : gewell::vision_engine::Model::gemma4_31b, argv[2], argv[3], argv[4], tokens, argv[6]);
     }
     console::message(std::string("Usage: ") + argv[0] + R"( [--log-format human|json] COMMAND ...
   bos | pair | cached-pair | short-decode PATH [CAPTURE_DIR|-]
   local-boundary | local-boundary-prefill PATH [CAPTURE_DIR|-]
   graph-decode PATH [OUTPUT_DIR|-]
   profile-decode PATH
-  vision VISION.safetensors PIXELS.f32 POSITIONS.i32 SOFT_TOKENS CAPTURE_DIR
+  vision | vision26 VISION.safetensors PIXELS.f32 POSITIONS.i32 SOFT_TOKENS CAPTURE_DIR
 )");
     return argc == 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h") ? 0 : 2;
   } catch (const std::exception& error) {

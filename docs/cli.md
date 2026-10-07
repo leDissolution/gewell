@@ -38,7 +38,7 @@ files and request formats. Prefer HTTP for ordinary text and image input.
 ## Option placement
 
 `--log-format human|json` is global and can appear before or after a command.
-`--help` and `-h` apply to the executable, not individual subcommands.
+`--version`, `--help`, and `-h` apply to the executable, not individual subcommands.
 
 Place `serve-http` options after the command and `run-jobs` options after its
 positional arguments. For `generate`, `caption`, and `generate-batch`, place
@@ -75,6 +75,8 @@ Cache budget/checkpoint options apply to serving and jobs.
 | `--prefill-budget-tokens N` | `0` | Soft prefill token budget between decode opportunities; 0 runs decode after each packed forward/head |
 | `--mtp-min-depth N` | `0` | Minimum adaptive proposal depth, `0..mtp_depth`; request correctness limits can shorten it |
 | `--decode-width N` | `0` | Target pending + proposal rows, `0..4294967295`; 0 keeps fixed maximum depth |
+| `--mtp-stats PATH` | disabled | Append per-request windowed acceptance histograms and shared decode timings to a JSONL file |
+| `--mtp-stats-window N` | `64` | Decode cycles per request window, `1..4294967295`; active only with `--mtp-stats` |
 | `--kv-cache-gpu-mib N` | required for `serve-http`; positional for `run-jobs` | Positive GPU KV budget |
 | `--kv-cache-cpu-mib N` | `0` | Host prefix-cache budget; zero disables cold storage |
 | `--kv-cache-index-mib N` | `512` | Positive host cache-index budget |
@@ -95,7 +97,7 @@ slower than one on the tested G0 setup.
 The 2048 default fits two full chunks and was neutral on that workload.
 
 Add `--prefill-budget-tokens 8192` to allow roughly four full forwards before
-a decode opportunity. This can build decode concurrency faster, trading longer TTFT for higher average throughput. The default
+a decode opportunity. This can build decode concurrency faster. The default
 logical budget remains 0: one forward/head, then a decode opportunity. Both
 larger physical batches and larger logical budgets can lengthen decode gaps.
 
@@ -116,6 +118,13 @@ longer inter-token gaps; TTFT depends on the workload.
 ## HTTP options
 
 All HTTP options follow `serve-http`.
+
+Add `--verbose` to print each validated generation or cache-prefill prompt to
+stdout (off by default). Prompts are decoded from the prepared tokens, including
+chat template and special tokens; images appear as template tokens without image
+data. Human logs escape newlines and control characters. With `--log-format json`,
+`server_request_prompt` events contain `data.request_id`, `data.path`, and
+`data.prompt`; the request ID matches the response's `x-request-id` header.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -190,10 +199,44 @@ and `run-jobs` it can follow the command arguments. Put it after other leading
 execution options. The mask uses `LAYER PROJECTION RECIPE` rules;
 normal deployment uses the precision stored in its bundle.
 
+For 26B, `LAYER` is `*` or 0–29. Attention and shared-MLP projections use
+`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, and `down_proj`.
+Global layers have no separate `v_proj`; `* v_proj` selects only local layers.
+Expert projections use `expert_gate_proj`, `expert_up_proj`, or
+`expert_down_proj`, with an optional fourth field selecting expert 0–127.
+Omitting that field, or using `*`, selects all experts. Rules apply in order;
+unspecified entries remain BF16. Norms, the router, and the tied embedding/head
+are not selectable.
+
+For example, on a BF16 26B artifact:
+
+```text
+* gate_proj fp8
+0 expert_gate_proj nvfp4 0
+29 expert_down_proj fp8 127
+```
+
+`fp8` and `nvfp4` reconstruct selected weights in GPU BF16 storage using the
+existing logical quantizers; the artifact file is unchanged. `bf16` keeps the
+source values. `fp8_w8a8` and `nvfp4_w4a4` instead assert matching native packed
+storage. A supplied mask must match every packed entry, including entries not
+explicitly selected by a rule; changing packed storage requires repacking.
+Without a mask, the artifact's stored precision is used. The 31B mask retains
+its three-field format and layer range 0–59.
+
 `generate-batch`'s optional `EVENTS.tsv` injects deterministic arrival,
 cancellation, and failure events for scheduler testing. `replay-rollout`
 consumes four TSV fields: request ID, prompt token path, continuation token
 path, and saved generating-model logits. Neither is needed to launch serving.
+
+For 26B, replay prefills each prompt in `CHUNK_ROWS` pieces, then feeds the
+recorded continuation through single-row cached decode. Leading
+`--nvfp4-activation-policy always|prefill` applies to that decode. Each saved
+logit row must predict the corresponding continuation token, including the
+final token; the final token itself is not fed. 31B retains causal chunked
+prefill replay. Both models support weight-QDQ overlays; 26B replay also accepts
+converted BF16, FP8, NVFP4, and mixed native artifacts. Replay records the mask's
+SHA-256 separately from the unchanged artifact payload hash.
 
 The separately built `gewell_diagnostics` contains fixed capture/profile
 commands: `bos`, `pair`, `cached-pair`, `short-decode`, `local-boundary`,

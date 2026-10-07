@@ -31,12 +31,12 @@ constexpr unsigned fp8_shared_bytes(bool global, bool frozen) {
   return (queries + 32) * (d + 16) + d * 36;
 }
 
-template<bool Global, bool Paged, bool Frozen>
+template<unsigned QueryHeads, bool Global, bool Paged, bool Frozen>
 __global__ __launch_bounds__(kThreads, Global && !Frozen ? 1 : 2)
 void fp8_partial_attention(const __grid_constant__ AttentionBatch batch,
                             const BF16* k_norm) {
   constexpr unsigned D = Global ? 512 : 256;
-  constexpr unsigned Heads = Global ? 4 : 16, Gqa = 32 / Heads;
+  constexpr unsigned Heads = Global ? QueryHeads / 8 : QueryHeads / 2, Gqa = QueryHeads / Heads;
   constexpr unsigned Queries = Global && !Frozen ? 32 : 16;
   constexpr unsigned GroupRows = Queries / Gqa, ColumnWarps = Queries == 32 ? 4 : 8;
   constexpr unsigned QStride = D + 16;
@@ -56,7 +56,8 @@ void fp8_partial_attention(const __grid_constant__ AttentionBatch batch,
   const unsigned group = block % tile.groups, split = block / tile.groups;
   const unsigned first_row = tile.first + group * GroupRows;
   const unsigned valid_rows = min(GroupRows, input.rows - first_row);
-  const unsigned last = Frozen ? input.base_position - 1 : input.base_position + first_row + valid_rows - 1;
+  const unsigned last = Frozen ? input.base_position - 1 : input.local_image
+      ? input.base_position + input.rows - 1 : input.base_position + first_row + valid_rows - 1;
   const unsigned first_position = Frozen ? last : input.base_position + first_row;
   const unsigned first = !Global && first_position >= 1023 ? first_position - 1023 : 0;
   const unsigned head = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -203,8 +204,10 @@ void fp8_partial_attention(const __grid_constant__ AttentionBatch batch,
     __syncthreads();
     for (unsigned q = warp; q < Queries; q += 8) {
       const unsigned position = Frozen ? last : input.base_position + first_row + q / Gqa;
-      const bool visible = q / Gqa < valid_rows && begin + lane <= position &&
-          (Global || position - (begin + lane) < 1024);
+      const unsigned key_position = begin + lane;
+      const bool visible = q / Gqa < valid_rows &&
+          (key_position <= position || (input.local_image && key_position <= last)) &&
+          (Global || key_position >= position || position - key_position < 1024);
       const float score = visible ? scores[q * 32 + lane] : -CUDART_INF_F;
       const float next = fmaxf(maximum[q], __shfl_sync(0xffffffffU, warp_max(score), 0));
       const float p = visible ? expf(score - next) : 0;
@@ -239,7 +242,7 @@ void fp8_partial_attention(const __grid_constant__ AttentionBatch batch,
     const unsigned q = warp / ColumnWarps * 16 + lane / 4 + (i / 2) * 8;
     if (q / Gqa >= valid_rows) continue;
     const unsigned row = first_row + q / Gqa - tile.first;
-    const auto result = (std::size_t(row) * 32 + head * Gqa + q % Gqa) * tile.splits + split;
+    const auto result = (std::size_t(row) * QueryHeads + head * Gqa + q % Gqa) * tile.splits + split;
     for (unsigned j = 0; j < D / (ColumnWarps * 8); ++j) {
       const unsigned d = (j * ColumnWarps + warp % ColumnWarps) * 8 + (lane % 4) * 2 + i % 2;
       tile.partial[result * D + d] = bad_query[q] ? CUDART_NAN_F : numerator[j][i];
@@ -250,24 +253,24 @@ void fp8_partial_attention(const __grid_constant__ AttentionBatch batch,
   }
 }
 
-template<bool Global, bool Paged, bool Frozen>
+template<unsigned QueryHeads, bool Global, bool Paged, bool Frozen>
 void launch_fp8_attention(const AttentionBatch& batch, unsigned count,
                            const BF16* k_norm, cudaStream_t stream) {
   const auto& last = batch.tiles[count - 1];
   constexpr auto shared = fp8_shared_bytes(Global, Frozen);
   if constexpr (Global && !Frozen) {
     static const bool configured = [] {
-      const auto status = cudaFuncSetAttribute(fp8_partial_attention<Global, Paged, Frozen>,
+      const auto status = cudaFuncSetAttribute(fp8_partial_attention<QueryHeads, Global, Paged, Frozen>,
           cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
       if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
       return true;
     }();
     (void)configured;
   }
-  fp8_partial_attention<Global, Paged, Frozen>
-      <<<dim3(Global ? 4 : 16, last.end_blocks), kThreads, shared, stream>>>(batch, k_norm);
+  fp8_partial_attention<QueryHeads, Global, Paged, Frozen>
+      <<<dim3(Global ? QueryHeads / 8 : QueryHeads / 2, last.end_blocks), kThreads, shared, stream>>>(batch, k_norm);
   check_launch();
-  batched_finalize_attention<Global ? 512 : 256>
-      <<<dim3(kHeads, last.end_rows), kThreads, 0, stream>>>(batch);
+  batched_finalize_attention<Global ? 512 : 256, QueryHeads>
+      <<<dim3(QueryHeads, last.end_rows), kThreads, 0, stream>>>(batch);
   check_launch();
 }

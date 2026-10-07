@@ -41,15 +41,15 @@ struct Pending {
 // startup logs record their selected-token boundaries for truncation tests.
 int main(int argc, char** argv) {
   gewell::console::set_format("json");
-  if (argc != 3 && argc != 8) {
+  if (argc != 3 && argc != 10) {
     std::cerr << "usage: http_server_test TOKENIZER_DIRECTORY PORT "
-                 "[MAX_CONNECTIONS MAX_BODY_BYTES MAX_TOTAL_BODY_BYTES MAX_OUTPUT_BYTES TIMEOUT_SECONDS]\n";
+                 "[MAX_CONNECTIONS MAX_BODY_BYTES MAX_TOTAL_BODY_BYTES MAX_OUTPUT_BYTES TIMEOUT_SECONDS VERBOSE LOG_FORMAT]\n";
     return 1;
   }
   try {
     const gewell::http::Settings defaults;
-    if (defaults.host != "127.0.0.1" || defaults.port != 6311)
-      throw std::runtime_error("unexpected HTTP bind defaults");
+    if (defaults.host != "127.0.0.1" || defaults.port != 6311 || defaults.verbose)
+      throw std::runtime_error("unexpected HTTP defaults");
     const auto tokenizer_path = std::filesystem::path(argv[1]) / "tokenizer.json";
     if (!std::filesystem::is_regular_file(tokenizer_path)) {
       std::cout << "SKIP: local tokenizer unavailable\n";
@@ -61,12 +61,14 @@ int main(int argc, char** argv) {
     settings.host = "0.0.0.0";
     settings.model = "gewell-gemma-4-31b-bf16";
     settings.port = static_cast<std::uint16_t>(std::stoul(argv[2]));
-    if (argc == 8) {
+    if (argc == 10) {
       settings.max_connections = std::stoull(argv[3]);
       settings.max_body_bytes = std::stoull(argv[4]);
       settings.max_body_total_bytes = std::stoull(argv[5]);
       settings.max_output_bytes = std::stoull(argv[6]);
       settings.socket_timeout_seconds = std::stoul(argv[7]);
+      settings.verbose = std::string_view(argv[8]) == "1";
+      gewell::console::set_format(argv[9]);
     }
     const gewell::text::Tokenizer tokenizer(tokenizer_path.string(), contract);
     constexpr std::size_t burst = 64;

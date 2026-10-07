@@ -250,6 +250,18 @@ Plan::Plan(cublasLtHandle_t handle, std::uint32_t rows,
           ? 0 : std::size_t(p.padded_rows) * output_width * sizeof(__nv_bfloat16);
   p.workspace_offset = align256(p.output_offset + padded_output_bytes);
   p.total_bytes = p.workspace_offset + p.workspace_bytes;
+  // The placeholder is needed only for algorithm selection. run supplies
+  // real block-scale pointers; keeping this allocation in every cached plan
+  // would add device memory outside the caller's bounded scratch allocation.
+  void* no_scales = nullptr;
+  check_cublas(cublasLtMatmulDescSetAttribute(
+                   p.operation, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                   &no_scales, sizeof(no_scales)), "clear heuristic weight scale pointer");
+  check_cublas(cublasLtMatmulDescSetAttribute(
+                   p.operation, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                   &no_scales, sizeof(no_scales)), "clear heuristic activation scale pointer");
+  check_cuda(cudaFree(p.query_scales), "release heuristic scale placeholder");
+  p.query_scales = nullptr;
 }
 
 Plan::~Plan() = default;

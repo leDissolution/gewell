@@ -35,9 +35,7 @@ void validate_tokenizer_pipeline(const nlohmann::json& data) {
                 model.at("end_of_word_suffix").is_null(), "unsupported BPE settings");
 }
 
-}  // namespace
-
-const text::TextContract& text_contract_31b() {
+const text::TextContract& shared_text_contract() {
   static const text::TextContract contract = [] {
     text::TextContract value{};
     value.vocabulary_size = 262144;
@@ -69,5 +67,10 @@ const text::TextContract& text_contract_31b() {
   }();
   return contract;
 }
+
+}  // namespace
+
+const text::TextContract& text_contract_31b() { return shared_text_contract(); }
+const text::TextContract& text_contract_26b_a4b() { return shared_text_contract(); }
 
 }  // namespace gewell::gemma4

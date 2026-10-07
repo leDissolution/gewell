@@ -1,3 +1,4 @@
+#include "gewell/models/gemma4/26b_a4b/cache_config.h"
 #include "gewell/console.h"
 #include "gewell/app.h"
 #include "runner_internal.h"
@@ -9,6 +10,7 @@
 #include "gewell/json_constraint.h"
 #include "gewell/logprobs.h"
 #include "gewell/models/gemma4/31b/serving_assets.h"
+#include "gewell/models/gemma4/26b_a4b/serving_assets.h"
 #include "gewell/models/gemma4/image_processor.h"
 #include "gewell/bf16_primitives.h"
 #include "gewell/models/gemma4/31b/model.h"
@@ -71,6 +73,10 @@
 
 #include "gewell/runtime/scheduler.h"
 #include "models/gemma4/31b/sm120/runtime_backend.h"
+#include "models/gemma4/26b_a4b/sm120/runtime_backend.h"
+#include "models/gemma4/26b_a4b/sm120/mtp_staging.cuh"
+#include "models/gemma4/26b_a4b/sm120/replay.cuh"
+#include "gewell/models/gemma4/26b_a4b/artifact.h"
 #include "models/gemma4/31b/sm120/runner_support.cuh"
 #include "models/gemma4/31b/sm120/batch_execution.cuh"
 #include "models/gemma4/31b/sm120/cache_config.h"
@@ -377,10 +383,18 @@ class GenerationLogitsOutput final : public GenerationLogitsSink {
     check_cuda(cudaStreamSynchronize(stream),
                "synchronize generation logits row");
 
+    write_host_row(row_.data());
+  }
+
+  void write_host_row(const void* logits) {
+    if (rows_written_ >= expected_rows_)
+      fail("write generation logits output", "too many decision rows");
+    const auto* bytes = static_cast<const std::uint8_t*>(logits);
+
     std::size_t written = 0;
     while (written < row_.size()) {
       const ssize_t result =
-          ::write(descriptor_, row_.data() + written, row_.size() - written);
+          ::write(descriptor_, bytes + written, row_.size() - written);
       if (result < 0 && errno == EINTR) {
         continue;
       }
@@ -653,6 +667,127 @@ class BatchSignalScope {
 
 namespace {
 
+int run_generation26(const std::string& artifact_path,
+                     const std::vector<std::uint32_t>& prompt,
+                     std::uint32_t count, const std::string& output_path,
+                     const std::string& logits_path, const GenerationSettings& settings,
+                     const std::string& qdq_path, std::shared_ptr<const runtime::ImageInput> image = {}) {
+  BatchLimits limits;
+  limits.capacity = 1;
+  limits.max_horizon = generation_cache_capacity(prompt.size(), count);
+  limits.prefill_chunk_tokens = checked_prefill_chunk_tokens(settings.prefill_chunk_tokens);
+  limits.prefill_batch_tokens = checked_prefill_batch_tokens(
+      settings.prefill_batch_tokens, limits.prefill_chunk_tokens);
+  limits.plan_rows = std::min<std::size_t>(prompt.size(), limits.prefill_chunk_tokens);
+  limits.mtp_depth = settings.mtp_depth;
+  limits.local_kv_format = settings.local_kv_format;
+  limits.global_kv_format = settings.global_kv_format;
+  limits.local_attention_compute = settings.local_attention_compute;
+  limits.global_attention_compute = settings.global_attention_compute;
+  limits.sampled = settings.temperature > 0 && settings.top_p > 0 && settings.top_k != 1;
+  limits.captures = !logits_path.empty();
+  const auto geometry = kv_cache::compact_pool_config(
+      gemma4_26b_a4b::sm120::kCacheGeometry, kv_cache::kMib, 0,
+      limits.index_bytes, limits.local_kv_format, limits.global_kv_format);
+  const auto pages = (limits.max_horizon + geometry.global_page_tokens - 1) / geometry.global_page_tokens;
+  const auto staging = limits.mtp_depth
+      ? gemma4_26b_a4b::sm120::mtp_staging_bytes(limits.mtp_depth + 1) : 0;
+  const auto base = geometry.local_ring_bytes + geometry.page_table_bytes +
+      pages * geometry.global_page_bytes + staging;
+  limits.kv_bytes = base;
+  // Include the backend's terminal arena and round to the cache budget unit.
+  for (;;) {
+    const auto bytes = base + (limits.kv_bytes / geometry.local_ring_bytes) * geometry.terminal_hidden_bytes;
+    const auto rounded = (bytes + kv_cache::kMib - 1) / kv_cache::kMib * kv_cache::kMib;
+    if (rounded == limits.kv_bytes) break;
+    limits.kv_bytes = rounded;
+  }
+  validate_cuda_device();
+  auto file = gemma4_26b_a4b::ArtifactFile::Open(artifact_path);
+  console::field("architecture", "gemma4_26b_a4b");
+  console::field("payload_sha256", artifact::digest_hex(file.payload_hash()));
+  console::field("generation_kv_budget_bytes", limits.kv_bytes);
+  auto backend = gemma4_26b_a4b::sm120::make_runtime_backend(std::move(file), limits,
+      settings.nvfp4_activation_policy, settings.assistant_path, settings.vision_path, qdq_path);
+  std::unique_ptr<GenerationLogitsOutput> logits;
+  if (limits.captures) logits = std::make_unique<GenerationLogitsOutput>(logits_path, count);
+  std::vector<std::uint32_t> output_tokens;
+  BatchCallbacks callbacks;
+  callbacks.ready = [](auto&) { return true; };
+  callbacks.start = [](auto&) {};
+  callbacks.finish = [&](auto& request) { output_tokens = request.outputs; };
+  callbacks.emit = [&](auto&, const auto*, std::size_t rows, const void* data, const TokenLogprobs*) {
+    if (logits) for (std::size_t row = 0; row < rows; ++row)
+      logits->write_host_row(static_cast<const std::uint8_t*>(data) + row * kGenerationLogitRowBytes);
+  };
+  callbacks.reject = [](auto&, const std::string& error, BatchFailure) { fail("generation", error); };
+  BatchSignalScope signals;
+  BatchScheduler scheduler(std::move(backend), limits, std::move(callbacks));
+  BatchRequest request;
+  request.id = "generation";
+  request.prompt = std::make_shared<const std::vector<std::uint32_t>>(prompt);
+  request.max_new_tokens = count;
+  request.sampling = {settings.temperature, settings.top_p, settings.top_k};
+  request.seed = settings.seed.value_or(std::random_device{}());
+  request.rng.seed(request.seed);
+  request.capture_logits = limits.captures;
+  request.honor_eos = bool(image);
+  if (image) request.images.push_back(std::move(image));
+  scheduler.submit(std::move(request));
+  scheduler.register_requests();
+  while (scheduler.has_pending()) {
+    if (batch_interrupted) fail("generation", "interrupted; incomplete output is not published");
+    if (!scheduler.step()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto& result = scheduler.requests.front();
+  if (result.phase == BatchPhase::cancelled || output_tokens.empty() ||
+      (!result.honor_eos && output_tokens.size() != count))
+    fail("generation", "request did not complete");
+  const auto encoded = write_generation_output(output_path, output_tokens);
+  if (logits) {
+    try { logits->publish(output_tokens.size()); }
+    catch (...) { ::unlink(output_path.c_str()); throw; }
+  }
+  console::field("generation_prefill_wall_seconds", result.prefill_seconds);
+  console::field("generation_decode_wall_seconds", result.decode_seconds);
+  if (result.prefill_gpu_seconds > 0)
+    console::field("generation_prefill_gpu_tokens_per_second", prompt.size() / result.prefill_gpu_seconds);
+  else
+    console::field("generation_prefill_gpu_tokens_per_second", "n/a");
+  const auto decode_tokens = output_tokens.size() - 1;
+  console::field("generation_decode_tokens_fed", decode_tokens);
+  if (decode_tokens && result.decode_gpu_seconds > 0)
+    console::field("generation_decode_gpu_tokens_per_second", decode_tokens / result.decode_gpu_seconds);
+  else
+    console::field("generation_decode_gpu_tokens_per_second", "n/a");
+  console::field("generation_mtp_rejected_cycles", scheduler.mtp_rejected_cycles);
+  console::field("generation_mtp_draft_gpu_milliseconds", scheduler.mtp_draft_gpu_seconds * 1000);
+  console::field("generation_mtp_verify_gpu_milliseconds", scheduler.mtp_verify_gpu_seconds * 1000);
+  console::field("generation_mtp_select_gpu_milliseconds", scheduler.mtp_select_gpu_seconds * 1000);
+  console::field("generation_first_token", output_tokens.front());
+  console::field("generation_last_token", output_tokens.back());
+  console::field("generation_output_bytes", encoded.size());
+  console::field("generation_output_tokens", output_tokens.size());
+  console::field("generation_output_file", output_path);
+  console::field("generation_output_sha256", artifact::digest_hex(sha256_bytes(encoded.data(), encoded.size())));
+  console::field("generation_mtp_cycles", result.mtp_cycles);
+  console::field("generation_mtp_proposed", result.mtp_proposed);
+  console::field("generation_mtp_accepted", result.mtp_accepted);
+  console::field("generation_prefill_gpu_milliseconds", result.prefill_gpu_seconds * 1000);
+  console::field("generation_decode_gpu_milliseconds", result.decode_gpu_seconds * 1000);
+  if (logits) {
+    console::field("generation_logits_dtype", "bf16_le");
+    console::field("generation_logits_layout", "token_major_post_softcap");
+    console::field("generation_logits_bytes", output_tokens.size() * kGenerationLogitRowBytes);
+    console::field("generation_logits_file", logits_path);
+    console::field("generation_logits_rows", output_tokens.size());
+    console::field("generation_logits_columns", gemma4_26b_a4b::kVocabSize);
+  } else {
+    console::field("generation_logits_file", "disabled");
+  }
+  return 0;
+}
+
 int run_loaded_generation(const WeightArena& weights,
                           const std::vector<std::uint32_t>& prompt,
                           std::uint32_t new_token_count,
@@ -824,6 +959,7 @@ int run_generate(const std::string& artifact_path,
                  const std::string& logits_output_path,
                  const std::string& qdq_mask_path,
                  GenerationSettings settings) {
+  const bool is_26b = artifact_model(artifact_path) == ModelKind::gemma4_26b_a4b;
   settings.mtp_depth = effective_mtp_depth(settings.mtp_depth, settings.assistant_path);
   if (settings.mtp_depth > mtp_target::kMaxDepth)
     fail("MTP settings", "depth must be 0..1279");
@@ -832,7 +968,7 @@ int run_generate(const std::string& artifact_path,
       settings.top_k > model::kVocabSize)
     fail("sampling settings", "invalid temperature, top-p, or top-k");
 
-  const qdq::Mask qdq_mask = qdq_mask_path.empty()
+  const qdq::Mask qdq_mask = is_26b || qdq_mask_path.empty()
                                  ? qdq::Mask{}
                                  : qdq::Mask::Load(qdq_mask_path);
   const qdq::SelectionSummary qdq_selection = qdq::summarize(qdq_mask);
@@ -862,7 +998,7 @@ int run_generate(const std::string& artifact_path,
   console::field("generation_seed", (settings.seed ? std::to_string(*settings.seed) : "entropy"));
   console::field("generation_eos_stopping", "disabled");
   console::field("generation_logits_returned", !(logits_output_path.empty()));
-  if (console::json_enabled() || !qdq_mask.all_bf16()) {
+  if (!is_26b && (console::json_enabled() || !qdq_mask.all_bf16())) {
     console::section("Weight quantization");
     console::field("weight_qdq_mask_file", (qdq_mask.has_source() ? qdq_mask.source_name() : "disabled"));
     if (qdq_mask.has_source()) {
@@ -889,6 +1025,8 @@ int run_generate(const std::string& artifact_path,
   console::field("artifact", artifact_path);
   console::field("verification", "disabled (header+table only)");
 
+  if (is_26b) return run_generation26(artifact_path, prompt, new_token_count,
+      output_path, logits_output_path, settings, qdq_mask_path);
   artifact::ArtifactFile file = artifact::ArtifactFile::Open(artifact_path);
   if (console::json_enabled())
     console::field("payload_sha256", artifact::digest_hex(file.header().payload_sha256));
@@ -914,6 +1052,7 @@ int run_caption(const std::string& artifact_path,
                 const std::string& output_path,
                 const std::string& logits_output_path,
                 GenerationSettings settings) {
+  const bool is_26b = artifact_model(artifact_path) == ModelKind::gemma4_26b_a4b;
   if (settings.vision_path.empty()) fail("caption", "image input requires --vision PATH");
   settings.mtp_depth = effective_mtp_depth(settings.mtp_depth, settings.assistant_path);
   if (settings.mtp_depth > mtp_target::kMaxDepth)
@@ -950,11 +1089,11 @@ int run_caption(const std::string& artifact_path,
   }
   const std::uint32_t padded_patch_rows =
       vision_engine::padded_patch_rows_for_capacity(image_max_soft_tokens);
-  const std::vector<std::uint8_t> pixels = read_exact_input(
+  std::vector<std::uint8_t> pixels = read_exact_input(
       pixel_values_path,
       vision_engine::prepared_pixel_bytes(padded_patch_rows),
       "read caption pixel input");
-  const std::vector<std::uint8_t> positions = read_exact_input(
+  std::vector<std::uint8_t> positions = read_exact_input(
       position_ids_path,
       vision_engine::prepared_position_bytes(padded_patch_rows),
       "read caption position input");
@@ -967,7 +1106,7 @@ int run_caption(const std::string& artifact_path,
 
   console::section("Image captioning");
   if (console::json_enabled())
-    console::field("caption_mode", "gemma4_31b_bf16_image_conditioned");
+    console::field("caption_mode", is_26b ? "gemma4_26b_a4b_image_conditioned" : "gemma4_31b_bf16_image_conditioned");
   console::field("caption_prompt_file", prompt_path);
   console::field("caption_prompt_tokens", prompt.size());
   if (console::json_enabled())
@@ -997,6 +1136,16 @@ int run_caption(const std::string& artifact_path,
   console::field("artifact", artifact_path);
   console::field("verification", "disabled (header+table only)");
 
+  if (is_26b) {
+    auto prepared = std::make_shared<runtime::ImageInput>();
+    prepared->pixels = std::move(pixels);
+    prepared->positions = std::move(positions);
+    prepared->padded_patch_rows = padded_patch_rows;
+    prepared->begin = image.begin;
+    prepared->end = image.end;
+    return run_generation26(artifact_path, prompt, max_new_token_count,
+        output_path, logits_output_path, settings, "", std::move(prepared));
+  }
   artifact::ArtifactFile file = artifact::ArtifactFile::Open(artifact_path);
   if (console::json_enabled())
     console::field("payload_sha256", artifact::digest_hex(file.header().payload_sha256));
@@ -1033,6 +1182,7 @@ int run_replay_rollout(const std::string& artifact_path,
                        const std::string& requests_path,
                        std::uint32_t chunk_rows, std::uint32_t head_rows,
                        const std::string& output_directory,
+                       nvfp4::ActivationPolicy activation_policy,
                        const std::string& qdq_mask_path) {
   if (!chunk_rows || chunk_rows > kMaxPrefillChunkTokens || !head_rows || head_rows > chunk_rows)
     fail("replay configuration", "require 1 <= HEAD_ROWS <= CHUNK_ROWS <= 4096");
@@ -1083,32 +1233,51 @@ int run_replay_rollout(const std::string& artifact_path,
     requests.push_back(std::move(request));
   }
   if (!manifest.eof() || requests.empty()) fail("replay manifest", "empty or unreadable manifest");
+  const bool is_26b=artifact_model(artifact_path)==ModelKind::gemma4_26b_a4b;
+  if(activation_policy!=nvfp4::ActivationPolicy::always && activation_policy!=nvfp4::ActivationPolicy::prefill)
+    fail("replay configuration", "invalid NVFP4 activation policy");
   std::error_code directory_error;
   if (!std::filesystem::create_directory(output_directory, directory_error))
     fail("replay output directory", directory_error ? directory_error.message() : "directory already exists");
   const std::filesystem::path output(output_directory);
-  artifact::ArtifactFile file = artifact::ArtifactFile::Open(artifact_path);
-  const auto mask = qdq_mask_path.empty() ? qdq::Mask{} : qdq::Mask::Load(qdq_mask_path);
+  std::optional<artifact::ArtifactFile> file;
+  std::optional<gemma4_26b_a4b::ArtifactFile> file26;
+  if(is_26b) file26.emplace(gemma4_26b_a4b::ArtifactFile::Open(artifact_path));
+  else file.emplace(artifact::ArtifactFile::Open(artifact_path));
+  const auto mask26 = !is_26b || qdq_mask_path.empty() ? gemma4_26b_a4b::QdqMask{} : gemma4_26b_a4b::QdqMask::Load(qdq_mask_path);
+  if (is_26b) mask26.validate(*file26);
+  const auto mask = is_26b || qdq_mask_path.empty() ? qdq::Mask{} : qdq::Mask::Load(qdq_mask_path);
   validate_cuda_device();
   console::section("Recorded-token replay");
   if (console::json_enabled())
-    console::field("replay_mode", "causal_chunked_compact_global_bf16");
+    console::field("replay_mode", is_26b ? "prefill_then_cached_decode_compact_global_bf16" : "causal_chunked_compact_global_bf16");
+  console::field("architecture", is_26b ? "gemma4_26b_a4b" : "gemma4_31b");
+  if(is_26b) console::field("nvfp4_activation_policy", activation_policy==nvfp4::ActivationPolicy::always ? "always" : "prefill");
   console::field("replay_requests", requests.size());
   console::field("replay_chunk_rows", chunk_rows);
   console::field("replay_head_rows", head_rows);
   if (console::json_enabled())
-    console::field("payload_sha256", artifact::digest_hex(file.header().payload_sha256));
+    console::field("payload_sha256", artifact::digest_hex(is_26b ? file26->payload_hash() : file->header().payload_sha256));
   if (console::json_enabled())
-    console::field("weight_qdq_mask_sha256", (mask.has_source() ? artifact::digest_hex(mask.source_sha256()) : "disabled"));
+    console::field("weight_qdq_mask_sha256", (is_26b ? (mask26.has_source() ? artifact::digest_hex(mask26.source_sha256()) : "disabled") : (mask.has_source() ? artifact::digest_hex(mask.source_sha256()) : "disabled")));
   const auto load_begin = std::chrono::steady_clock::now();
-  WeightArena weights(file, mask);
+  // The26B resident executor outlives each private replay history. Its default
+  // stream also outlives all requests; this command runs no concurrent work.
+  std::unique_ptr<WeightArena> weights;
+  std::unique_ptr<gemma4_26b_a4b::sm120::BatchedExecutor> executor26;
+  if(is_26b) executor26=std::make_unique<gemma4_26b_a4b::sm120::BatchedExecutor>(std::move(*file26),chunk_rows,nullptr,activation_policy);
+  else weights=std::make_unique<WeightArena>(*file,mask);
+  if (is_26b) console::field("weight_qdq_seconds", executor26->apply_qdq(mask26).seconds);
   console::field("weight_load_seconds", seconds_since(load_begin));
 
-  const auto tile_bytes = std::size_t(head_rows) * kGenerationLogitRowBytes;
-  DeviceAllocation raw_logits(tile_bytes), capped_logits(tile_bytes), reference_logits(tile_bytes);
-  DeviceAllocation recorded_tokens(head_rows * sizeof(std::uint32_t));
-  DeviceAllocation device_metrics(head_rows * sizeof(replay_metrics::Row));
-  PinnedHostAllocation host_reference(tile_bytes), host_metrics(head_rows * sizeof(replay_metrics::Row));
+  const unsigned allocated_head_rows=is_26b?1:head_rows;
+  const auto tile_bytes = std::size_t(allocated_head_rows) * kGenerationLogitRowBytes;
+  std::unique_ptr<DeviceAllocation> raw_logits;
+  if(!is_26b) raw_logits=std::make_unique<DeviceAllocation>(tile_bytes);
+  DeviceAllocation capped_logits(tile_bytes), reference_logits(tile_bytes);
+  DeviceAllocation recorded_tokens(allocated_head_rows * sizeof(std::uint32_t));
+  DeviceAllocation device_metrics(allocated_head_rows * sizeof(replay_metrics::Row));
+  PinnedHostAllocation host_reference(tile_bytes), host_metrics(allocated_head_rows * sizeof(replay_metrics::Row));
   CudaEvent gpu_begin, gpu_end;
   std::ofstream results(output / "results.jsonl");
   results.exceptions(std::ios::failbit | std::ios::badbit);
@@ -1120,9 +1289,11 @@ int run_replay_rollout(const std::string& artifact_path,
     const auto case_begin = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> input = request.prompt;
     input.insert(input.end(), request.continuation.begin(), request.continuation.end() - 1);
-    Executor engine(
-        weights, input.size(), 1, false, {}, nullptr, 0, {}, 0, {}, chunk_rows);
-    const auto stream = engine.stream();
+    std::unique_ptr<Executor> engine;
+    std::unique_ptr<gemma4_26b_a4b::sm120::ReplayCache> replay26;
+    if(is_26b) replay26=std::make_unique<gemma4_26b_a4b::sm120::ReplayCache>(*executor26,input.size(),chunk_rows,nullptr);
+    else engine.reset(new Executor(*weights,input.size(),1,false,{},nullptr,0,{},0,{},chunk_rows));
+    const auto stream = is_26b ? nullptr : engine->stream();
     std::ifstream reference(request.reference, std::ios::binary);
     if (!reference) fail("replay reference", "cannot open " + request.reference);
     std::ofstream metrics(output / (request.id + ".metrics.tsv"));
@@ -1138,10 +1309,14 @@ int run_replay_rollout(const std::string& artifact_path,
       check_cuda(cudaEventElapsedTime(&milliseconds, gpu_begin.get(), gpu_end.get()), "time replay GPU work");
       gpu_seconds += milliseconds / 1000.0;
     };
-    for (std::uint32_t base = 0; base < input.size(); base += chunk_rows) {
-      const auto rows = static_cast<std::uint32_t>(std::min<std::size_t>(chunk_rows, input.size() - base));
+    for (std::uint32_t base = 0; base < input.size();) {
+      const auto rows = static_cast<std::uint32_t>(is_26b ?
+          (base<request.prompt.size() ? std::min<std::size_t>(chunk_rows,request.prompt.size()-base) : 1) :
+          std::min<std::size_t>(chunk_rows,input.size()-base));
       check_cuda(cudaEventRecord(gpu_begin.get(), stream), "record replay prefill start");
-      engine.replay_chunk(input.data() + base, base, rows);
+      if(is_26b) replay26->forward(input.data()+base,base,rows,
+          base<request.prompt.size()?nvfp4::Phase::prefill:nvfp4::Phase::decode);
+      else engine->replay_chunk(input.data()+base,base,rows);
       finish_gpu();
       const auto score_begin = static_cast<std::uint32_t>(std::max<std::size_t>(base, request.prompt.size() - 1));
       for (std::uint32_t position = score_begin; position < base + rows; position += head_rows) {
@@ -1155,8 +1330,9 @@ int run_replay_rollout(const std::string& artifact_path,
             cudaMemcpyHostToDevice, stream), "copy replay reference logits");
         check_cuda(cudaMemcpyAsync(recorded_tokens.data(), request.continuation.data() + scored,
             count * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream), "copy replay recorded tokens");
-        engine.replay_head(position - base, count, static_cast<BFloat16*>(raw_logits.data()),
-                            static_cast<BFloat16*>(capped_logits.data()));
+        if(is_26b) replay26->head(position-base,count,static_cast<BFloat16*>(capped_logits.data()));
+        else engine->replay_head(position-base,count,static_cast<BFloat16*>(raw_logits->data()),
+                                 static_cast<BFloat16*>(capped_logits.data()));
         replay_metrics::compare_rows(static_cast<BFloat16*>(reference_logits.data()),
             static_cast<BFloat16*>(capped_logits.data()), static_cast<std::uint32_t*>(recorded_tokens.data()),
             count, model::kVocabSize, static_cast<replay_metrics::Row*>(device_metrics.data()), stream);
@@ -1174,6 +1350,7 @@ int run_replay_rollout(const std::string& artifact_path,
         }
         scored += count;
       }
+      base += rows;
     }
     if (scored != request.continuation.size() || reference.peek() != std::char_traits<char>::eof())
       fail("replay accounting", "prediction rows do not match the complete continuation");
@@ -1323,7 +1500,8 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
                        const std::string& assistant_path, const std::string& vision_path,
                        std::uint32_t prefill_budget_tokens, std::uint32_t mtp_min_depth,
                        std::uint32_t decode_width, const std::string& mtp_stats_path,
-                       std::uint32_t mtp_stats_window, const MtpCaptureSettings& mtp_capture) {
+                       std::uint32_t mtp_stats_window, const MtpCaptureSettings& mtp_capture,
+                       const MtpHeadSettings& mtp_head) {
   mtp_depth = effective_mtp_depth(mtp_depth, assistant_path, mtp_min_depth);
   if (!mtp_depth) mtp_min_depth = 0;
   if (!max_batch || max_batch > kMaxBatchRows || !kv_cache_gpu_mib ||
@@ -1331,6 +1509,8 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
     fail("batch configuration", "invalid batch capacity or GPU KV budget");
   auto requests = read_batch_requests(requests_path);
   auto events = read_batch_events(events_path, requests);
+  const auto selected_model = artifact_model(artifact_path);
+  const bool is_26b = selected_model == ModelKind::gemma4_26b_a4b;
   BatchLimits limits;
   limits.capacity = std::min<std::uint32_t>(max_batch, requests.size());
   limits.kv_bytes = kv_cache_gpu_mib * kv_cache::kMib;
@@ -1340,6 +1520,7 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
   limits.mtp_stats_path = mtp_stats_path;
   limits.mtp_stats_window = mtp_stats_window;
   limits.mtp_capture = mtp_capture;
+  limits.mtp_head = mtp_head;
   limits.prefill_chunk_tokens = checked_prefill_chunk_tokens(prefill_chunk_tokens);
   limits.prefill_batch_tokens = checked_prefill_batch_tokens(prefill_batch_tokens, limits.prefill_chunk_tokens);
   limits.prefill_budget_tokens = prefill_budget_tokens;
@@ -1361,9 +1542,13 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
       (mtp_depth && std::uint64_t(limits.capacity) * (mtp_depth + 1) > mtp_target::kMaxDepth + 1))
     fail("batch MTP", "batch size times (depth + 1) must not exceed 1280 verifier rows");
   const auto staging_bytes = mtp_depth
-      ? limits.capacity * mtp_target::Verifier::staging_bytes(mtp_depth + 1) : 0;
-  const auto config = sm120::compact_pool_config(limits.kv_bytes, 0, limits.index_bytes, limits.local_kv_format, limits.global_kv_format);
-  const auto hidden_bytes = (limits.kv_bytes / config.local_ring_bytes) * model::kHiddenSize * sizeof(BFloat16);
+      ? limits.capacity * (is_26b ? gemma4_26b_a4b::sm120::mtp_staging_bytes(mtp_depth + 1)
+                                  : mtp_target::Verifier::staging_bytes(mtp_depth + 1)) : 0;
+  const auto config = is_26b
+      ? kv_cache::compact_pool_config(gemma4_26b_a4b::sm120::kCacheGeometry, limits.kv_bytes, 0, limits.index_bytes, limits.local_kv_format, limits.global_kv_format)
+      : sm120::compact_pool_config(limits.kv_bytes, 0, limits.index_bytes, limits.local_kv_format, limits.global_kv_format);
+  const auto hidden_bytes = (limits.kv_bytes / config.local_ring_bytes) *
+      (is_26b ? gemma4_26b_a4b::kHiddenSize : model::kHiddenSize) * sizeof(BFloat16);
   if (!hidden_bytes || staging_bytes >= limits.kv_bytes || hidden_bytes >= limits.kv_bytes - staging_bytes)
     fail("batch configuration", "staging exceeds GPU KV budget");
   const auto pages = (std::size_t(limits.max_horizon) + config.global_page_tokens - 1) / config.global_page_tokens;
@@ -1374,8 +1559,6 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
     fail("batch output directory", "directory must be new");
   const std::filesystem::path output(output_directory);
   BatchSignalScope signals;
-  artifact::ArtifactFile file = artifact::ArtifactFile::Open(artifact_path);
-  const auto mask = qdq_mask_path.empty() ? qdq::Mask{} : qdq::Mask::Load(qdq_mask_path);
   validate_cuda_device();
   console::section("Batch generation");
   if (console::json_enabled())
@@ -1386,13 +1569,26 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
   console::field("batch_mtp_min_depth", mtp_min_depth);
   console::field("batch_decode_width", decode_width);
   console::field("batch_mtp_staging_bytes", staging_bytes);
-  if (console::json_enabled())
-    console::field("payload_sha256", artifact::digest_hex(file.header().payload_sha256));
-  if (console::json_enabled())
-    console::field("weight_qdq_mask_sha256", (mask.has_source() ? artifact::digest_hex(mask.source_sha256()) : "disabled"));
   const auto load_begin = std::chrono::steady_clock::now();
-  WeightArena weights(file, mask, mtp_depth ? assistant_path : "", vision_path);
-  console::field("weight_load_seconds", seconds_since(load_begin));
+  std::unique_ptr<WeightArena> weights;
+  std::unique_ptr<runtime::ExecutionBackend> backend;
+  if (is_26b) {
+    auto file = gemma4_26b_a4b::ArtifactFile::Open(artifact_path);
+    if (console::json_enabled()) {
+      console::field("payload_sha256", artifact::digest_hex(file.payload_hash()));
+    }
+    backend = gemma4_26b_a4b::sm120::make_runtime_backend(std::move(file), limits, activation_policy, assistant_path, vision_path, qdq_mask_path);
+  } else {
+    auto file = artifact::ArtifactFile::Open(artifact_path);
+    const auto mask = qdq_mask_path.empty() ? qdq::Mask{} : qdq::Mask::Load(qdq_mask_path);
+    if (console::json_enabled()) {
+      console::field("payload_sha256", artifact::digest_hex(file.header().payload_sha256));
+      console::field("weight_qdq_mask_sha256", mask.has_source() ? artifact::digest_hex(mask.source_sha256()) : "disabled");
+    }
+    weights = std::make_unique<WeightArena>(file, mask, mtp_depth ? assistant_path : "", vision_path);
+    backend = sm120::make_runtime_backend(*weights, limits, activation_policy);
+    console::field("weight_load_seconds", seconds_since(load_begin));
+  }
   BatchLogitWriter writer;
   struct Capture { std::unique_ptr<std::ofstream> output; std::future<void> pending; };
   std::map<std::string, Capture> captures;
@@ -1463,7 +1659,8 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
       else fail("batch compute", "injected failure; partial state cannot be handed off");
     }
   };
-  BatchScheduler scheduler(sm120::make_runtime_backend(weights, limits, activation_policy), limits, std::move(callbacks));
+  BatchScheduler scheduler(std::move(backend), limits, std::move(callbacks));
+  if (is_26b) console::field("weight_load_seconds", seconds_since(load_begin));
   current = &scheduler;
   for (auto& request : requests) scheduler.submit(std::move(request));
   scheduler.register_requests();
@@ -1486,7 +1683,7 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
 }
 
 BatchLimits live_batch_limits(std::uint32_t max_batch, const RuntimeSettings& settings,
-                              std::size_t max_connections) {
+                              std::size_t max_connections, ModelKind selected_model) {
   const auto kv_cache_gpu_mib = settings.kv_cache_gpu_mib;
   const auto mtp_depth = settings.mtp_depth;
   if (!max_connections || max_connections > 256 || !max_batch || max_batch > std::min<std::size_t>(max_connections, kMaxBatchRows) ||
@@ -1502,6 +1699,7 @@ BatchLimits live_batch_limits(std::uint32_t max_batch, const RuntimeSettings& se
   limits.mtp_stats_path = settings.mtp_stats_path;
   limits.mtp_stats_window = settings.mtp_stats_window;
   limits.mtp_capture = settings.mtp_capture;
+  limits.mtp_head = settings.mtp_head;
   limits.prefill_chunk_tokens = checked_prefill_chunk_tokens(settings.prefill_chunk_tokens);
   limits.prefill_batch_tokens = checked_prefill_batch_tokens(settings.prefill_batch_tokens, limits.prefill_chunk_tokens);
   limits.prefill_budget_tokens = settings.prefill_budget_tokens;
@@ -1519,9 +1717,15 @@ BatchLimits live_batch_limits(std::uint32_t max_batch, const RuntimeSettings& se
       ? settings.kv_checkpoint_interval_tokens : 0;
   limits.max_requests = max_connections;
   limits.sampled = limits.captures = limits.live = true;
-  const auto config = sm120::compact_pool_config(limits.kv_bytes, 0, limits.index_bytes, limits.local_kv_format, limits.global_kv_format);
-  const auto staging = mtp_depth ? max_batch * mtp_target::Verifier::staging_bytes(mtp_depth + 1) : 0;
-  const auto hidden = (limits.kv_bytes / config.local_ring_bytes) * model::kHiddenSize * sizeof(BFloat16);
+  const bool is_26b = selected_model == ModelKind::gemma4_26b_a4b;
+  const auto config = is_26b
+      ? kv_cache::compact_pool_config(gemma4_26b_a4b::sm120::kCacheGeometry, limits.kv_bytes, 0, limits.index_bytes, limits.local_kv_format, limits.global_kv_format)
+      : sm120::compact_pool_config(limits.kv_bytes, 0, limits.index_bytes, limits.local_kv_format, limits.global_kv_format);
+  const auto staging = mtp_depth ? max_batch * (is_26b
+      ? gemma4_26b_a4b::sm120::mtp_staging_bytes(mtp_depth + 1)
+      : mtp_target::Verifier::staging_bytes(mtp_depth + 1)) : 0;
+  const auto hidden = (limits.kv_bytes / config.local_ring_bytes) *
+      (is_26b ? gemma4_26b_a4b::kHiddenSize : model::kHiddenSize) * sizeof(BFloat16);
   if (staging >= limits.kv_bytes || hidden >= limits.kv_bytes - staging ||
       limits.kv_bytes - staging - hidden < config.local_ring_bytes + config.page_table_bytes + config.global_page_bytes)
     fail("batch server", "GPU budget cannot hold one execution and staging");
@@ -1538,13 +1742,20 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
                     const std::string& qdq_mask_path) {
   settings.mtp_depth = effective_mtp_depth(settings.mtp_depth, settings.assistant_path, settings.mtp_min_depth);
   if (!settings.mtp_depth) settings.mtp_min_depth = 0;
-  auto limits = live_batch_limits(max_batch, settings, http_settings.max_connections);
+  const auto selected_model = serving_model(model_directory);
+  const bool is_26b = selected_model == ModelKind::gemma4_26b_a4b;
+  auto limits = live_batch_limits(max_batch, settings, http_settings.max_connections, selected_model);
   limits.captures = false;
   limits.logprobs = true;
   console::section("GeWell - HTTP inference server");
   console::field("server_model", http_settings.model);
   BatchSignalScope signals;
-  auto assets = gemma4_31b::ServingAssets::Open(model_directory);
+  std::optional<gemma4_31b::ServingAssets> assets31;
+  std::optional<gemma4_26b_a4b::ServingAssets> assets26;
+  if (is_26b) assets26.emplace(gemma4_26b_a4b::ServingAssets::Open(model_directory));
+  else assets31.emplace(gemma4_31b::ServingAssets::Open(model_directory));
+  auto& tokenizer = is_26b ? assets26->tokenizer : assets31->tokenizer;
+  const auto payload_hash = is_26b ? assets26->weights.payload_hash() : assets31->weights.header().payload_sha256;
   http::ImageSupport images;
   if (!settings.vision_path.empty()) {
     images.begin_token = model::kBeginImageTokenId;
@@ -1567,12 +1778,20 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
       return image;
     };
   }
-  http::Server transport(assets.tokenizer, http_settings, settings.mtp_depth + 1, std::move(images));
-  const auto mask = qdq_mask_path.empty() ? qdq::Mask{} : qdq::Mask::Load(qdq_mask_path);
+  http::Server transport(tokenizer, http_settings, settings.mtp_depth + 1, std::move(images));
   validate_cuda_device();
   const auto load_begin = std::chrono::steady_clock::now();
-  WeightArena weights(assets.weights, mask, settings.mtp_depth ? settings.assistant_path : "", settings.vision_path);
-  console::field("weight_load_seconds", seconds_since(load_begin));
+  std::unique_ptr<WeightArena> weights;
+  std::unique_ptr<runtime::ExecutionBackend> backend;
+  if (is_26b) {
+    backend = gemma4_26b_a4b::sm120::make_runtime_backend(std::move(assets26->weights), limits, settings.nvfp4_activation_policy, settings.assistant_path, settings.vision_path, qdq_mask_path);
+  } else {
+    const auto mask = qdq_mask_path.empty() ? qdq::Mask{} : qdq::Mask::Load(qdq_mask_path);
+    weights = std::make_unique<WeightArena>(assets31->weights, mask,
+        settings.mtp_depth ? settings.assistant_path : "", settings.vision_path);
+    backend = sm120::make_runtime_backend(*weights, limits, settings.nvfp4_activation_policy);
+    console::field("weight_load_seconds", seconds_since(load_begin));
+  }
   BatchScheduler* current = nullptr;
   std::map<http::ClientId, std::size_t> clients;
   std::vector<std::size_t> retired;
@@ -1597,7 +1816,7 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
     result.input_checkpoint = request.input_checkpoint;
     result.completion_checkpoint = request.completion_checkpoint;
     result.stopped = request.string_stopped ||
-        (!request.outputs.empty() && is_generation_stop_token(request.outputs.back()));
+        (!request.outputs.empty() && text_contract(selected_model).is_stop(request.outputs.back()));
     result.cache_stats = request.control_stats;
     transport.finish(request.client, result);
   };
@@ -1685,7 +1904,8 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
       if (found != clients.end()) current->cancel(found->second, inflight);
     }
   };
-  BatchScheduler scheduler(sm120::make_runtime_backend(weights, limits, settings.nvfp4_activation_policy), limits, std::move(callbacks));
+  BatchScheduler scheduler(std::move(backend), limits, std::move(callbacks));
+  if (is_26b) console::field("weight_load_seconds", seconds_since(load_begin));
   current = &scheduler;
   console::section("Serving");
   console::field("server_batch_capacity", max_batch);
@@ -1706,11 +1926,12 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
   console::field("server_max_body_total_bytes", http_settings.max_body_total_bytes);
   console::field("server_max_output_bytes", http_settings.max_output_bytes);
   console::field("server_socket_timeout_seconds", http_settings.socket_timeout_seconds);
-  console::field("server_image_limit", 1);
-  console::field("server_image_prompt_tokens", kMultimodalChunkTokens);
-  console::field("server_image_max_soft_tokens", settings.image_max_soft_tokens);
-  console::field("server_image_admission", "packed_prefill");
-  console::field("server_image_prefix_cache", true);
+  const bool image_enabled = !settings.vision_path.empty();
+  console::field("server_image_limit", image_enabled ? 1 : 0);
+  console::field("server_image_prompt_tokens", image_enabled ? kMultimodalChunkTokens : 0);
+  console::field("server_image_max_soft_tokens", image_enabled ? settings.image_max_soft_tokens : 0);
+  console::field("server_image_admission", image_enabled ? "packed_prefill" : "disabled");
+  console::field("server_image_prefix_cache", image_enabled);
   if (console::json_enabled()) {
     console::field("server_mode", "native_http");
     console::field("server_bind", http_settings.host + ":" + std::to_string(http_settings.port));
@@ -1718,7 +1939,7 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
     console::field("server_kv_cache_gpu_mib", settings.kv_cache_gpu_mib);
     console::field("server_kv_cache_cpu_mib", settings.kv_cache_cpu_mib);
     console::field("server_kv_cache_index_mib", settings.kv_cache_index_mib);
-    console::field("payload_sha256", artifact::digest_hex(assets.weights.header().payload_sha256));
+    console::field("payload_sha256", artifact::digest_hex(payload_hash));
     console::field("server_ready", true);
   } else {
     console::message("\nReady - http://" + http_settings.host + ":" + std::to_string(http_settings.port) +

@@ -2,6 +2,8 @@
 
 #include "gewell/bf16_primitives.h"
 #include "gewell/models/gemma4/31b/model.h"
+#include "gewell/models/gemma4/31b/component_weights.h"
+#include "gewell/models/gemma4/26b_a4b/component_weights.h"
 #include "gewell/vision_primitives.h"
 
 #include <cublasLt.h>
@@ -38,20 +40,25 @@ constexpr std::size_t align_up(std::size_t value, std::size_t alignment) {
   return ((value + alignment - 1) / alignment) * alignment;
 }
 
-constexpr std::size_t vision_weight_offset(std::size_t physical_id) {
-  std::size_t offset = 0;
-  for (std::size_t id = model::kVisionPatchProjectionPhysicalId;
-       id < physical_id; ++id) {
-    offset += align_up(
-        static_cast<std::size_t>(model::kPhysicalTensors[id].byte_count()),
-        model::kStorageAlignment);
-  }
-  return offset;
-}
+struct WeightLayout {
+  std::array<std::size_t, gemma4_26b_a4b::kVisionTensorCount> offsets{};
+  std::size_t bytes{};
+};
 
-constexpr std::size_t kComputedVisionWeightSliceBytes =
-    vision_weight_offset(model::kAssistantEmbeddingPhysicalId);
-static_assert(kComputedVisionWeightSliceBytes == kVisionWeightSliceBytes);
+WeightLayout weight_layout(vision_engine::Model selected) {
+  static_cast<void>(vision_engine::output_width(selected));
+  const auto specs = selected == vision_engine::Model::gemma4_26b_a4b
+      ? gemma4_26b_a4b::vision_tensor_specs()
+      : model::component_specs(model::Component::vision);
+  WeightLayout layout;
+  for (std::size_t i = 0; i < specs.size(); ++i) {
+    layout.offsets[i] = layout.bytes;
+    std::size_t bytes = sizeof(BFloat16);
+    for (const auto dimension : specs[i].shape) bytes *= dimension;
+    layout.bytes += align_up(bytes, 4096);
+  }
+  return layout;
+}
 
 struct AddressRange {
   std::uintptr_t begin{};
@@ -250,10 +257,15 @@ static_assert(static_cast<std::size_t>(model::kVisionHeadCount) *
 
 }  // namespace
 
+std::size_t vision_weight_slice_bytes(vision_engine::Model selected) {
+  return weight_layout(selected).bytes;
+}
+
 class VisionExecutor::Impl {
  public:
-  Impl(VisionWeightSlice weights, std::uint32_t soft_token_count)
-      : weights_(checked_weights(weights)),
+  Impl(vision_engine::Model selected, VisionWeightSlice weights, std::uint32_t soft_token_count)
+      : selected_(selected), output_width_(vision_engine::output_width(selected)),
+        layout_(weight_layout(selected)), weights_(checked_weights(weights, layout_.bytes)),
         soft_token_count_(soft_token_count),
         patch_rows_(checked_patch_rows(soft_token_count)),
         scratch_(patch_rows_),
@@ -266,7 +278,7 @@ class VisionExecutor::Impl {
         mlp_to_hidden_(patch_rows_, model::kVisionMlpSize,
                        model::kVisionHiddenSize),
         bridge_(soft_token_count_, model::kVisionHiddenSize,
-                model::kHiddenSize) {
+                output_width_) {
     bind_weights();
   }
 
@@ -292,7 +304,7 @@ class VisionExecutor::Impl {
   void run(const vision_engine::PrefillRequest& request, void* scratch_device,
            std::size_t scratch_capacity_bytes, cudaStream_t stream,
            CaptureSink* captures) const {
-    static_cast<void>(vision_engine::validate_prefill_request(request));
+    static_cast<void>(vision_engine::validate_prefill_request(request, selected_));
     if (request.image.soft_token_count != soft_token_count_) {
       throw std::invalid_argument(
           "vision request soft-token count differs from executor plan");
@@ -404,11 +416,11 @@ class VisionExecutor::Impl {
                 stream);
     capture(captures, "vision.soft_features",
             request.soft_features_bf16_device, CaptureDType::bf16,
-            soft_token_count_, model::kHiddenSize, stream);
+            soft_token_count_, output_width_, stream);
   }
 
  private:
-  static VisionWeightSlice checked_weights(VisionWeightSlice weights) {
+  static VisionWeightSlice checked_weights(VisionWeightSlice weights, std::size_t expected_bytes) {
     if (weights.base == nullptr) {
       throw std::invalid_argument("vision weight slice base is null");
     }
@@ -417,9 +429,9 @@ class VisionExecutor::Impl {
       throw std::invalid_argument(
           "vision weight slice must be 256-byte aligned");
     }
-    if (weights.bytes != kVisionWeightSliceBytes) {
+    if (weights.bytes != expected_bytes) {
       throw std::invalid_argument(
-          "vision weight slice must be exactly 1151897600 bytes");
+          "vision weight slice size does not match selected model");
     }
     static_cast<void>(
         address_range(weights.base, weights.bytes, "vision weight slice"));
@@ -435,34 +447,26 @@ class VisionExecutor::Impl {
     return soft_token_count * model::kVisionPoolSize * model::kVisionPoolSize;
   }
 
-  const BFloat16* weight(std::size_t physical_id) const {
-    if (physical_id < model::kVisionPatchProjectionPhysicalId ||
-        physical_id >= model::kAssistantEmbeddingPhysicalId) {
-      fail("bind vision weight", "physical ID is outside 832..1187");
-    }
+  const BFloat16* weight(std::size_t id) const {
     const auto* base = reinterpret_cast<const std::uint8_t*>(weights_.base);
-    return reinterpret_cast<const BFloat16*>(
-        base + vision_weight_offset(physical_id));
+    return reinterpret_cast<const BFloat16*>(base + layout_.offsets.at(id));
   }
 
   void bind_weights() {
-    patch_projection_ = weight(model::kVisionPatchProjectionPhysicalId);
-    position_embedding_ = weight(model::kVisionPositionEmbeddingPhysicalId);
+    namespace ids = gemma4_26b_a4b;
+    patch_projection_ = weight(ids::kVisionPatchProjectionId);
+    position_embedding_ = weight(ids::kVisionPositionEmbeddingId);
     for (std::size_t layer = 0; layer < layers_.size(); ++layer) {
-      const std::size_t base =
-          model::kVisionLayerWeightsFirstPhysicalId +
-          layer * model::kVisionLayerTensorCount;
+      const auto base = ids::kVisionLayerFirstId + layer * ids::kVisionLayerTensorCount;
       layers_[layer] = {
-          weight(base),      weight(base + 1),  weight(base + 2),
-          weight(base + 3),  weight(base + 4),  weight(base + 5),
-          weight(base + 6),  weight(base + 7),  weight(base + 8),
-          weight(base + 9),  weight(base + 10), weight(base + 11),
-          weight(base + 12),
-      };
+          weight(base), weight(base + 1), weight(base + 2), weight(base + 3),
+          weight(base + 4), weight(base + 5), weight(base + 6), weight(base + 7),
+          weight(base + 8), weight(base + 9), weight(base + 10), weight(base + 11),
+          weight(base + 12)};
     }
-    std_bias_ = weight(model::kVisionStdBiasPhysicalId);
-    std_scale_ = weight(model::kVisionStdScalePhysicalId);
-    projection_ = weight(model::kVisionProjectionPhysicalId);
+    std_bias_ = weight(ids::kVisionStdBiasId);
+    std_scale_ = weight(ids::kVisionStdScaleId);
+    projection_ = weight(ids::kVisionProjectionId);
   }
 
   void validate_scratch_ranges(const vision_engine::PrefillRequest& request,
@@ -478,7 +482,7 @@ class VisionExecutor::Impl {
         vision_engine::prepared_position_bytes(
             request.image.padded_patch_rows);
     const std::size_t output_bytes =
-        static_cast<std::size_t>(soft_token_count_) * model::kHiddenSize *
+        static_cast<std::size_t>(soft_token_count_) * output_width_ *
         sizeof(BFloat16);
     const std::array<AddressRange, 4> forbidden{{
         weights,
@@ -531,6 +535,9 @@ class VisionExecutor::Impl {
     return reinterpret_cast<T*>(base + offset);
   }
 
+  vision_engine::Model selected_;
+  std::uint32_t output_width_;
+  WeightLayout layout_;
   VisionWeightSlice weights_{};
   std::uint32_t soft_token_count_{};
   std::uint32_t patch_rows_{};
@@ -549,9 +556,9 @@ class VisionExecutor::Impl {
   const BFloat16* projection_{};
 };
 
-VisionExecutor::VisionExecutor(VisionWeightSlice weights,
+VisionExecutor::VisionExecutor(vision_engine::Model selected, VisionWeightSlice weights,
                                std::uint32_t soft_token_count)
-    : impl_(std::make_unique<Impl>(weights, soft_token_count)) {}
+    : impl_(std::make_unique<Impl>(selected, weights, soft_token_count)) {}
 
 VisionExecutor::~VisionExecutor() = default;
 VisionExecutor::VisionExecutor(VisionExecutor&&) noexcept = default;

@@ -194,37 +194,64 @@ struct GreedyBatch {
   GreedyDistributionInput inputs[kGreedyBatchEntries];
 };
 
+constexpr unsigned kGreedyTile = 4096;
+
+__global__ void initialize_greedy_batch_kernel(
+    const __grid_constant__ GreedyBatch batch) {
+  if (threadIdx.x == 0) *batch.inputs[blockIdx.x].best_scratch = UINT_MAX;
+}
+
+__device__ GreedyCandidate greedy_candidate(
+    const GreedyDistributionInput& input, std::uint32_t token) {
+  const float logit = __bfloat162float(input.logits[token]);
+  const float score = isfinite(logit) ? logit : 0.0F;
+  return {score == 0.0F ? 0.0F : score, token};
+}
+
 __global__ void greedy_best_batch_kernel(
     const __grid_constant__ GreedyBatch batch,
     std::uint32_t vocabulary_size) {
   using Reduce = cub::BlockReduce<GreedyCandidate, kThreads>;
   __shared__ typename Reduce::TempStorage reduction;
-  const auto& input = batch.inputs[blockIdx.x];
+  const auto& input = batch.inputs[blockIdx.y];
   GreedyCandidate best{-CUDART_INF_F, UINT_MAX};
   bool invalid = false;
-  for (std::uint32_t token = threadIdx.x; token < vocabulary_size;
+  const unsigned first = blockIdx.x * kGreedyTile;
+  const unsigned end = min(first + kGreedyTile, vocabulary_size);
+  for (std::uint32_t token = first + threadIdx.x; token < end;
        token += blockDim.x) {
-    const float logit = __bfloat162float(input.logits[token]);
-    invalid |= !isfinite(logit);
-    float score = isfinite(logit) ? logit : 0.0F;
+    invalid |= !isfinite(__bfloat162float(input.logits[token]));
+    auto candidate = greedy_candidate(input, token);
     if (input.allowed_tokens &&
         !(input.allowed_tokens[token / 32] &
           (std::uint32_t{1} << (token % 32))))
-      score = -CUDART_INF_F;
-    const GreedyCandidate candidate{score == 0.0F ? 0.0F : score, token};
+      candidate.score = -CUDART_INF_F;
     best = GreedyBetter{}(best, candidate);
   }
   best = Reduce(reduction).Reduce(best, GreedyBetter{});
   const bool invalid_row = __syncthreads_or(invalid);
   if (threadIdx.x != 0) return;
   if (invalid_row) set_error(input.status, Status::invalid_logits);
-  if (!isfinite(best.score))
-    set_error(input.status, Status::invalid_distribution);
-  *input.best_scratch = isfinite(best.score) ? best.token : UINT_MAX;
-  *input.selected_id = *input.status == Status::success &&
-                               best.token < vocabulary_size
-                           ? best.token
-                           : 0;
+  if (!isfinite(best.score)) return;
+  // The winner only improves under the total (score, lower-token-ID) order.
+  // Reuse the existing one-word scratch; no per-tile allocation is needed.
+  unsigned previous = atomicCAS(input.best_scratch, UINT_MAX, UINT_MAX);
+  while (previous == UINT_MAX ||
+         GreedyBetter{}(best, greedy_candidate(input, previous)).token == best.token) {
+    if (previous == best.token) break;
+    const unsigned observed = atomicCAS(input.best_scratch, previous, best.token);
+    if (observed == previous) break;
+    previous = observed;
+  }
+}
+
+__global__ void finalize_greedy_batch_kernel(
+    const __grid_constant__ GreedyBatch batch) {
+  if (threadIdx.x != 0) return;
+  const auto& input = batch.inputs[blockIdx.x];
+  const unsigned best = *input.best_scratch;
+  if (best == UINT_MAX) set_error(input.status, Status::invalid_distribution);
+  *input.selected_id = *input.status == Status::success ? best : 0;
 }
 
 __global__ void greedy_probabilities_batch_kernel(
@@ -1072,8 +1099,11 @@ void build_greedy_distributions(
     const auto count = static_cast<unsigned>(std::min<std::size_t>(
         kGreedyBatchEntries, inputs.size() - first));
     std::copy_n(inputs.begin() + first, count, batch.inputs);
-    greedy_best_batch_kernel<<<count, kThreads, 0, stream>>>(
-        batch, vocabulary_size);
+    initialize_greedy_batch_kernel<<<count, 1, 0, stream>>>(batch);
+    greedy_best_batch_kernel<<<
+        dim3((vocabulary_size + kGreedyTile - 1) / kGreedyTile, count),
+        kThreads, 0, stream>>>(batch, vocabulary_size);
+    finalize_greedy_batch_kernel<<<count, 1, 0, stream>>>(batch);
     check_cuda(cudaGetLastError(), "find batched MTP greedy winners");
     if (std::any_of(batch.inputs, batch.inputs + count,
                     [](const auto& input) { return input.output_probs; })) {

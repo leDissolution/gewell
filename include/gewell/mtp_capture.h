@@ -9,7 +9,12 @@ struct MtpCaptureSettings {
   std::string path;
   std::uint32_t every{32}, max_samples{250'000};
   // Completed target-layer counts, one-based; final norm is captured separately.
-  std::vector<std::uint32_t> layers{4, 12, 24, 40, 56};
+  std::vector<std::uint32_t> layers;  // Empty selects the loaded model's defaults.
+};
+
+struct MtpCaptureGeometry {
+  std::uint32_t target_width{}, assistant_width{}, layer_count{};
+  std::vector<std::uint32_t> default_layers;
 };
 
 struct MtpTargetProbes {

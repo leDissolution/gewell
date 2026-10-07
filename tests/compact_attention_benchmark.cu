@@ -22,7 +22,7 @@ namespace a = gewell::mtp_attention;
 namespace b = gewell::bf16_primitives;
 namespace m = gewell::gemma4_31b;
 using BF16 = gewell::mtp_target::BFloat16;
-using Cache = gewell::mtp_target::CacheView;
+using Cache = gewell::kv_cache::DeviceView;
 
 void check(cudaError_t status) {
   if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));

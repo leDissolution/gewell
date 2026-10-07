@@ -1,6 +1,6 @@
 #include "gewell/bf16_primitives.h"
 #include "gewell/prefill_primitives.h"
-#include "../src/models/gemma4/31b/sm120/kernels/rope_inverse_frequency.cuh"
+#include "../src/rope_inverse_frequency.cuh"
 #include "../src/models/gemma4/31b/sm120/kernels/bf16_attention_detail.cuh"
 
 #include <cuda_bf16.h>

@@ -8,6 +8,9 @@
 
 namespace gewell::vision_engine {
 
+enum class Model { gemma4_31b, gemma4_26b_a4b };
+std::uint32_t output_width(Model model);
+
 inline constexpr std::array<std::uint32_t, 5>
     kSupportedSoftTokenCapacities{70, 140, 280, 560, 1'120};
 static_assert(kSupportedSoftTokenCapacities[4] ==
@@ -72,7 +75,7 @@ struct PreparedImage {
 
 // Host-side description of one prefill-only vision invocation. Tensor pointers
 // point to CUDA device memory. The output is contiguous row-major BF16
-// [image.soft_token_count,5376]. Input and output device regions must not
+// [image.soft_token_count,output_width(model)]. Input and output device regions must not
 // overlap.
 struct PrefillRequest {
   PreparedImage image{};
@@ -85,7 +88,7 @@ struct PrefillRequest {
 // contract and are not inspected here. Throws std::invalid_argument on an
 // invalid request.
 [[nodiscard]] std::size_t validate_prefill_request(
-    const PrefillRequest& request);
+    const PrefillRequest& request, Model model);
 
 // Validates the little-endian processor-facing files before copying them to
 // CUDA. Pixel and position buffers must select the same supported padded

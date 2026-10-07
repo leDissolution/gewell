@@ -38,7 +38,7 @@ bundle is local, serving needs no Hugging Face connection.
 
 ## Convert safetensors
 
-Conversion uses Python 3.10+ and NumPy. `tools/convert.py` accepts a Gemma 4 31B safetensors directory or
+Conversion uses Python 3.10+ and NumPy. `tools/convert.py` accepts a Gemma 4 31B or 26B A4B safetensors directory or
 single file through `--snapshot`. Fine-tunes and repacked checkpoints are
 accepted when required tensor names, shapes, and storage layouts match.
 Shard names and counts are unrestricted. A safetensors index is optional;
@@ -65,10 +65,37 @@ The tokenizer defaults to `tokenizer.json` in the source directory. Use
 `--serving-snapshot DIR` when it is stored separately. Conversion keeps source files in place and
 refuses to replace existing output weights or a manifest. `--plan` validates
 metadata and scales without copying weights. BF16 text weights occupy about
-57.2 GiB; packed projections reduce that size. Conversion streams tensors,
+57.2 GiB for 31B and 47.0 GiB for 26B A4B; packed projections reduce that size. Conversion streams tensors,
 with temporary decoding storage bounded by one tensor.
 
 ## Select precision
+
+For Gemma 4 26B A4B, pass `--architecture gemma4_26b_a4b` to conversion,
+planning, and native repacking. Source import supports Google's stacked BF16
+experts and separately named expert projections, including NVIDIA's packed
+NVFP4 checkpoint. Omitted mask entries retain their source precision.
+
+```bash
+python3 tools/convert.py --architecture gemma4_26b_a4b \
+  --snapshot /path/to/gemma4-26b-a4b --plan
+python3 tools/convert.py --architecture gemma4_26b_a4b \
+  --snapshot /path/to/gemma4-26b-a4b --output /path/to/26b-bundle
+```
+
+26B layers are `0..29`, and experts are `0..127`. Plain `gate_proj`,
+`up_proj`, and `down_proj` select the shared MLP; use
+`experts.*.gate_proj` or `experts.7.down_proj` to select routed projections.
+Rules support `*` layers and later rules win. Attention, shared, and routed
+projections can each use BF16, FP8, or NVFP4. The router, norms, embeddings,
+and tied head remain BF16. Native NVFP4 pads physical output rows while
+preserving logical dimensions, including the 704-wide expert MLP.
+
+Both `--nvfp4-activation-policy always` and `prefill` apply to 26B execution.
+The latter uses BF16 activations with packed NVFP4 weights during decode.
+Conversion coverage and quality limits are described under
+[activation calibration](#activation-calibration).
+
+The remaining examples in this section use the 31B inventory.
 
 A mask contains `LAYER PROJECTION STORAGE` rules. `LAYER` is `*` or `0..59`;
 storage is `bf16`, `fp8_w8a8`, or `nvfp4_w4a4`. Projection names are `q_proj`,
@@ -139,7 +166,7 @@ this order:
 2. The source's `input_scale`, if retaining that projection's quantization format.
 3. The bundled reference calibration for missing scales and changed formats.
 
-The shipped `tools/default_calibration.json` contains measured activation
+The 31B profile, `tools/default_calibration.json`, contains measured activation
 absolute maxima for all 410 text projections. The reference run observed 74
 histories (64 text, eight image, two video), up to 32,641 input tokens, using
 BF16 forward activations and quantize/dequantize (QDQ) of packed all-NVFP4
@@ -149,6 +176,14 @@ reference measurements, not new measurements of the selected source or mask.
 Fine-tunes and different workloads may benefit from custom scales; the
 reference provenance never restricts which structurally compatible sources
 can be converted.
+
+26B conversion (`--architecture gemma4_26b_a4b`) uses
+`tools/gemma4_26b_default_calibration.json`. It supplies 11,683 measured ranges
+from 512 BF16 text prompts, capped at 512 tokens each, with observation counts
+and pinned source/corpus provenance. Its 42 uncovered expert projections have
+no default scale: a plan requesting them reports their names and requires
+source scales, explicit overrides, or an explicit BF16 mask entry. These
+measurements do not establish image, long-context, or quantized-model quality.
 
 When defaults are used, the converter prints one notice. `--plan` reports
 how many scales come from overrides, the source, and defaults. The output

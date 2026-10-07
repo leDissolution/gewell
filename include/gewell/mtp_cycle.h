@@ -2,6 +2,7 @@
 
 #include "gewell/mtp_sampling.h"
 #include "gewell/mtp_target.h"
+#include "gewell/mtp_assistant.h"
 #include "gewell/mtp_capture.h"
 
 #include <cstddef>
@@ -89,11 +90,55 @@ class Cycle final {
   std::unique_ptr<Impl> impl_;
 };
 
+// The shared sampling cycle owns no target weights. These two model adapters
+// supply verification and accepted-KV commit while preserving one acceptance,
+// constraint, logprob and capture implementation.
+using BatchCaches = std::vector<kv_cache::DeviceView>;
+struct TargetInput {
+  std::uint32_t base_position{}, rows{};
+  BatchCaches caches;
+  void* staging{};
+  std::size_t staging_size{};
+  std::uint32_t staging_capacity_rows{};
+  std::vector<mtp_target::LayerCapture> captures;
+};
+struct TargetCommit {
+  const BatchCaches* caches{};
+  std::uint32_t base_position{}, source_rows{}, capacity_rows{};
+  const void* staging{};
+  std::size_t staging_size{};
+  std::uint32_t commit_rows{};
+};
+class BatchTarget {
+ public:
+  virtual ~BatchTarget() = default;
+  virtual mtp_assistant::Model model() const = 0;
+  virtual mtp_assistant::Weights assistant_weights() const = 0;
+  virtual std::size_t staging_bytes(std::uint32_t rows) const = 0;
+  virtual std::size_t scratch_bytes() const = 0;
+  virtual void prepare(std::uint32_t rows) = 0;
+  virtual void run_batch(const std::uint32_t* tokens,
+                        const std::vector<TargetInput>& inputs, cudaStream_t stream) = 0;
+  virtual void commit_batch(const std::vector<TargetCommit>& inputs, cudaStream_t stream) = 0;
+  virtual const mtp_target::BFloat16* logits() const = 0;
+  virtual const mtp_target::BFloat16* hidden() const = 0;
+};
+std::unique_ptr<BatchTarget> make_31b_batch_target(
+    cublasLtHandle_t handle, const mtp_target::Weights& weights,
+    std::uint32_t capacity_rows, std::uint32_t context_capacity,
+    const nvfp4::Weights* native_weights, nvfp4::ActivationPolicy activation_policy,
+    const fp8::Weights* fp8_weights, attention::Compute local_compute,
+    attention::Compute global_compute);
+
+struct DeviceProbes {
+  std::vector<std::uint32_t> layers;
+  mtp_target::BFloat16* output{};  // Selected terminal row, [layers, hidden width].
+};
 struct BatchInput {
   std::uint32_t pending_token{};
   const mtp_target::BFloat16* target_hidden{};
   std::uint32_t position{}, depth{};
-  mtp_target::Caches caches{};
+  BatchCaches caches;
   float temperature{}, top_p{1.0F};
   std::uint32_t top_k{};
   // Greedy verification itself needs only winner IDs. Keep this true for
@@ -104,6 +149,7 @@ struct BatchInput {
   ConstraintMask constraint_mask;
   MtpCaptureFeatures* capture{};
   MtpTargetProbes* capture_next{};
+  DeviceProbes depth_probes;
 };
 
 struct BatchOutcome {
@@ -115,7 +161,7 @@ struct BatchOutcome {
 
 struct BatchCommitInput {
   std::uint32_t request{};
-  const mtp_target::Caches* caches{};
+  const BatchCaches* caches{};
   std::uint32_t count{};
 };
 
@@ -124,12 +170,9 @@ struct BatchCommitInput {
 // slice per active request and is owned/budgeted by the offline scheduler.
 class Batch final {
  public:
-  Batch(cublasLtHandle_t handle, const mtp_target::Weights& weights,
+  Batch(cublasLtHandle_t handle, std::unique_ptr<BatchTarget> target,
         std::uint32_t context_capacity, std::uint32_t capacity,
         std::uint32_t max_depth, void* staging, std::size_t staging_size,
-        const nvfp4::Weights* native_weights = nullptr,
-        nvfp4::ActivationPolicy activation_policy = nvfp4::ActivationPolicy::always,
-        const fp8::Weights* fp8_weights = nullptr,
         attention::Compute local_compute = attention::Compute::bf16,
         attention::Compute global_compute = attention::Compute::bf16);
   ~Batch();

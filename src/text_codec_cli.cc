@@ -1,4 +1,3 @@
-#include "gewell/models/gemma4/31b/serving_assets.h"
 #include "gewell/text_codec_cli.h"
 #include "gewell/chat_codec.h"
 
@@ -74,13 +73,12 @@ json process(const Tokenizer& tokenizer, const json& request) {
 
 }  // namespace
 
-int run_text_codec(const std::string& model_directory) {
-  const auto assets = gemma4_31b::ServingAssets::Open(model_directory);
+int run_text_codec(const Tokenizer& tokenizer) {
   std::string line;
   bool failed = false;
   while (std::getline(std::cin, line)) {
     try {
-      std::cout << process(assets.tokenizer, json::parse(line)).dump() << '\n';
+      std::cout << process(tokenizer, json::parse(line)).dump() << '\n';
     } catch (const std::exception& error) {
       std::cout << json({{"error", error.what()}}).dump() << '\n';
       failed = true;

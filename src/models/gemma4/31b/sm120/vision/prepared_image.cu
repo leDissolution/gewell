@@ -12,8 +12,8 @@ void reserve(std::unique_ptr<DeviceAllocation>& buffer, std::size_t bytes) {
 }
 
 PreparedImage::PreparedImage(const WeightArena& weights)
-    : tower_({weights.pointer(model::kVisionPatchProjectionPhysicalId),
-              vision_executor::kVisionWeightSliceBytes}, 1) {}
+    : tower_(vision_engine::Model::gemma4_31b, {weights.pointer(model::kVisionPatchProjectionPhysicalId),
+              vision_executor::vision_weight_slice_bytes(vision_engine::Model::gemma4_31b)}, 1) {}
 
 void PreparedImage::prepare(const std::vector<std::uint8_t>& pixels,
     const std::vector<std::uint8_t>& positions, std::uint32_t padded_patch_rows,

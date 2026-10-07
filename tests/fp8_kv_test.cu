@@ -1,10 +1,13 @@
 #include "gewell/bf16_primitives.h"
+#include "gewell/models/gemma4/26b_a4b/cache_config.h"
+#include "models/gemma4/26b_a4b/sm120/attention.cuh"
 #include "gewell/prefill_primitives.h"
 #include "gewell/mtp_attention.h"
 #include "gewell/mtp_assistant.h"
-#include "../src/models/gemma4/31b/sm120/cache.h"
+#include "../src/runtime/physical_cache.h"
+#include "../src/models/gemma4/31b/sm120/resources.cuh"
 #include "../src/models/gemma4/31b/sm120/cache_config.h"
-#include "../src/models/gemma4/31b/sm120/kernels/kv_storage.cuh"
+#include "kv_storage.cuh"
 #include "../src/models/gemma4/31b/sm120/mtp/fp8_quantize.cuh"
 
 #include <algorithm>
@@ -24,7 +27,7 @@ namespace a = gewell::mtp_attention;
 namespace m = gewell::gemma4_31b;
 namespace kv = gewell::kv_cache;
 using BF16 = __nv_bfloat16;
-using Cache = gewell::mtp_target::CacheView;
+using Cache = gewell::kv_cache::DeviceView;
 void check(cudaError_t status) {
   if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
@@ -211,7 +214,7 @@ void packed_loads() {
 struct Fixture {
   static constexpr unsigned Capacity = 5376, Pages = 21;
   unsigned Base;
-  unsigned rows, heads, d, width, capacity;
+  unsigned rows, query_heads, heads, d, width, capacity;
   bool global, paged;
   std::size_t stride, ref_stride;
   Device key_cache, value_cache, ref_key, ref_value, offsets, ref_offsets;
@@ -220,8 +223,8 @@ struct Fixture {
   p::CompactGlobalPagedCache page{}, ref_page{};
   std::vector<BF16> hq, hk, hv;
 
-  Fixture(bool global, bool paged, unsigned rows, unsigned base = 1030)
-      : Base(base), rows(rows), heads(global ? 4 : 16), d(global ? 512 : 256),
+  Fixture(bool global, bool paged, unsigned rows, unsigned base = 1030, unsigned queries = 32)
+      : Base(base), rows(rows), query_heads(queries), heads(global ? queries / 8 : queries / 2), d(global ? 512 : 256),
         width(global ? 640 : 256), capacity(global ? Capacity : 1024),
         global(global), paged(paged),
         stride(heads * 256 * kv::row_words(width, kv::Format::fp8, global ? 2 : 1) + 64),
@@ -230,7 +233,7 @@ struct Fixture {
         value_cache(global ? 2 : key_cache.bytes),
         ref_key(paged ? (Pages * ref_stride + 64) * 2 : heads * capacity * width * 2),
         ref_value(global ? 2 : ref_key.bytes), offsets(Pages * 8), ref_offsets(Pages * 8),
-        query(32 * rows * d * 2), key(heads * rows * d * 2), value(key.bytes),
+        query(queries * rows * d * 2), key(heads * rows * d * 2), value(key.bytes),
         norm(d * 2), output(query.bytes), reference(query.bytes),
         scratch(std::max(p::tensor_attention_scratch_bytes(rows),
                         a::scratch_bytes(std::min(rows, 1280U), Capacity))) {
@@ -278,7 +281,9 @@ struct Fixture {
         }
       }
     }
-    if (Base) {
+    if (query_heads == 16) {
+      key_cache.upload(expected); value_cache.upload(expected_v);
+    } else if (Base) {
       Device dk(pk.size() * 2), dv(pv.size() * 2); dk.upload(pk); dv.upload(pv);
       if (paged) p::write_kv_cache_chunk_global_compact_paged(dk.get(), dv.get(), page, 0, Base);
       else if (global) p::write_kv_cache_chunk_global_compact(dk.get(), dv.get(), cache.key, 0, Base, capacity, nullptr, cache.format);
@@ -287,8 +292,8 @@ struct Fixture {
     require(key_cache.host() == expected, "FP8 K/compact packing or guards differ from CPU oracle");
     if (!global) require(value_cache.host() == expected_v, "FP8 V packing or guards differ from CPU oracle");
     ref_key.upload(restored); ref_value.upload(restored_v);
-    hq.resize(32 * rows * d); hk.resize(heads * rows * d); hv.resize(hk.size());
-    for (unsigned h = 0; h < 32; ++h)
+    hq.resize(query_heads * rows * d); hk.resize(heads * rows * d); hv.resize(hk.size());
+    for (unsigned h = 0; h < query_heads; ++h)
       for (unsigned r = 0; r < rows; ++r)
         for (unsigned dim = 0; dim < d; ++dim) hq[(h * rows + r) * d + dim] = pattern(1, Base + r, h, dim);
     for (unsigned h = 0; h < heads; ++h)
@@ -451,16 +456,18 @@ struct Fixture {
     const unsigned visible = global ? Base + (frozen ? 0 : rows) : std::min(1024U, Base + rows);
     unsigned limit = std::min(256U, (visible + 31) / 32);
     if (global && Base + rows < 16384) limit = std::min(limit, 128U / std::min(rows, 8U));
-    std::uint64_t work = 0;
     const unsigned group_rows = global ? (frozen ? 2 : 4) : 8;
-    for (unsigned first = 0; first < rows; first += 8) {
-      const unsigned count = std::min(8U, rows - first), end = Base + (frozen ? 0 : first + count);
-      work += std::uint64_t((count + group_rows - 1) / group_rows) * (global ? end : std::min(1024U, end));
-    }
     const auto scale = [](float x) { return x > 0 ? x / 448 : 1; };
-    for (unsigned head : {0U, 17U, 31U}) {
-      const unsigned h = head / (32 / heads);
+    for (unsigned head : {0U, query_heads / 2 + 1, query_heads - 1}) {
+      const unsigned h = head / (query_heads / heads);
       for (unsigned r : {0U, rows / 2, rows - 1}) {
+        // Shared launch descriptors carry at most 32 eight-row query tiles.
+        const unsigned first_tile = r / 256 * 256;
+        std::uint64_t work = 0;
+        for (unsigned first = first_tile; first < std::min(rows, first_tile + 256); first += 8) {
+          const unsigned count = std::min(8U, rows - first), end = Base + (frozen ? 0 : first + count);
+          work += std::uint64_t((count + group_rows - 1) / group_rows) * (global ? end : std::min(1024U, end));
+        }
         const unsigned tile_end = Base + (frozen ? 0 : std::min(rows, (r / 8 + 1) * 8));
         const unsigned tile_visible = global ? tile_end : std::min(1024U, tile_end);
         const unsigned budget = ((global ? 128U : 64U) * std::uint64_t(tile_visible) + work - 1) / work;
@@ -540,7 +547,7 @@ struct Fixture {
           float numerator = 0;
           for (unsigned split = 0; split < splits; ++split)
             numerator = std::fma(std::exp(maxima[split] - maximum), part[split * d + dim], numerator);
-          const float expected = fp(bf(numerator / denominator)), observed = fp(out[(r * 32 + head) * d + dim]);
+          const float expected = fp(bf(numerator / denominator)), observed = fp(out[(r * query_heads + head) * d + dim]);
           if (!std::isfinite(observed) || std::fabs(expected - observed) > 0.00004F + std::fabs(expected) * 0.012F)
             throw std::runtime_error("FP8 decode oracle mismatch global=" + std::to_string(global) + " frozen=" + std::to_string(frozen) + " rows=" + std::to_string(rows) + " head=" + std::to_string(head) + " row=" + std::to_string(r) + " dim=" + std::to_string(dim) + " expected=" + std::to_string(expected) + " actual=" + std::to_string(observed));
         }
@@ -551,7 +558,7 @@ struct Fixture {
   void fp8_decode_compute() {
     const auto kind = global ? m::AttentionKind::global : m::AttentionKind::local;
     const auto original_k = key_cache.host(), original_v = value_cache.host();
-    const auto bytes = a::scratch_bytes(rows, Capacity);
+    const auto bytes = a::fp8_scratch_bytes(query_heads, rows, Capacity);
     Device arena(bytes + 64);
     arena.upload(std::vector<unsigned char>(arena.bytes, 0xa5));
     for (bool frozen : {false, true}) {
@@ -559,12 +566,34 @@ struct Fixture {
       const auto input = [&](const Cache& c, BF16* out) {
         return a::BatchInput{query.get(), frozen ? nullptr : key.get(), frozen ? nullptr : value.get(), c, Base, rows, out};
       };
-      a::run_fp8_batch({input(cache, output.get())}, norm.get(), kind, arena.get<void>(), bytes, nullptr, frozen);
+      a::run_fp8_batch(query_heads, {input(cache, output.get())}, norm.get(), kind, arena.get<void>(), bytes, nullptr, frozen);
       fp8_decode_reference(frozen);
-      a::run_fp8_batch({input(ref, reference.get())}, norm.get(), kind, arena.get<void>(), bytes, nullptr, frozen);
+      a::run_fp8_batch(query_heads, {input(ref, reference.get())}, norm.get(), kind, arena.get<void>(), bytes, nullptr, frozen);
       fp8_decode_reference(frozen, false);
+      if (query_heads == 16 && !frozen && (!global || paged || !Base)) {
+        // Qualify the 26B token-major layout adapter against the separately
+        // checked head-major FP8 path for both stored-cache formats.
+        std::vector<BF16> qt(hq.size()), kt(hk.size());
+        for (unsigned r = 0; r < rows; ++r) {
+          for (unsigned h = 0; h < query_heads; ++h)
+            std::copy_n(hq.data() + (h * rows + r) * d, d, qt.data() + (r * query_heads + h) * d);
+          for (unsigned h = 0; h < heads; ++h)
+            std::copy_n(hk.data() + (h * rows + r) * d, d, kt.data() + (r * heads + h) * d);
+        }
+        Device dq(query.bytes), dk(key.bytes), result(output.bytes); dq.upload(qt); dk.upload(kt);
+        using Compute = gewell::attention::Compute;
+        gewell::gemma4_26b_a4b::sm120::AttentionWorkspace workspace(rows,
+            global ? Compute::bf16 : Compute::fp8, global ? Compute::fp8 : Compute::bf16);
+        cublasHandle_t handle{}; require(cublasCreate(&handle) == CUBLAS_STATUS_SUCCESS, "create layout adapter handle");
+        for (bool packed : {false, true}) {
+          workspace.run(handle, dq.get(), dk.get(), value.get(), norm.get(), packed ? cache : ref,
+                        global, Base, rows, result.get());
+          require(result.host() == (packed ? output.host() : reference.host()), "26B FP8 token-major adapter changed output");
+        }
+        cublasDestroy(handle);
+      }
       const auto original = output.host();
-      for (unsigned count : {2U, 33U}) {
+      for (unsigned count : (rows > 256 ? std::vector<unsigned>{2U} : std::vector<unsigned>{2U, 33U})) {
         Device actual(count * output.bytes), control(actual.bytes);
         std::vector<a::BatchInput> inputs, controls;
         for (unsigned i = 0; i < count; ++i) {
@@ -573,10 +602,10 @@ struct Fixture {
         }
         cudaStream_t stream; cudaGraph_t graph; cudaGraphExec_t executable;
         check(cudaStreamCreate(&stream)); check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        a::run_fp8_batch(inputs, norm.get(), kind, arena.get<void>(), bytes, stream, frozen);
+        a::run_fp8_batch(query_heads, inputs, norm.get(), kind, arena.get<void>(), bytes, stream, frozen);
         check(cudaStreamEndCapture(stream, &graph)); check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         check(cudaGraphLaunch(executable, stream)); check(cudaStreamSynchronize(stream));
-        a::run_fp8_batch(controls, norm.get(), kind, arena.get<void>(), bytes, stream, frozen);
+        a::run_fp8_batch(query_heads, controls, norm.get(), kind, arena.get<void>(), bytes, stream, frozen);
         check(cudaStreamSynchronize(stream));
         require(actual.host() == control.host(), "FP8 mixed-cache graph differs from eager execution");
         check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph)); check(cudaStreamDestroy(stream));
@@ -585,16 +614,16 @@ struct Fixture {
         auto poisoned = hv;
         std::fill(poisoned.end() - heads * d, poisoned.end(), bf(NAN));
         value.upload(poisoned);
-        a::run_fp8_batch({input(cache, output.get())}, norm.get(), kind, arena.get<void>(), bytes, nullptr);
+        a::run_fp8_batch(query_heads, {input(cache, output.get())}, norm.get(), kind, arena.get<void>(), bytes, nullptr);
         auto changed = output.host();
-        require(std::equal(original.begin(), original.begin() + (rows - 1) * 32 * d * 2, changed.begin()), "FP8 future values changed earlier queries");
+        require(std::equal(original.begin(), original.begin() + (rows - 1) * query_heads * d * 2, changed.begin()), "FP8 future values changed earlier queries");
         value.upload(hv);
       }
     }
     const auto guard = arena.host();
     require(std::all_of(guard.end() - 64, guard.end(), [](auto x) { return x == 0xa5; }), "FP8 attention scratch overrun");
     require(original_k == key_cache.host() && original_v == value_cache.host(), "FP8 compute changed KV");
-    std::cout << "FP8 decode/verification/frozen compute global=" << global << " paged=" << paged << " rows=" << rows << " base=" << Base << " passed\n";
+    std::cout << "FP8 decode/verification/frozen compute query_heads=" << query_heads << " global=" << global << " paged=" << paged << " rows=" << rows << " base=" << Base << " passed\n";
   }
 
   void mtp_batch(bool misaligned = false) {
@@ -995,14 +1024,17 @@ __global__ void check_storage(const unsigned* data, std::size_t words, unsigned*
   auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < words && data[i] != unsigned(i * 2654435761U)) atomicOr(failed, 1U);
 }
-void checkpoint_copies() {
+void checkpoint_copies(kv::CompactGeometry geometry, kv::Format format) {
   namespace s = gewell::gemma4_31b::sm120;
-  const auto config = s::compact_pool_config(1536ULL << 20, 425ULL << 20,
-      64ULL << 20, kv::Format::fp8, kv::Format::fp8);
-  require(config.local_ring_bytes == (425ULL << 20) && config.global_page_bytes == 6717440,
-      "FP8 physical cache accounting");
+  const auto config = kv::compact_pool_config(geometry,1536ULL << 20,512ULL << 20,
+      64ULL << 20,format,format);
+  const bool moe = geometry.layers == 30;
+  const auto expected_local = moe ? (format == kv::Format::bf16 ? 209715200ULL : 111411200ULL) : 445644800ULL;
+  const auto expected_global = moe ? (format == kv::Format::bf16 ? 3276800ULL : 1679360ULL) : 6717440ULL;
+  require(config.local_ring_bytes == expected_local && config.global_page_bytes == expected_global,
+      "physical cache accounting");
   kv::CacheLedger ledger(config);
-  s::PhysicalCache storage(config, ledger, 1024);
+  gewell::runtime::PhysicalCache storage(geometry, config, ledger, 1024);
   const auto bytes = config.local_ring_bytes;
   kv::ExecutionInfo source{}, destination{};
   source.processed_tokens = 1030;
@@ -1026,7 +1058,24 @@ void checkpoint_copies() {
     check_storage<<<(words + 255) / 256, 256>>>(dst, words, failed.get<unsigned>());
     require(failed.host() == std::vector<unsigned char>(4, 0), "FP8 fork or checkpoint restore changed payload/scales");
   }
-  std::cout << "FP8 ring fork, GPU snapshot, CPU spill/restore passed\n";
+  const auto page_a = ledger.try_allocate_gpu(config.global_page_bytes);
+  const auto page_b = ledger.try_allocate_gpu(config.global_page_bytes);
+  const auto page_cpu = ledger.try_allocate_cpu(config.global_page_bytes);
+  auto* page_source = static_cast<unsigned*>(storage.device_pointer(page_a));
+  auto* page_destination = static_cast<unsigned*>(storage.device_pointer(page_b));
+  const auto page_words = config.global_page_bytes/4;
+  fill_storage<<<(page_words+255)/256,256>>>(page_source,page_words);
+  storage.copy_global_page(page_a,page_b,{});
+  check(cudaMemset(failed.get<void>(),0,4));
+  check_storage<<<(page_words+255)/256,256>>>(page_destination,page_words,failed.get<unsigned>());
+  require(failed.host() == std::vector<unsigned char>(4,0),"global page copy changed bytes");
+  storage.spill(page_a,page_cpu,config.global_page_bytes,"test global spill");
+  check(cudaMemset(page_destination,0,config.global_page_bytes));
+  storage.restore_global_page(page_cpu,page_b,{});
+  check_storage<<<(page_words+255)/256,256>>>(page_destination,page_words,failed.get<unsigned>());
+  require(failed.host() == std::vector<unsigned char>(4,0),"global page restore changed bytes");
+  std::cout << "cache layers=" << geometry.layers << " format=" << kv::format_name(format)
+            << " ring fork, GPU snapshot, CPU spill/restore and global page copies passed\n";
 }
 
 // A kernel diagnostic, not a model/quality benchmark. Every request has its
@@ -1083,7 +1132,7 @@ void benchmark_decode_compute(unsigned base, unsigned rows, bool global) {
   check(cudaStreamCreate(&stream)); check(cudaEventCreate(&start)); check(cudaEventCreate(&end));
   for (bool fp8 : {false, true}) {
     const auto run = [&] {
-      if (fp8) a::run_fp8_batch(inputs, norm.get(), kind, scratch.get<void>(), scratch.bytes, stream, frozen);
+      if (fp8) a::run_fp8_batch(32, inputs, norm.get(), kind, scratch.get<void>(), scratch.bytes, stream, frozen);
       else if (frozen) a::run_frozen_global_batch(inputs, norm.get(), scratch.get<void>(), scratch.bytes, stream);
       else a::run_batch(inputs, norm.get(), kind, scratch.get<void>(), scratch.bytes, stream);
     };
@@ -1115,6 +1164,12 @@ void benchmark_decode_compute(unsigned base, unsigned rows, bool global) {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--checkpoint-copies") {
+      checkpoint_copies(gewell::gemma4_31b::sm120::kCacheGeometry,kv::Format::fp8);
+      checkpoint_copies(gewell::gemma4_26b_a4b::sm120::kCacheGeometry,kv::Format::bf16);
+      checkpoint_copies(gewell::gemma4_26b_a4b::sm120::kCacheGeometry,kv::Format::fp8);
+      return 0;
+    }
     if (argc == 2 && (std::string(argv[1]) == "--local-verify" ||
                       std::string(argv[1]) == "--local-verify-sanitize")) {
       const bool sanitize = std::string(argv[1]) == "--local-verify-sanitize";
@@ -1151,6 +1206,24 @@ int main(int argc, char** argv) {
     if (argc == 5 && std::string(argv[1]) == "--benchmark-decode-compute") {
       require(std::string(argv[4]) == "global" || std::string(argv[4]) == "local", "benchmark attention kind");
       benchmark_decode_compute(std::stoul(argv[2]), std::stoul(argv[3]), std::string(argv[4]) == "global");
+      return 0;
+    }
+    if (argc == 2 && (std::string(argv[1]) == "--decode-compute-26b" ||
+                      std::string(argv[1]) == "--decode-compute-26b-sanitize" ||
+                      std::string(argv[1]) == "--decode-compute-26b-wide")) {
+      const bool sanitize = std::string(argv[1]) == "--decode-compute-26b-sanitize";
+      const bool wide = std::string(argv[1]) == "--decode-compute-26b-wide";
+      if (wide) {
+        for (unsigned rows : {257U, 1280U, 4096U}) for (bool global : {false, true}) {
+          Fixture fixture(global, global, rows, 0, 16); fixture.fp8_decode_compute();
+        }
+      } else {
+        for (unsigned base : (sanitize ? std::vector<unsigned>{1030U} : std::vector<unsigned>{0U, 1U, 1030U, 4095U}))
+          for (unsigned rows : (sanitize ? std::vector<unsigned>{1U, 3U} : std::vector<unsigned>{1U, 3U, 8U, 17U}))
+            for (unsigned layout = 0; layout < 3; ++layout) {
+              Fixture fixture(layout != 0, layout == 2, rows, base, 16); fixture.fp8_decode_compute();
+            }
+      }
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--decode-compute") {
@@ -1221,7 +1294,9 @@ int main(int argc, char** argv) {
       }
     accepted_commits(false);
     accepted_commits(true);
-    checkpoint_copies();
+    checkpoint_copies(gewell::gemma4_31b::sm120::kCacheGeometry,kv::Format::fp8);
+    checkpoint_copies(gewell::gemma4_26b_a4b::sm120::kCacheGeometry,kv::Format::bf16);
+    checkpoint_copies(gewell::gemma4_26b_a4b::sm120::kCacheGeometry,kv::Format::fp8);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

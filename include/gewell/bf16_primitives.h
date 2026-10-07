@@ -264,7 +264,8 @@ void causal_gqa_attention_m2(const BFloat16* query, const BFloat16* key,
 
 // Apply one position's split-half RoPE without changing the head-major
 // [heads,D] layout. The multiply/multiply/add BF16 boundaries are identical to
-// apply_rope_transpose_m2. `heads` must be 32 or the selected kind's KV count.
+// apply_rope_transpose_m2. `heads` supports 16/32 query heads or the selected
+// kind's 31B KV count. Both models share these RoPE factors and boundaries.
 void apply_rope_m1(const BFloat16* input, const BFloat16* cos,
                    const BFloat16* sin, BFloat16* output,
                    std::uint32_t heads, gemma4_31b::AttentionKind kind,

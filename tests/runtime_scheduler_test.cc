@@ -126,6 +126,14 @@ class TestBackend final : public ExecutionBackend {
   }
   void summarize_batch_row(std::uint32_t, const SamplingSettings&, std::uint32_t, const std::uint32_t*) override {}
   void check_constraint_sampling() override {}
+  std::vector<std::vector<MtpDepthInput>> head_inputs;
+  std::vector<std::uint32_t> predict_mtp_depths(const std::vector<MtpDepthInput>& inputs) override {
+    head_inputs.push_back(inputs);
+    std::vector<std::uint32_t> result;
+    for (const auto& input : inputs)
+      result.push_back(head_inputs.size() % 2 ? input.min_depth : input.max_depth);
+    return result;
+  }
   BatchMtpOutcome run_batch_mtp(const std::vector<BatchMtpInput>& inputs) override {
     require(!image_live, "MTP overlapped in-flight image features");
     if (fail_mtp_execution) throw std::runtime_error("injected MTP execution failure");
@@ -187,7 +195,7 @@ class TestBackend final : public ExecutionBackend {
   std::size_t output_bytes() const override { return 0; }
   std::size_t host_scratch_bytes() const override { return 0; }
   std::size_t sampling_scratch_bytes() const override { return 0; }
-  BackendLimits supported{64,64,4,3,16,8,16,8,128,{63},8};
+  BackendLimits supported{64,64,4,3,16,8,16,8,128,{63},8, {2,1,60,{4,12,24,40,56}}};
   kv_cache::PoolConfig config_;
   PersistentCacheManager* cache{};
   std::uint32_t chunk_cap{4}, prefill_rows{};
@@ -464,6 +472,59 @@ void adaptive_decode_depth() {
     try { BatchScheduler scheduler(std::make_unique<TestBackend>(), configured, output.callbacks()); }
     catch (const std::runtime_error& e) { rejected = std::string(e.what()).find("invalid scheduler limits") != std::string::npos; }
     require(rejected, "minimum depth greater than maximum was accepted");
+  }
+}
+void learned_decode_depth() {
+  for (bool head : {false, true}) for (unsigned width : {0U, 8U}) {
+    if (head && width) continue;
+    Output output;
+    auto configured = limits(3);
+    configured.mtp_head.path = head ? "test-head" : "";
+    configured.mtp_head.tail_fraction = .5F;
+    configured.decode_width = width;
+    bool rejected = false;
+    try { BatchScheduler scheduler(std::make_unique<TestBackend>(), configured, output.callbacks()); }
+    catch (const std::runtime_error& e) { rejected = std::string(e.what()).find("tail fraction") != std::string::npos; }
+    require(rejected, "tail fraction without a head or positive width was silently ignored");
+  }
+  for (const unsigned floor : {0U, 2U}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    auto configured = limits(3);
+    configured.mtp_head.path = "test-head";
+    configured.mtp_head.tail_fraction = .5F;
+    configured.mtp_min_depth = floor;
+    configured.decode_width = 8;
+    configured.prefill_budget_tokens = 32;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("a", {2,3}, 4));
+    scheduler.submit(request("b", {4,5}, 14));
+    auto ordinary = request("c", {6,7}, 7); ordinary.ordinary_decode = true;
+    scheduler.submit(std::move(ordinary));
+    run(scheduler);
+    require(!device->head_inputs.empty(), "learned depth was never queried");
+    require(device->head_inputs.front().at(1).max_depth == 3,
+            "shared budget applied a uniform per-request depth cap before prediction");
+    for (std::size_t cycle = 0; cycle < device->head_inputs.size(); ++cycle) {
+      const auto& inputs = device->head_inputs[cycle];
+      require(inputs.size() == device->decode_depths[cycle].size(), "head lost batch rows");
+      for (std::size_t row = 0; row < inputs.size(); ++row) {
+        const auto& input = inputs[row];
+        const auto depth = device->decode_depths[cycle][row];
+        require(depth >= input.min_depth && depth <= input.max_depth, "learned depth escaped bounds");
+        require(input.position == 2 + input.output_begin - 1, "head position/output alignment");
+        require(input.previous_accepted <= input.previous_depth && input.prior_accepted <= input.prior_proposed,
+                "head included future acceptance");
+        require(input.target_hidden.value != nullptr, "missing terminal state for learned round");
+      }
+    }
+    require(output.tokens["a"].size() == 4 && output.tokens["b"].size() == 14 && output.tokens["c"].size() == 7,
+            "learned depth violated output limits");
+    if (!floor) {
+      require(device->decode_depths.front() == std::vector<std::uint32_t>{0,0,0}, "zero-depth prediction lost");
+      require(device->decode_depths.at(1) == std::vector<std::uint32_t>{1,3,0}, "zero-depth round did not resume speculation");
+    }
+    require(device->states.empty() && device->cache->stats().execution_count == 0, "learned depth leaked state");
   }
 }
 void cancellation_and_backpressure(std::uint32_t budget = 0) {
@@ -1281,7 +1342,7 @@ int main() {
     using namespace gewell::runtime;
     packed_image_prefill(); packed_prefill(); packed_prefill_separate_limits(); packed_prefill_cancellation_and_failure();
     shared_prefix_and_seed(); cancellation_and_backpressure(); mtp_commit_and_stop_fallback(); failure_cleanup();
-    live_decode_accounting(); adaptive_decode_depth();
+    live_decode_accounting(); adaptive_decode_depth(); learned_decode_depth();
     mtp_failure_isolation(); windowed_mtp_statistics();
     logical_prefill_budgets(); logical_budget_under_kv_pressure(); cancellation_and_backpressure(16);
     logical_budget_failed_prefill();

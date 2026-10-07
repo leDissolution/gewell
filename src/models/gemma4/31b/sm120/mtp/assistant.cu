@@ -2,6 +2,7 @@
 
 #include "gewell/bf16_primitives.h"
 #include "gewell/mtp_attention.h"
+#include "gewell/models/gemma4/26b_a4b/model.h"
 #include "cuda.cuh"
 
 #include <cuda_runtime.h>
@@ -34,7 +35,7 @@ void check_cuda(cudaError_t status, const char* operation) {
     throw std::runtime_error(std::string("MTP assistant ") + operation + ": " + cudaGetErrorString(status));
 }
 
-void validate_cache(const FrozenCache& cache, model::AttentionKind kind) {
+void validate_cache(const FrozenCache& cache, model::AttentionKind kind, unsigned heads = 32) {
   require(cache.processed_tokens > 0 && cache.processed_tokens < 262'144,
           "frozen prefix must leave a valid pending position");
   if (kind == model::AttentionKind::local) {
@@ -50,7 +51,7 @@ void validate_cache(const FrozenCache& cache, model::AttentionKind kind) {
     require(cache.global.page_offsets && cache.global.page_tokens == 256 &&
                 cache.global.page_count >= (cache.processed_tokens + 255) / 256,
             "global page table does not cover the frozen prefix");
-    const std::size_t layer_elements = static_cast<std::size_t>(4) * 256 * kv_cache::row_words(640, cache.global.format, 2);
+    const std::size_t layer_elements = static_cast<std::size_t>(heads / 8) * 256 * kv_cache::row_words(640, cache.global.format, 2);
     require(cache.global.page_stride_elements >= layer_elements &&
                 cache.global.layer_offset_elements <= cache.global.page_stride_elements - layer_elements,
             "global layer view exceeds a page");
@@ -60,8 +61,8 @@ void validate_cache(const FrozenCache& cache, model::AttentionKind kind) {
   }
 }
 
-mtp_target::CacheView global_cache_view(const FrozenCache& cache) {
-  mtp_target::CacheView view{};
+kv_cache::DeviceView global_cache_view(const FrozenCache& cache) {
+  kv_cache::DeviceView view{};
   view.key = const_cast<BFloat16*>(cache.global_compact);
   view.capacity = cache.global_capacity;
   view.page_pool = cache.global.page_pool;
@@ -74,13 +75,37 @@ mtp_target::CacheView global_cache_view(const FrozenCache& cache) {
   return view;
 }
 
-mtp_target::CacheView local_cache_view(const FrozenCache& cache) {
-  mtp_target::CacheView view{};
+kv_cache::DeviceView local_cache_view(const FrozenCache& cache) {
+  kv_cache::DeviceView view{};
   view.key = const_cast<BFloat16*>(cache.local_key);
   view.value = const_cast<BFloat16*>(cache.local_value);
   view.capacity = 1024;
   view.format = cache.local_format;
   return view;
+}
+
+// 26B target embedding scale is already rounded to BF16 (53). The
+// assistant always uses this target table, not its own tied output table.
+struct Embedding26Input {
+  const std::uint32_t* token;
+  const BFloat16* hidden;
+  BFloat16* output;
+};
+constexpr unsigned kEmbedding26Batch = 128;
+struct Embedding26Batch { Embedding26Input inputs[kEmbedding26Batch]; };
+
+__global__ void embedding_26b(const BFloat16* table,
+                              const __grid_constant__ Embedding26Batch batch) {
+  constexpr unsigned width = gemma4_26b_a4b::kHiddenSize;
+  const auto& input = batch.inputs[blockIdx.y];
+  const unsigned d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (d >= width) return;
+  const auto token = *input.token;
+  if (token < gemma4_26b_a4b::kVocabSize)
+    input.output[d] = __float2bfloat16_rn(
+        __bfloat162float(table[std::size_t(token) * width + d]) *
+        gemma4_26b_a4b::kEmbeddingScale);
+  input.output[width + d] = input.hidden[d];
 }
 
 __device__ float block_reduce(float value, float* values) {
@@ -161,47 +186,52 @@ class Executor::Impl {
   struct Plans {
     mtp_cuda::Linear pre, local_query, global_query, local_out, global_out,
         up, down, head, post;
-    explicit Plans(unsigned rows)
-        : pre(rows, 2 * model::kHiddenSize, kHidden),
-          local_query(rows, kHidden, 32 * 256),
-          global_query(rows, kHidden, 32 * 512),
-          local_out(rows, 32 * 256, kHidden),
-          global_out(rows, 32 * 512, kHidden),
+    Plans(unsigned rows, unsigned target_hidden, unsigned heads)
+        : pre(rows, 2 * target_hidden, kHidden),
+          local_query(rows, kHidden, heads * 256),
+          global_query(rows, kHidden, heads * 512),
+          local_out(rows, heads * 256, kHidden),
+          global_out(rows, heads * 512, kHidden),
           up(rows, kHidden, kMlp), down(rows, kMlp, kHidden),
           head(rows, kHidden, model::kVocabSize),
-          post(rows, kHidden, model::kHiddenSize) {}
+          post(rows, kHidden, target_hidden) {}
   };
 
-  Impl(cublasLtHandle_t handle, const Weights& weights, unsigned capacity,
+  Impl(Model selected_model, cublasLtHandle_t handle, const Weights& weights, unsigned capacity,
        unsigned batch_capacity, attention::Compute local, attention::Compute global)
       : handle(handle), weights(weights), capacity(capacity), batch_capacity(batch_capacity),
+        target_hidden(selected_model == Model::gemma4_26b_a4b ? gemma4_26b_a4b::kHiddenSize : model::kHiddenSize),
+        heads(selected_model == Model::gemma4_26b_a4b ? gemma4_26b_a4b::kQueryHeadCount : model::kQueryHeadCount),
         local_compute(local), global_compute(global) {
+    require(selected_model == Model::gemma4_31b || selected_model == Model::gemma4_26b_a4b,
+            "unknown assistant model");
     require(handle && weights.target_embedding && weights.target_global_k_norm,
             "handle and target weight views are required");
     require(batch_capacity > 0 && batch_capacity <= 1280, "invalid assistant batch capacity");
     for (const auto* weight : weights.assistant) require(weight, "incomplete assistant weight suffix");
-    attention_bytes = batch_attention_scratch_bytes(capacity, batch_capacity);
+    attention_bytes = heads == 16 ? mtp_attention::frozen_scratch_bytes(heads, capacity)
+        : batch_attention_scratch_bytes(capacity, batch_capacity);
     // Single allocation; all BF16 regions have even lengths and the attention
     // arena starts at an explicitly aligned offset.
-    constexpr std::size_t elements = 3 * model::kHiddenSize + 4 * kHidden +
-        4 * 32 * 512 + 3 * kMlp + 2 * (256 + 512) + model::kVocabSize;
+    const std::size_t elements = 3 * target_hidden + 4 * kHidden +
+        4 * heads * 512 + 3 * kMlp + 2 * (256 + 512) + model::kVocabSize;
     const std::size_t activation_bytes = mtp_cuda::align(batch_capacity * elements * sizeof(BFloat16));
-    plans.emplace(batch_capacity, std::make_unique<Plans>(batch_capacity));
+    plans.emplace(batch_capacity, std::make_unique<Plans>(batch_capacity, target_hidden, heads));
     bytes = activation_bytes + attention_bytes;
     check_cuda(cudaMalloc(&arena, bytes), "allocate scratch");
     auto* cursor = static_cast<BFloat16*>(arena);
     const auto take = [&cursor, batch_capacity](std::size_t n) {
       auto* result = cursor; cursor += batch_capacity * n; return result;
     };
-    combined = take(2 * model::kHiddenSize);
+    combined = take(2 * target_hidden);
     hidden = take(kHidden); normalized = take(kHidden);
     branch = take(kHidden); residual = take(kHidden);
-    query_raw = take(32 * 512); query_norm = take(32 * 512);
-    query_rope = take(32 * 512); context = take(32 * 512);
+    query_raw = take(heads * 512); query_norm = take(heads * 512);
+    query_rope = take(heads * 512); context = take(heads * 512);
     gate = take(kMlp); up = take(kMlp); product = take(kMlp);
     local_cos = take(256); local_sin = take(256);
     global_cos = take(512); global_sin = take(512);
-    logits = take(model::kVocabSize); feedback = take(model::kHiddenSize);
+    logits = take(model::kVocabSize); feedback = take(target_hidden);
     attention = static_cast<char*>(arena) + activation_bytes;
   }
 
@@ -211,7 +241,7 @@ class Executor::Impl {
 
   cublasLtHandle_t handle;
   Weights weights;
-  unsigned capacity, batch_capacity;
+  unsigned capacity, batch_capacity, target_hidden, heads;
   attention::Compute local_compute, global_compute;
   std::map<unsigned, std::unique_ptr<Plans>> plans;
   std::size_t bytes{}, attention_bytes{};
@@ -224,10 +254,10 @@ class Executor::Impl {
   BFloat16 *logits{}, *feedback{};
 };
 
-Executor::Executor(cublasLtHandle_t handle, const Weights& weights,
+Executor::Executor(Model selected_model, cublasLtHandle_t handle, const Weights& weights,
                    std::uint32_t context_capacity, std::uint32_t batch_capacity,
                    attention::Compute local_compute, attention::Compute global_compute)
-    : impl_(std::make_unique<Impl>(handle, weights, context_capacity, batch_capacity,
+    : impl_(std::make_unique<Impl>(selected_model, handle, weights, context_capacity, batch_capacity,
                                   local_compute, global_compute)) {}
 
 Executor::~Executor() = default;
@@ -252,10 +282,10 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
   for (const auto& input : inputs) {
     require(input.token && input.hidden && input.logits && input.feedback, "null forward input/output");
     require(input.cache.processed_tokens <= capacity, "frozen prefix exceeds allocated scratch capacity");
-    validate_cache(input.cache, model::AttentionKind::local);
-    validate_cache(input.cache, model::AttentionKind::global);
+    validate_cache(input.cache, model::AttentionKind::local, heads);
+    validate_cache(input.cache, model::AttentionKind::global, heads);
   }
-  if (!plans.count(rows)) plans.emplace(rows, std::make_unique<Plans>(rows));
+  if (!plans.count(rows)) plans.emplace(rows, std::make_unique<Plans>(rows, target_hidden, heads));
   auto& p = *plans.at(rows);
   auto& s = *this;
   const auto capture = [stream](BFloat16* destination, const BFloat16* source, unsigned elements = kHidden) {
@@ -268,11 +298,31 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
     local_attention.reserve(rows);
     global_attention.reserve(rows);
   }
-  if (rows == 1) {
+  if (heads == 16) {
+    for (unsigned first = 0; first < rows; first += kEmbedding26Batch) {
+      Embedding26Batch batch{};
+      const unsigned count = std::min(kEmbedding26Batch, rows - first);
+      for (unsigned i = 0; i < count; ++i) {
+        const unsigned row = first + i;
+        batch.inputs[i] = {inputs[row].token, inputs[row].hidden,
+            s.combined + std::size_t(row) * 2 * target_hidden};
+      }
+      embedding_26b<<<dim3((target_hidden + 255) / 256, count), 256, 0, stream>>>(
+          s.weights.target_embedding, batch);
+      check_cuda(cudaGetLastError(), "26B batch embedding and feedback launch");
+    }
+    std::vector<primitives::RopeFactorsM1Input> factors;
+    factors.reserve(rows);
+    for (unsigned row = 0; row < rows; ++row)
+      factors.push_back({s.local_cos + row * 256, s.local_sin + row * 256,
+          s.global_cos + row * 512, s.global_sin + row * 512,
+          inputs[row].cache.processed_tokens});
+    primitives::generate_rope_factors_m1_batch(factors, stream);
+  } else if (rows == 1) {
     primitives::embedding_lookup_device_token(
         s.weights.target_embedding, inputs[0].token, s.combined, stream);
-    check_cuda(cudaMemcpyAsync(s.combined + model::kHiddenSize,
-        inputs[0].hidden, model::kHiddenSize * sizeof(BFloat16),
+    check_cuda(cudaMemcpyAsync(s.combined + target_hidden,
+        inputs[0].hidden, target_hidden * sizeof(BFloat16),
         cudaMemcpyDeviceToDevice, stream), "copy feedback input");
     primitives::generate_rope_factors_m1(
         s.local_cos, s.local_sin, s.global_cos, s.global_sin,
@@ -284,9 +334,9 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
     factors.reserve(rows);
     for (unsigned row = 0; row < rows; ++row) {
       auto* combined_row =
-          s.combined + std::size_t(row) * 2 * model::kHiddenSize;
-      check_cuda(cudaMemcpyAsync(combined_row + model::kHiddenSize,
-          inputs[row].hidden, model::kHiddenSize * sizeof(BFloat16),
+          s.combined + std::size_t(row) * 2 * target_hidden;
+      check_cuda(cudaMemcpyAsync(combined_row + target_hidden,
+          inputs[row].hidden, target_hidden * sizeof(BFloat16),
           cudaMemcpyDeviceToDevice, stream), "copy feedback input");
       embeddings.push_back({inputs[row].token, combined_row});
       factors.push_back({s.local_cos + row * 256,
@@ -306,36 +356,46 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
     const auto kind = global ? model::AttentionKind::global : model::AttentionKind::local;
     norm(s.hidden, w[0], s.normalized, rows, stream);
     (global ? p.global_query : p.local_query).run(handle, s.normalized, w[1], s.query_raw, stream);
-    primitives::rms_norm(s.query_raw, w[2], s.query_norm, rows * 32, head_width, 1.0e-6F, stream);
-    if (trace) capture(trace->query_norm[layer], s.query_norm, 32 * head_width);
+    primitives::rms_norm(s.query_raw, w[2], s.query_norm, rows * heads, head_width, 1.0e-6F, stream);
+    if (trace) capture(trace->query_norm[layer], s.query_norm, heads * head_width);
     if (rows == 1)
       primitives::apply_rope_m1(s.query_norm,
           global ? s.global_cos : s.local_cos,
-          global ? s.global_sin : s.local_sin, s.query_rope, 32, kind,
+          global ? s.global_sin : s.local_sin, s.query_rope, heads, kind,
           stream);
     else
       primitives::apply_rope_m1_batch(s.query_norm,
           global ? s.global_cos : s.local_cos,
-          global ? s.global_sin : s.local_sin, s.query_rope, rows, 32,
+          global ? s.global_sin : s.local_sin, s.query_rope, rows, heads,
           kind, stream);
-    if (trace) capture(trace->query_rope[layer], s.query_rope, 32 * head_width);
+    if (trace) capture(trace->query_rope[layer], s.query_rope, heads * head_width);
     if ((global ? global_compute : local_compute) == attention::Compute::fp8) {
       global_attention.clear();
       for (unsigned row = 0; row < rows; ++row) {
-        const auto offset = std::size_t(row) * 32 * head_width;
+        const auto offset = std::size_t(row) * heads * head_width;
         global_attention.push_back({s.query_rope + offset, nullptr, nullptr,
             global ? global_cache_view(inputs[row].cache) : local_cache_view(inputs[row].cache),
             inputs[row].cache.processed_tokens, 1, s.context + offset});
       }
-      mtp_attention::run_fp8_batch(global_attention, s.weights.target_global_k_norm, kind,
+      mtp_attention::run_fp8_batch(heads, global_attention, s.weights.target_global_k_norm, kind,
           s.attention, s.attention_bytes, stream, true);
+    } else if (heads == 16) {
+      global_attention.clear();
+      for (unsigned row = 0; row < rows; ++row) {
+        const auto offset = std::size_t(row) * heads * head_width;
+        global_attention.push_back({s.query_rope + offset, nullptr, nullptr,
+            global ? global_cache_view(inputs[row].cache) : local_cache_view(inputs[row].cache),
+            inputs[row].cache.processed_tokens, 1, s.context + offset});
+      }
+      mtp_attention::run_frozen_prefix_batch(heads, global_attention,
+          s.weights.target_global_k_norm, kind, s.attention, s.attention_bytes, stream);
     } else if (rows == 1) {
       attend_frozen_prefix(s.query_rope, inputs[0].cache,
           s.weights.target_global_k_norm, kind, s.attention, s.context, stream);
     } else if (global) {
       global_attention.clear();
       for (unsigned row = 0; row < rows; ++row) {
-        const auto offset = std::size_t(row) * 32 * head_width;
+        const auto offset = std::size_t(row) * heads * head_width;
         global_attention.push_back({s.query_rope + offset, nullptr, nullptr,
             global_cache_view(inputs[row].cache),
             inputs[row].cache.processed_tokens, 1, s.context + offset});
@@ -346,7 +406,7 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
     } else {
       local_attention.clear();
       for (unsigned row = 0; row < rows; ++row) {
-        const auto offset = std::size_t(row) * 32 * head_width;
+        const auto offset = std::size_t(row) * heads * head_width;
         local_attention.push_back({s.query_rope + offset,
             inputs[row].cache.local_key, inputs[row].cache.local_value,
             inputs[row].cache.processed_tokens - 1, s.context + offset, inputs[row].cache.local_format});
@@ -355,7 +415,7 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
           local_attention, s.attention, s.attention_bytes, stream);
     }
     check_cuda(cudaGetLastError(), "attention finalizer launch");
-    if (trace) capture(trace->attention[layer], s.context, 32 * head_width);
+    if (trace) capture(trace->attention[layer], s.context, heads * head_width);
     (global ? p.global_out : p.local_out).run(handle, s.context, w[3], s.branch, stream);
     norm(s.branch, w[4], s.normalized, rows, stream);
     primitives::residual_add(s.hidden, s.normalized, s.residual, rows * kHidden, stream);
@@ -377,7 +437,7 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
   p.post.run(handle, s.normalized, s.weights.assistant[47], s.feedback, stream);
   for (unsigned row = 0; row < rows; ++row) {
     capture(inputs[row].logits, s.logits + std::size_t(row) * model::kVocabSize, model::kVocabSize);
-    capture(inputs[row].feedback, s.feedback + std::size_t(row) * model::kHiddenSize, model::kHiddenSize);
+    capture(inputs[row].feedback, s.feedback + std::size_t(row) * target_hidden, target_hidden);
   }
 }
 

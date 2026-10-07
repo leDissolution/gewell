@@ -6,6 +6,9 @@
 #include "gewell/app.h"
 #include "gewell/offline_runner.h"
 #include "gewell/text_codec_cli.h"
+#include "model_selection.h"
+#include "gewell/models/gemma4/31b/serving_assets.h"
+#include "gewell/models/gemma4/26b_a4b/serving_assets.h"
 #include "gewell/vision_engine.h"
 
 #include <cublasLt.h>
@@ -136,8 +139,8 @@ std::vector<std::uint32_t> parse_capture_layers(std::string_view value) {
   while (true) {
     const auto comma = value.find(',');
     const auto layer = parse_positive_u32(value.substr(0, comma), "--mtp-capture-layers");
-    if (layer > model::kLayerCount || (!layers.empty() && layer <= layers.back()))
-      throw std::runtime_error("--mtp-capture-layers must be increasing completed-layer counts in 1..60");
+    if (!layers.empty() && layer <= layers.back())
+      throw std::runtime_error("--mtp-capture-layers must be increasing positive completed-layer counts");
     layers.push_back(layer);
     if (comma == std::string_view::npos) break;
     value.remove_prefix(comma + 1);
@@ -161,6 +164,15 @@ bool parse_runtime_option(std::string_view option, std::string_view value,
     settings.mtp_min_depth = parse_mtp_depth(value, option);
   } else if (option == "--decode-width") {
     settings.decode_width = parse_decode_width(value);
+  } else if (option == "--mtp-head") {
+    if (value.empty() || value.substr(0, 2) == "--") throw std::runtime_error("--mtp-head requires a checkpoint directory");
+    settings.mtp_head.path = value;
+  } else if (option == "--mtp-head-threshold") {
+    settings.mtp_head.threshold = parse_sampling_float(std::string(value).c_str(), "--mtp-head-threshold");
+    if (settings.mtp_head.threshold > 1) throw std::runtime_error("--mtp-head-threshold must be in [0,1]");
+  } else if (option == "--mtp-head-tail-fraction") {
+    settings.mtp_head.tail_fraction = parse_sampling_float(std::string(value).c_str(), "--mtp-head-tail-fraction");
+    if (settings.mtp_head.tail_fraction > 1) throw std::runtime_error("--mtp-head-tail-fraction must be in [0,1]");
   } else if (option == "--mtp-stats") {
     if (value.empty() || value.substr(0, 2) == "--") throw std::runtime_error("--mtp-stats requires a path");
     settings.mtp_stats_path = value;
@@ -255,7 +267,89 @@ void print_artifact_metadata(const artifact::ArtifactFile& file,
   console::field("lm_head_target_physical_id", header.lm_head_target_id);
 }
 
+int artifact_command26(const std::string& path, std::string_view command) {
+  namespace m = gewell::gemma4_26b_a4b;
+  auto file = m::ArtifactFile::Open(path);
+  const auto payload_bytes = file.file_bytes() - m::kArtifactDataOffset;
+  std::uint64_t logical_bytes = 0;
+  for (const auto& entry : file.entries()) logical_bytes += entry.bytes;
+  const bool verify = command == "verify" || command == "probe";
+  const auto started = std::chrono::steady_clock::now();
+  if (verify) file.VerifyFull();
+  console::section("Artifact");
+  console::field("artifact", path);
+  console::field("architecture", "gemma4_26b_a4b");
+  console::field("weight_format", file.is_mixed() ? "gemma4-26b-a4b-mixed-v1" : "gemma4-26b-a4b-bf16-v1");
+  console::field("validation", verify ? "full" : "header+table (payload not scanned)");
+  console::field("physical_tensors", m::kTextPhysicalTensorCount);
+  console::field("logical_tensors", m::kTextPhysicalTensorCount + 1);
+  console::field("aliases", 1);
+  console::field("logical_data_bytes", logical_bytes);
+  console::field("payload_bytes", payload_bytes);
+  console::field("file_bytes", file.file_bytes());
+  console::field("lm_head_logical_id", m::kLmHeadLogicalId);
+  console::field("lm_head_target_physical_id", m::kLmHeadPhysicalId);
+  if (verify) {
+    console::field("verification_seconds", std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count());
+    console::field("payload_sha256", artifact::digest_hex(file.payload_hash()));
+  }
+  if (command == "inspect" || command == "verify") return 0;
+  if (!validate_cuda_target(true)) return 1;
+  if (command == "probe") {
+    std::size_t scalar = 0;
+    while (scalar < m::kTextPhysicalTensorCount &&
+        !(m::kTextTensors[scalar].role == m::TensorRole::layer_scalar && m::kTextTensors[scalar].layer == 0)) ++scalar;
+    if (scalar == m::kTextPhysicalTensorCount) throw std::runtime_error("missing26B probe scalar");
+    const auto norm = m::kFinalNormPhysicalId;
+    const auto scalar_bytes = file.entries()[scalar].bytes;
+    const auto norm_bytes = file.entries()[norm].bytes;
+    std::vector<std::uint8_t> expected(scalar_bytes + norm_bytes), actual(expected.size());
+    std::memcpy(expected.data(), file.tensor_data(scalar), scalar_bytes);
+    std::memcpy(expected.data() + scalar_bytes, file.tensor_data(norm), norm_bytes);
+    DeviceAllocation device(expected.size());
+    require_cuda(cudaMemcpy(device.data(), expected.data(), expected.size(), cudaMemcpyHostToDevice), "probe host-to-device copy");
+    require_cuda(cudaMemcpy(actual.data(), device.data(), actual.size(), cudaMemcpyDeviceToHost), "probe device-to-host copy");
+    if (actual != expected) throw std::runtime_error("probe byte roundtrip mismatch");
+    console::section("GPU roundtrip probe");
+    console::field("probe", "passed");
+    console::field("probe_physical_tensor_ids", nlohmann::json::array({scalar, norm}));
+    console::field("probe_roundtrip_bytes", expected.size());
+    return 0;
+  }
+  std::size_t free_before = 0, total = 0;
+  require_cuda(cudaMemGetInfo(&free_before, &total), "cudaMemGetInfo before load");
+  DeviceAllocation arena(payload_bytes);
+  auto* destination = static_cast<std::uint8_t*>(arena.data());
+  const auto* source = file.tensor_data(m::kEmbeddingPhysicalId);
+  for (std::size_t copied = 0; copied < payload_bytes;) {
+    const auto chunk = std::min<std::size_t>(artifact::kIoChunkBytes, payload_bytes - copied);
+    require_cuda(cudaMemcpy(destination + copied, source + copied, chunk, cudaMemcpyHostToDevice), "payload host-to-device copy");
+    copied += chunk;
+  }
+  std::array<const void*, m::kTextPhysicalTensorCount + 1> pointers{};
+  for (std::size_t id = 0; id < file.entries().size(); ++id)
+    pointers[id] = destination + (file.entries()[id].offset - m::kArtifactDataOffset);
+  pointers[m::kLmHeadLogicalId] = pointers[m::kLmHeadPhysicalId];
+  if (pointers[m::kLmHeadLogicalId] != pointers[m::kEmbeddingPhysicalId])
+    throw std::runtime_error("lm_head device pointer is not tied to embedding");
+  std::size_t free_after = 0, total_after = 0;
+  require_cuda(cudaMemGetInfo(&free_after, &total_after), "cudaMemGetInfo after load");
+  if (total_after != total || free_after > free_before) throw std::runtime_error("inconsistent CUDA memory after load");
+  console::section("GPU weight load");
+  console::field("load", "passed");
+  console::field("gpu_total_bytes", total);
+  console::field("gpu_free_before_bytes", free_before);
+  console::field("gpu_free_after_load_bytes", free_after);
+  console::field("device_arena_bytes", arena.size());
+  console::field("device_arena_address_mod_4096", reinterpret_cast<std::uintptr_t>(arena.data()) % 4096);
+  console::field("device_free_delta_bytes", free_before - free_after);
+  console::field("lm_head_pointer_tied", true);
+  return 0;
+}
+
 int inspect_artifact(const std::string& path) {
+  if (app::artifact_model(path) == app::ModelKind::gemma4_26b_a4b) return artifact_command26(path, "inspect");
   artifact::ArtifactFile file = artifact::ArtifactFile::Open(path);
   print_artifact_metadata(file, "header+table (payload not scanned)");
   return 0;
@@ -275,6 +369,7 @@ artifact::Verification verify_and_report(artifact::ArtifactFile& file) {
 }
 
 int verify_artifact(const std::string& path) {
+  if (app::artifact_model(path) == app::ModelKind::gemma4_26b_a4b) return artifact_command26(path, "verify");
   artifact::ArtifactFile file = artifact::ArtifactFile::Open(path);
   verify_and_report(file);
   return 0;
@@ -292,6 +387,7 @@ const artifact::TensorEntry& find_entry(const artifact::ArtifactFile& file,
 }
 
 int probe_artifact(const std::string& path) {
+  if (app::artifact_model(path) == app::ModelKind::gemma4_26b_a4b) return artifact_command26(path, "probe");
   artifact::ArtifactFile file = artifact::ArtifactFile::Open(path);
   verify_and_report(file);
   if (!validate_cuda_target(true)) {
@@ -331,6 +427,7 @@ int probe_artifact(const std::string& path) {
 }
 
 int load_artifact(const std::string& path) {
+  if (app::artifact_model(path) == app::ModelKind::gemma4_26b_a4b) return artifact_command26(path, "load");
   artifact::ArtifactFile file = artifact::ArtifactFile::Open(path);
   print_artifact_metadata(file, "header+table (payload not scanned)");
   if (!validate_cuda_target(true)) {
@@ -420,6 +517,7 @@ Inspection and validation
   text-codec MODEL_DIR                Run the JSONL tokenizer protocol
 
 Options
+  --version                          Print the version and exit
   --log-format human|json             Readable console (default) or JSON Lines;
                                      accepted before or after the command
   --assistant PATH                   Original assistant model.safetensors; loaded only for positive MTP depth
@@ -428,13 +526,18 @@ Options
                                      warns and falls back to 0 without --assistant
   --mtp-min-depth N                  Minimum adaptive proposal depth (default 0, <= --mtp-depth)
   --decode-width N                   Target pending + proposal rows per decode batch;
-                                     0 (default) uses fixed --mtp-depth; batch commands only
+                                     0 (default) disables width limit; batch commands only
+                                     with --mtp-head, share width by predicted survival
   --mtp-stats PATH                   Append windowed MTP statistics to a JSONL file (batch commands)
   --mtp-stats-window N               Decode cycles per request window (default 64, positive)
+  --mtp-head DIR                     Trained acceptance head checkpoint (batch commands, opt-in)
+  --mtp-head-threshold P             Minimum predicted P(accepted >= k), in [0,1] (default 0.5)
+  --mtp-head-tail-fraction F         Minimum batch fraction at deepest draft step after redistribution;
+                                     0 disables (default), range 0..1, requires positive decode width
   --mtp-capture DIR                  Append sampled training pairs in a directory (batch commands)
   --mtp-capture-every N              Capture approximately 1/N MTP rounds (default 32, positive)
   --mtp-capture-max-samples N        Capture attempts per launch (default 250000, positive)
-  --mtp-capture-layers LIST          Completed target layers to probe (default 4,12,24,40,56; 1..60)
+  --mtp-capture-layers LIST          Completed target layers to probe (loaded model defaults/bounds)
   --prefill-chunk-tokens N            Per-prompt text chunk cap, 1..4096 (default 1024)
   --prefill-batch-tokens N            Combined text GEMM rows, 1..4096 (default 2048, >= chunk cap)
   --prefill-budget-tokens N           Prefill tokens between batch decodes (0: each forward/head)
@@ -448,6 +551,7 @@ Options
   --kv-checkpoint-interval-tokens N   Periodic checkpoint spacing (0 disables it)
 
 HTTP options (after serve-http)
+  --verbose                          Print received prompts to the console (default off)
   --host HOST                        IPv4 bind address (default 127.0.0.1)
   --port N                           HTTP port (default 6311)
   --model NAME                       Public model name
@@ -493,6 +597,11 @@ int main(int argc, char** argv) {
     }
     argc = remaining;
     argv[argc] = nullptr;
+    const bool version_only = argc == 2 && std::string_view(argv[1]) == "--version";
+    // Keep the startup banner off stdout, which also carries JSONL protocols.
+    console::event("version", {{"version", GEWELL_VERSION}},
+                   "gewell " GEWELL_VERSION, !version_only);
+    if (version_only) return 0;
     if (argc == 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
       print_usage(argv[0]);
       return 0;
@@ -501,15 +610,18 @@ int main(int argc, char** argv) {
     generation_settings.assistant_path = assistant_path;
     generation_settings.vision_path = vision_path;
     bool generation_options = false;
+    bool replay_incompatible_options = false;
     bool batch_sampling_options = false;
     bool prefill_budget_option = false;
     bool prefill_batch_option = false;
     bool adaptive_depth_options = false;
     bool mtp_stats_options = false;
     bool mtp_capture_options = false;
+    bool mtp_head_options = false;
     while (argc >= 2) {
       const std::string_view option(argv[1]);
       if (option != "--mtp-depth" && option != "--mtp-min-depth" && option != "--decode-width" &&
+          option != "--mtp-head" && option != "--mtp-head-threshold" && option != "--mtp-head-tail-fraction" &&
           option != "--mtp-stats" && option != "--mtp-stats-window" &&
           option != "--mtp-capture" && option != "--mtp-capture-every" && option != "--mtp-capture-max-samples" && option != "--mtp-capture-layers" &&
           option != "--temperature" && option != "--top-p" &&
@@ -518,13 +630,16 @@ int main(int argc, char** argv) {
           option != "--kv-global-format" && option != "--attention-local-compute" && option != "--attention-global-compute") break;
       if (argc < 3) throw std::runtime_error(std::string(option) + " requires a value");
       generation_options = true;
+      replay_incompatible_options |= option != "--nvfp4-activation-policy";
       prefill_budget_option |= option == "--prefill-budget-tokens";
       prefill_batch_option |= option == "--prefill-batch-tokens";
       adaptive_depth_options |= option == "--mtp-min-depth" || option == "--decode-width";
       mtp_stats_options |= option == "--mtp-stats" || option == "--mtp-stats-window";
       const bool capture_option = option == "--mtp-capture" || option == "--mtp-capture-every" || option == "--mtp-capture-max-samples" || option == "--mtp-capture-layers";
       mtp_capture_options |= capture_option;
-      batch_sampling_options |= !capture_option && option != "--mtp-stats" && option != "--mtp-stats-window" &&
+      const bool head_option = option == "--mtp-head" || option == "--mtp-head-threshold" || option == "--mtp-head-tail-fraction";
+      mtp_head_options |= head_option;
+      batch_sampling_options |= !head_option && !capture_option && option != "--mtp-stats" && option != "--mtp-stats-window" &&
           option != "--mtp-depth" && option != "--mtp-min-depth" && option != "--decode-width" && option != "--prefill-chunk-tokens" && option != "--prefill-batch-tokens" && option != "--prefill-budget-tokens" && option != "--nvfp4-activation-policy" && option != "--kv-local-format" && option != "--kv-global-format" && option != "--attention-local-compute" && option != "--attention-global-compute";
       if (option == "--nvfp4-activation-policy") generation_settings.nvfp4_activation_policy = parse_nvfp4_activation_policy(argv[2]);
       if (option == "--prefill-chunk-tokens") generation_settings.prefill_chunk_tokens = parse_prefill_chunk_tokens(argv[2]);
@@ -537,6 +652,19 @@ int main(int argc, char** argv) {
       if (option == "--mtp-depth") generation_settings.mtp_depth = parse_mtp_depth(argv[2]);
       if (option == "--mtp-min-depth") generation_settings.mtp_min_depth = parse_mtp_depth(argv[2], option);
       if (option == "--decode-width") generation_settings.decode_width = parse_decode_width(argv[2]);
+      if (option == "--mtp-head") {
+        if (std::string_view(argv[2]).empty() || std::string_view(argv[2]).substr(0, 2) == "--")
+          throw std::runtime_error("--mtp-head requires a checkpoint directory");
+        generation_settings.mtp_head.path = argv[2];
+      }
+      if (option == "--mtp-head-threshold") {
+        generation_settings.mtp_head.threshold = parse_sampling_float(argv[2], "--mtp-head-threshold");
+        if (generation_settings.mtp_head.threshold > 1) throw std::runtime_error("--mtp-head-threshold must be in [0,1]");
+      }
+      if (option == "--mtp-head-tail-fraction") {
+        generation_settings.mtp_head.tail_fraction = parse_sampling_float(argv[2], "--mtp-head-tail-fraction");
+        if (generation_settings.mtp_head.tail_fraction > 1) throw std::runtime_error("--mtp-head-tail-fraction must be in [0,1]");
+      }
       if (option == "--mtp-stats-window") generation_settings.mtp_stats_window = parse_positive_u32(argv[2], option);
       if (option == "--mtp-capture-layers") generation_settings.mtp_capture.layers = parse_capture_layers(argv[2]);
       if (option == "--mtp-capture-every") generation_settings.mtp_capture.every = parse_positive_u32(argv[2], option);
@@ -572,6 +700,8 @@ int main(int argc, char** argv) {
     }
     if (generation_options && argc >= 2) {
       const std::string_view command(argv[1]);
+      if (mtp_head_options && command != "generate-batch" && command != "serve-http" && command != "run-jobs")
+        throw std::runtime_error("--mtp-head options require a batching command");
       if (mtp_capture_options && command != "generate-batch" &&
           command != "serve-http" && command != "run-jobs")
         throw std::runtime_error("--mtp-capture options require a batching command");
@@ -586,8 +716,10 @@ int main(int argc, char** argv) {
       if (prefill_budget_option && command != "generate-batch" &&
           command != "serve-http" && command != "run-jobs")
         throw std::runtime_error("--prefill-budget-tokens requires a batching command");
+      if (command == "replay-rollout" && replay_incompatible_options)
+        throw std::runtime_error("only --nvfp4-activation-policy generation settings apply to replay-rollout");
       if (command != "generate" && command != "caption" && command != "generate-batch" &&
-          command != "serve-http" && command != "run-jobs")
+          command != "serve-http" && command != "run-jobs" && command != "replay-rollout")
         throw std::runtime_error("generation options precede generate/caption or batching commands");
     }
     if (!qdq_mask.empty() && argc >= 2) {
@@ -599,7 +731,12 @@ int main(int argc, char** argv) {
     if (argc == 3) {
       const std::string_view command = argv[1];
       if (command == "text-codec") {
-        return gewell::text::run_text_codec(argv[2]);
+        if (app::serving_model(argv[2]) == app::ModelKind::gemma4_26b_a4b) {
+          const auto assets = gewell::gemma4_26b_a4b::ServingAssets::Open(argv[2]);
+          return gewell::text::run_text_codec(assets.tokenizer);
+        }
+        const auto assets = gewell::gemma4_31b::ServingAssets::Open(argv[2]);
+        return gewell::text::run_text_codec(assets.tokenizer);
       }
       if (command == "inspect") {
         return inspect_artifact(argv[2]);
@@ -623,7 +760,7 @@ int main(int argc, char** argv) {
           generation_settings.local_kv_format, generation_settings.global_kv_format,
           generation_settings.local_attention_compute, generation_settings.global_attention_compute, assistant_path, vision_path,
           generation_settings.prefill_budget_tokens, generation_settings.mtp_min_depth, generation_settings.decode_width,
-          generation_settings.mtp_stats_path, generation_settings.mtp_stats_window, generation_settings.mtp_capture);
+          generation_settings.mtp_stats_path, generation_settings.mtp_stats_window, generation_settings.mtp_capture, generation_settings.mtp_head);
     }
     if (argc >= 2 && std::string_view(argv[1]) == "serve-http") {
       if (batch_sampling_options) throw std::runtime_error("serve-http sampling settings belong to each request");
@@ -636,6 +773,7 @@ int main(int argc, char** argv) {
       settings.mtp_stats_path = generation_settings.mtp_stats_path;
       settings.mtp_stats_window = generation_settings.mtp_stats_window;
       settings.mtp_capture = generation_settings.mtp_capture;
+      settings.mtp_head = generation_settings.mtp_head;
       settings.prefill_chunk_tokens = generation_settings.prefill_chunk_tokens;
       settings.prefill_batch_tokens = generation_settings.prefill_batch_tokens;
       settings.prefill_budget_tokens = generation_settings.prefill_budget_tokens;
@@ -650,9 +788,13 @@ int main(int argc, char** argv) {
       std::uint32_t max_batch = 0;
       bool has_gpu_budget = false;
       std::string mask = qdq_mask;
-      for (int index = 2; index < argc; index += 2) {
-        if (index + 1 >= argc) throw std::runtime_error(std::string(argv[index]) + " requires a value");
+      for (int index = 2; index < argc; ++index) {
         const std::string_view option(argv[index]);
+        if (option == "--verbose") {
+          http_settings.verbose = true;
+          continue;
+        }
+        if (index + 1 >= argc) throw std::runtime_error(std::string(option) + " requires a value");
         if (option == "--model-dir") model_directory = argv[index + 1];
         else if (option == "--host") http_settings.host = argv[index + 1];
         else if (option == "--port") http_settings.port = parse_port(argv[index + 1]);
@@ -674,6 +816,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("unknown serve-http option: " + std::string(option));
           has_gpu_budget |= option == "--kv-cache-gpu-mib";
         }
+        ++index;
       }
       if (model_directory.empty()) throw std::runtime_error("--model-dir is required for serve-http");
       if (!max_batch) throw std::runtime_error("--max-batch is required for serve-http");
@@ -695,6 +838,7 @@ int main(int argc, char** argv) {
       settings.mtp_stats_path = generation_settings.mtp_stats_path;
       settings.mtp_stats_window = generation_settings.mtp_stats_window;
       settings.mtp_capture = generation_settings.mtp_capture;
+      settings.mtp_head = generation_settings.mtp_head;
       settings.prefill_chunk_tokens = generation_settings.prefill_chunk_tokens;
       settings.prefill_batch_tokens = generation_settings.prefill_batch_tokens;
       settings.prefill_budget_tokens = generation_settings.prefill_budget_tokens;
@@ -713,7 +857,7 @@ int main(int argc, char** argv) {
     if (argc == 7 && std::string_view(argv[1]) == "replay-rollout") {
       return app::run_replay_rollout(argv[2], argv[3],
           parse_positive_u32(argv[4], "CHUNK_ROWS"),
-          parse_positive_u32(argv[5], "HEAD_ROWS"), argv[6], qdq_mask);
+          parse_positive_u32(argv[5], "HEAD_ROWS"), argv[6], generation_settings.nvfp4_activation_policy, qdq_mask);
     }
     if ((argc == 6 || argc == 7) && std::string_view(argv[1]) == "generate") {
       return app::run_generate(argv[2], argv[3], parse_positive_u32(argv[4], "NEW_TOKENS"),

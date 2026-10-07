@@ -1,8 +1,13 @@
 #pragma once
 
-#include "gewell/kv_cache.h"
+#include "gewell/compact_cache_geometry.h"
+#include "gewell/models/gemma4/31b/model.h"
 
 namespace gewell::gemma4_31b::sm120 {
+
+inline constexpr kv_cache::CompactGeometry kCacheGeometry{
+    gemma4_31b::kLayerCount, gemma4_31b::kLocalKvHeadCount,
+    gemma4_31b::kGlobalKvHeadCount, gemma4_31b::kHiddenSize};
 
 inline constexpr std::uint32_t kGlobalPageTokens = 256;
 inline constexpr std::uint32_t kLocalWindowTokens = 1'024;

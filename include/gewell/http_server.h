@@ -14,6 +14,7 @@ struct Settings {
   // Per connection, including buffered text and pending response bytes.
   std::size_t max_output_bytes = 8 * 1024 * 1024;
   std::uint32_t socket_timeout_seconds = 60;
+  bool verbose = false;
 };
 
 struct Admission { ClientId client; Request request; };

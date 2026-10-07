@@ -1,4 +1,4 @@
-#include "../kernels/kv_storage.cuh"
+#include "kv_storage.cuh"
 #include "../kernels/fp8_cache.cuh"
 #include "fp8_quantize.cuh"
 #include "gewell/mtp_attention.h"
@@ -12,11 +12,12 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace gewell::mtp_attention {
 namespace {
 using BF16 = mtp_target::BFloat16;
-using Cache = mtp_target::CacheView;
+using Cache = kv_cache::DeviceView;
 constexpr unsigned kThreads = 256;
 constexpr unsigned kWarp = 32;
 constexpr unsigned kHeads = gemma4_31b::kQueryHeadCount;
@@ -35,8 +36,8 @@ unsigned default_splits(unsigned base, unsigned rows, bool global, bool frozen =
 }
 
 std::size_t bytes_for(std::uint32_t rows, std::uint32_t splits,
-                      std::uint32_t dimension) {
-  return std::size_t(std::min(rows, kQueryTileRows)) * kHeads * splits *
+                      std::uint32_t dimension, unsigned heads = kHeads) {
+  return std::size_t(std::min(rows, kQueryTileRows)) * heads * splits *
          (dimension + 2) * sizeof(float);
 }
 
@@ -114,7 +115,7 @@ __device__ void tensor_pv(const BF16* probabilities, const BF16* values,
 // fixed stride, keeping the partial-result allocation bounded.
 template <bool Paged>
 __device__ __forceinline__ const BF16* compact_record(
-    const mtp_target::CacheView& cache, unsigned head, unsigned position) {
+    const kv_cache::DeviceView& cache, unsigned head, unsigned position) {
   if constexpr (Paged)
     return compact_global_cache::paged_row(cache.page_pool, cache.page_offsets,
         256, cache.layer_offset_elements, head, position, cache.format);
@@ -164,7 +165,7 @@ __device__ __forceinline__ bool stage_compact_tile(
   return true;
 }
 
-template <bool Global, bool Paged, bool Frozen = false, bool Buffered = false>
+template <bool Global, bool Paged, bool Frozen = false, bool Buffered = false, unsigned Heads = kHeads>
 __device__ __forceinline__ void partial_attention_body(
     const BF16* query, const BF16* staged_key, const BF16* staged_value,
     Cache cache, const BF16* k_norm, std::uint32_t base,
@@ -172,8 +173,8 @@ __device__ __forceinline__ void partial_attention_body(
     float* partial, float* maxima, float* denominators, unsigned grid_x, unsigned grid_y, unsigned grid_z) {
   constexpr unsigned Threads = kThreads;
   constexpr unsigned D = Global ? 512 : 256;
-  constexpr unsigned KvHeads = Global ? 4 : 16;
-  constexpr unsigned QueriesPerKv = kHeads / KvHeads;
+  constexpr unsigned KvHeads = Global ? Heads / 8 : Heads / 2;
+  constexpr unsigned QueriesPerKv = Heads / KvHeads;
   constexpr unsigned WarpsPerQuery = (kThreads / kWarp) / QueriesPerKv;
   // Reconstruct each global BF16 key once, then reuse the tile for V. The
   // eight-element padding avoids WMMA bank conflicts without changing the
@@ -292,13 +293,12 @@ __device__ __forceinline__ void partial_attention_body(
         *reinterpret_cast<uint4*>(tile + (i / D) * TileWidth + i % D) = value;
       }
     } else {
-      for (unsigned i = threadIdx.x; i < load_count * D; i += Threads) {
+      for (unsigned i = threadIdx.x * 8; i < load_count * D; i += Threads * 8) {
         const unsigned position = begin + i / D;
         const unsigned d = i % D;
-        tile[i] = position >= base
-                      ? staged_key[(std::size_t(kv_head) * rows + position - base) *
-                                       D + d]
-                      : kv_storage::load(kv_storage::row(cache.key, std::size_t(kv_head) * 1024 + position % 1024, D, cache.format), d, D, cache.format);
+        *reinterpret_cast<uint4*>(tile + i) = position >= base
+                      ? load_eight(staged_key + (std::size_t(kv_head) * rows + position - base) * D + d)
+                      : kv_storage::load_eight(kv_storage::row(cache.key, std::size_t(kv_head) * 1024 + position % 1024, D, cache.format), d, D, cache.format);
       }
     }
     if constexpr (Global) {
@@ -405,13 +405,12 @@ __device__ __forceinline__ void partial_attention_body(
         *reinterpret_cast<uint4*>(tile + (i / D) * TileWidth + i % D) = value;
       }
     } else {
-      for (unsigned i = threadIdx.x; i < load_count * D; i += Threads) {
+      for (unsigned i = threadIdx.x * 8; i < load_count * D; i += Threads * 8) {
         const unsigned position = begin + i / D;
         const unsigned d = i % D;
-        tile[i] = position >= base
-                      ? staged_value[(std::size_t(position - base) * KvHeads +
-                                      kv_head) * D + d]
-                      : kv_storage::load(kv_storage::row(cache.value, std::size_t(kv_head) * 1024 + position % 1024, D, cache.format), d, D, cache.format);
+        *reinterpret_cast<uint4*>(tile + i) = position >= base
+                      ? load_eight(staged_value + (std::size_t(position - base) * KvHeads + kv_head) * D + d)
+                      : kv_storage::load_eight(kv_storage::row(cache.value, std::size_t(kv_head) * 1024 + position % 1024, D, cache.format), d, D, cache.format);
       }
     }
     __syncthreads();
@@ -464,7 +463,7 @@ __device__ __forceinline__ void partial_attention_body(
     __syncthreads();
   }
 
-  const std::size_t result = (std::size_t(tile_row) * kHeads + query_head) *
+  const std::size_t result = (std::size_t(tile_row) * Heads + query_head) *
                             splits + split;
 #pragma unroll
   for (unsigned i = 0; i < ValuesPerThread; ++i) {
@@ -478,13 +477,13 @@ __device__ __forceinline__ void partial_attention_body(
   }
 }
 
-template <bool Global, bool Paged, bool Frozen = false>
+template <bool Global, bool Paged, bool Frozen = false, unsigned Heads = kHeads>
 __global__ __launch_bounds__(kThreads, 2) void partial_attention(
     const BF16* query, const BF16* staged_key, const BF16* staged_value,
     Cache cache, const BF16* k_norm, std::uint32_t base,
     std::uint32_t rows, std::uint32_t first_row, std::uint32_t splits,
     float* partial, float* maxima, float* denominators) {
-  partial_attention_body<Global, Paged, Frozen>(query, staged_key, staged_value, cache, k_norm, base, rows, first_row, splits, partial, maxima, denominators,
+  partial_attention_body<Global, Paged, Frozen, false, Heads>(query, staged_key, staged_value, cache, k_norm, base, rows, first_row, splits, partial, maxima, denominators,
       blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
@@ -1003,7 +1002,7 @@ __global__ __launch_bounds__(kThreads, 2) void local_eight_rows(
       blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
-template <unsigned D>
+template <unsigned D, unsigned Heads = kHeads>
 __device__ __forceinline__ void finalize_attention_body(const float* partial, const float* maxima,
                                    const float* denominators,
                                    std::uint32_t first_row,
@@ -1015,7 +1014,7 @@ __device__ __forceinline__ void finalize_attention_body(const float* partial, co
   const unsigned row = grid_y;
   const unsigned lane = threadIdx.x % kWarp;
   const unsigned warp = threadIdx.x / kWarp;
-  const std::size_t first = (std::size_t(row) * kHeads + query_head) * splits;
+  const std::size_t first = (std::size_t(row) * Heads + query_head) * splits;
   float maximum = threadIdx.x < splits ? maxima[first + threadIdx.x]
                                       : -CUDART_INF_F;
   maximum = warp_max(maximum);
@@ -1046,17 +1045,17 @@ __device__ __forceinline__ void finalize_attention_body(const float* partial, co
     for (unsigned split = 0; split < splits; ++split)
       numerator = fmaf(weights[split], partial[(first + split) * D + d],
                        numerator);
-    context[(std::size_t(first_row + row) * kHeads + query_head) * D + d] =
+    context[(std::size_t(first_row + row) * Heads + query_head) * D + d] =
         __float2bfloat16_rn(numerator / total_denominator);
   }
 }
 
-template <unsigned D>
+template <unsigned D, unsigned Heads = kHeads>
 __global__ void finalize_attention(const float* partial, const float* maxima,
                                    const float* denominators,
                                    std::uint32_t first_row,
                                    std::uint32_t splits, BF16* context) {
-  finalize_attention_body<D>(partial, maxima, denominators, first_row, splits,
+  finalize_attention_body<D, Heads>(partial, maxima, denominators, first_row, splits,
                              context, blockIdx.x, blockIdx.y);
 }
 
@@ -1084,7 +1083,7 @@ struct AttentionBatch { AttentionTile tiles[kBatchTiles]; };
 // tiles, and distribute splits in proportion to visible KV work. A lone tile
 // retains its original split count. Scratch capacity is a separate hard limit.
 bool plan_batch(AttentionBatch& batch, unsigned count, bool global,
-                void* scratch, std::size_t bytes, bool frozen = false) {
+                void* scratch, std::size_t bytes, bool frozen = false, unsigned heads = kHeads) {
   const bool four_rows = batch.tiles[0].input.rows > 1;
   const unsigned group_budget = (global ? 128 : 64) * (four_rows ? 1 : 2);
   const unsigned D = global ? 512 : 256;
@@ -1104,7 +1103,7 @@ bool plan_batch(AttentionBatch& batch, unsigned count, bool global,
                                       tile.input.rows, global, frozen);
     const auto budget = unsigned((std::uint64_t(visible[i]) * group_budget + work - 1) / work);
     splits[i] = count == 1 ? limit : std::min(limit, std::max(1U, budget));
-    needed += bytes_for(tile.count, splits[i], D);
+    needed += bytes_for(tile.count, splits[i], D, heads);
   }
   if (needed > bytes) return false;
 
@@ -1115,11 +1114,11 @@ bool plan_batch(AttentionBatch& batch, unsigned count, bool global,
     tile.splits = splits[i];
     tile.end_blocks = blocks += tile.groups * tile.splits;
     tile.end_rows = rows += tile.count;
-    const auto entries = std::size_t(tile.count) * kHeads * tile.splits;
+    const auto entries = std::size_t(tile.count) * heads * tile.splits;
     tile.partial = reinterpret_cast<float*>(static_cast<unsigned char*>(scratch) + used);
     tile.maxima = tile.partial + entries * D;
     tile.denominators = tile.maxima + entries;
-    used += bytes_for(tile.count, tile.splits, D);
+    used += bytes_for(tile.count, tile.splits, D, heads);
   }
   return true;
 }
@@ -1150,13 +1149,13 @@ void batched_partial_attention(const __grid_constant__ AttentionBatch batch,
         tile.partial, tile.maxima, tile.denominators, blockIdx.x, group, split);
 }
 
-template<unsigned D>
+template<unsigned D, unsigned Heads = kHeads>
 __global__ void batched_finalize_attention(const __grid_constant__ AttentionBatch batch) {
   unsigned index = 0;
   while (blockIdx.y >= batch.tiles[index].end_rows) ++index;
   const auto& tile = batch.tiles[index];
   const auto row = blockIdx.y - (index ? batch.tiles[index - 1].end_rows : 0);
-  finalize_attention_body<D>(tile.partial, tile.maxima, tile.denominators,
+  finalize_attention_body<D, Heads>(tile.partial, tile.maxima, tile.denominators,
       tile.first, tile.splits, tile.input.context, blockIdx.x, row);
 }
 
@@ -1204,44 +1203,227 @@ std::size_t scratch_bytes(std::uint32_t rows, std::uint32_t context) {
 static unsigned checked_splits(const BF16* query, const BF16* staged_key, const BF16* staged_value,
          const Cache& cache, const BF16* k_norm, std::uint32_t base,
          std::uint32_t rows, gemma4_31b::AttentionKind kind, BF16* context,
-         void* scratch, std::size_t bytes, bool frozen) {
+         void* scratch, std::size_t bytes, bool frozen, unsigned heads = kHeads, unsigned max_rows = mtp_target::kMaxDepth + 1) {
   const bool global = kind == gemma4_31b::AttentionKind::global;
   if ((kind != gemma4_31b::AttentionKind::local && !global) || !query ||
       (!frozen && (!staged_key || !staged_value)) || !context || !scratch || !rows ||
-      rows > mtp_target::kMaxDepth + 1 ||
+      rows > max_rows ||
       std::uint64_t(base) + (frozen ? 0 : rows) > kMaxContext ||
       (frozen && (!base || rows != 1)))
     throw std::invalid_argument("MTP attention inputs outside capacity");
   if (global) {
     if (!k_norm)
       throw std::invalid_argument("MTP global attention requires K norm scale");
-    if (cache.page_pool) {
-      const std::size_t layer_elements = 4 * 256 * kv_cache::row_words(640, cache.format, 2);
+    // A cold causal prefill reads staged keys only.
+    if (base && cache.page_pool) {
+      const std::size_t layer_elements = (heads / 8) * 256 * kv_cache::row_words(640, cache.format, 2);
       if (!cache.page_offsets || cache.page_tokens != 256 ||
           (std::uint64_t(base) + 255) / 256 > cache.page_count ||
           cache.layer_offset_elements > cache.page_stride_elements ||
           layer_elements > cache.page_stride_elements - cache.layer_offset_elements)
         throw std::invalid_argument("MTP paged attention does not cover committed KV");
-    } else if (!cache.key || base > cache.capacity) {
+    } else if (base && (!cache.key || base > cache.capacity)) {
       throw std::invalid_argument("MTP global attention does not cover committed KV");
     }
-  } else if (!cache.key || !cache.value || cache.capacity != 1024) {
+  } else if (base && (!cache.key || !cache.value || cache.capacity != 1024)) {
     throw std::invalid_argument("MTP local attention requires separate 1024-row rings");
   }
   const unsigned D = global ? 512 : 256;
   const auto splits = default_splits(base, rows, global, frozen);
-  if (bytes < bytes_for(rows, splits, D))
+  if (bytes < bytes_for(rows, splits, D, heads))
     throw std::invalid_argument("MTP attention scratch is too small");
   return splits;
 }
 
-void run_fp8_batch(const std::vector<BatchInput>& inputs, const BF16* k_norm,
+std::size_t frozen_scratch_bytes(unsigned heads, std::uint32_t context) {
+  if ((heads != 16 && heads != 32) || !context || context > kMaxContext)
+    throw std::invalid_argument("MTP frozen attention geometry outside capacity");
+  // The existing local planner includes one row when sizing frozen splits.
+  // At L=32 its two 256-wide splits need slightly more than one 512-wide
+  // global split. Cover both without changing the established split policy.
+  return std::max(bytes_for(1, splits_for(context), 512, heads),
+      bytes_for(1, default_splits(context, 1, false, true), 256, heads));
+}
+
+template<unsigned Heads, bool Global, bool Paged>
+static void frozen_prefix(const BF16* query, const Cache& cache, const BF16* norm,
+                          unsigned base, BF16* output, void* scratch,
+                          unsigned splits, cudaStream_t stream) {
+  constexpr unsigned D = Global ? 512 : 256;
+  constexpr unsigned KvHeads = Global ? Heads / 8 : Heads / 2;
+  const auto entries = std::size_t(Heads) * splits;
+  auto* partial = static_cast<float*>(scratch);
+  auto* maxima = partial + entries * D;
+  auto* denominator = maxima + entries;
+  partial_attention<Global, Paged, true, Heads>
+      <<<dim3(KvHeads, 1, splits), kThreads, 0, stream>>>(query, nullptr,
+          nullptr, cache, norm, base, 1, 0, splits, partial, maxima, denominator);
+  check_launch();
+  finalize_attention<D, Heads><<<Heads, kThreads, 0, stream>>>(
+      partial, maxima, denominator, 0, splits, output);
+  check_launch();
+}
+
+void run_frozen_prefix(const BF16* query, const Cache& cache, const BF16* norm,
+                       std::uint32_t processed, unsigned heads,
+                       gemma4_31b::AttentionKind kind, BF16* output,
+                       void* scratch, std::size_t bytes, cudaStream_t stream) {
+  if ((heads != 16 && heads != 32) ||
+      (cache.format != kv_cache::Format::bf16 && cache.format != kv_cache::Format::fp8))
+    throw std::invalid_argument("MTP frozen attention invalid heads or cache format");
+  const auto splits = checked_splits(query, nullptr, nullptr, cache, norm,
+      processed, 1, kind, output, scratch, bytes, true, heads);
+  const bool global = kind == gemma4_31b::AttentionKind::global;
+  const auto launch = [&](auto head_count) {
+    constexpr unsigned Heads = decltype(head_count)::value;
+    if (!global) frozen_prefix<Heads, false, false>(query, cache, norm, processed,
+        output, scratch, splits, stream);
+    else if (cache.page_pool) frozen_prefix<Heads, true, true>(query, cache, norm,
+        processed, output, scratch, splits, stream);
+    else frozen_prefix<Heads, true, false>(query, cache, norm, processed,
+        output, scratch, splits, stream);
+  };
+  if (heads == 16) launch(std::integral_constant<unsigned, 16>{});
+  else launch(std::integral_constant<unsigned, 32>{});
+}
+
+namespace {
+template<unsigned Heads, bool Global, bool Paged, bool Frozen = true>
+__global__ __launch_bounds__(kThreads, 2) void single_row_batch_partial(
+    const __grid_constant__ AttentionBatch batch, const BF16* norm) {
+  unsigned index = 0;
+  while (blockIdx.y >= batch.tiles[index].end_blocks) ++index;
+  const auto& tile = batch.tiles[index];
+  const unsigned split = blockIdx.y - (index ? batch.tiles[index - 1].end_blocks : 0);
+  const auto& input = tile.input;
+  partial_attention_body<Global, Paged, Frozen, false, Heads>(input.query,
+      input.staged_key, input.staged_value, input.cache, norm, input.base_position, 1, 0,
+      tile.splits, tile.partial, tile.maxima, tile.denominators,
+      blockIdx.x, 0, split);
+}
+
+template<unsigned Heads, bool Global, bool Paged, bool Frozen = true>
+void launch_single_row_batch(const AttentionBatch& batch, unsigned count,
+                         const BF16* norm, cudaStream_t stream) {
+  single_row_batch_partial<Heads, Global, Paged, Frozen>
+      <<<dim3(Global ? Heads / 8 : Heads / 2, batch.tiles[count - 1].end_blocks),
+         kThreads, 0, stream>>>(batch, norm);
+  check_launch();
+  batched_finalize_attention<Global ? 512 : 256, Heads>
+      <<<dim3(Heads, count), kThreads, 0, stream>>>(batch);
+  check_launch();
+}
+
+template<unsigned Heads, bool Frozen = true>
+void fixed_split_batch(const std::vector<BatchInput>& inputs, const BF16* norm,
+                  bool global, void* scratch, std::size_t bytes, cudaStream_t stream) {
+  AttentionBatch batch{};
+  unsigned count = 0, blocks = 0;
+  std::size_t used = 0;
+  bool paged = false;
+  const auto flush = [&] {
+    if (!count) return;
+    if (!global) launch_single_row_batch<Heads, false, false, Frozen>(batch, count, norm, stream);
+    else if (paged) launch_single_row_batch<Heads, true, true, Frozen>(batch, count, norm, stream);
+    else launch_single_row_batch<Heads, true, false, Frozen>(batch, count, norm, stream);
+    count = blocks = 0;
+    used = 0;
+  };
+  const unsigned D = global ? 512 : 256;
+  for (const auto& input : inputs) {
+    const auto splits = default_splits(input.base_position, 1, global, Frozen);
+    const auto needed = bytes_for(1, splits, D, Heads);
+    if (count == kBatchTiles || needed > bytes - used ||
+        (count && global && paged != bool(input.cache.page_pool))) flush();
+    paged = bool(input.cache.page_pool);
+    auto* partial = reinterpret_cast<float*>(static_cast<unsigned char*>(scratch) + used);
+    auto* maxima = partial + std::size_t(Heads) * splits * D;
+    batch.tiles[count] = {input, 0, 1, splits, 1, blocks + splits, count + 1,
+        partial, maxima, maxima + std::size_t(Heads) * splits};
+    ++count;
+    blocks += splits;
+    used += needed;
+  }
+  flush();
+}
+}  // namespace
+
+void run_frozen_prefix_batch(unsigned heads, const std::vector<BatchInput>& inputs,
+                             const BF16* norm, gemma4_31b::AttentionKind kind,
+                             void* scratch, std::size_t bytes, cudaStream_t stream) {
+  if ((heads != 16 && heads != 32) || inputs.empty())
+    throw std::invalid_argument("MTP frozen attention invalid heads or empty batch");
+  for (const auto& input : inputs) {
+    if (input.cache.format != kv_cache::Format::bf16 && input.cache.format != kv_cache::Format::fp8)
+      throw std::invalid_argument("MTP frozen attention invalid cache format");
+    checked_splits(input.query, nullptr, nullptr, input.cache, norm,
+        input.base_position, input.rows, kind, input.context, scratch, bytes, true, heads);
+  }
+  const bool global = kind == gemma4_31b::AttentionKind::global;
+  if (heads == 16) fixed_split_batch<16>(inputs, norm, global, scratch, bytes, stream);
+  else fixed_split_batch<32>(inputs, norm, global, scratch, bytes, stream);
+}
+
+void run_decode_batch(unsigned heads, const std::vector<BatchInput>& inputs,
+                      const BF16* norm, gemma4_31b::AttentionKind kind,
+                      void* scratch, std::size_t bytes, cudaStream_t stream) {
+  if ((heads != 16 && heads != 32) || inputs.empty())
+    throw std::invalid_argument("Decode attention invalid heads or empty batch");
+  for (const auto& input : inputs) {
+    if (input.rows != 1 || input.local_image ||
+        (input.cache.format != kv_cache::Format::bf16 && input.cache.format != kv_cache::Format::fp8))
+      throw std::invalid_argument("Decode attention requires one causal row per input");
+    checked_splits(input.query, input.staged_key, input.staged_value, input.cache, norm,
+        input.base_position, 1, kind, input.context, scratch, bytes, false, heads);
+  }
+  const bool global = kind == gemma4_31b::AttentionKind::global;
+  const auto launch = [&](auto head_count) {
+    constexpr unsigned Heads = decltype(head_count)::value;
+    if (!global) {
+      // Keep each local CTA to one 32-key tile. Larger tiles serialize the
+      // scalar local P*V loop and lose the benefit of coalescing requests.
+      fixed_split_batch<Heads, false>(inputs, norm, false, scratch, bytes, stream);
+      return;
+    }
+    AttentionBatch batch{};
+    unsigned count = 0;
+    bool paged = false;
+    const auto flush = [&] {
+      if (!count) return;
+      if (paged) launch_single_row_batch<Heads, true, true, false>(batch, count, norm, stream);
+      else launch_single_row_batch<Heads, true, false, false>(batch, count, norm, stream);
+      count = 0;
+    };
+    for (const auto& input : inputs) {
+      if (count == kBatchTiles || (count && paged != bool(input.cache.page_pool))) flush();
+      paged = bool(input.cache.page_pool);
+      const AttentionTile tile{input, 0, 1, 0, 1};
+      batch.tiles[count] = tile;
+      if (!plan_batch(batch, count + 1, global, scratch, bytes, false, Heads)) {
+        flush();
+        batch.tiles[0] = tile;
+        if (!plan_batch(batch, 1, global, scratch, bytes, false, Heads))
+          throw std::logic_error("Validated decode attention tile does not fit scratch");
+      }
+      ++count;
+    }
+    flush();
+  };
+  if (heads == 16) launch(std::integral_constant<unsigned, 16>{});
+  else launch(std::integral_constant<unsigned, 32>{});
+}
+
+template<unsigned Heads>
+static void fp8_batch(const std::vector<BatchInput>& inputs, const BF16* k_norm,
                    gemma4_31b::AttentionKind kind, void* scratch,
                    std::size_t bytes, cudaStream_t stream, bool frozen) {
   if (inputs.empty()) throw std::invalid_argument("FP8 attention batch is empty");
-  for (const auto& i : inputs)
+  for (const auto& i : inputs) {
+    if (i.local_image && (Heads != 16 || frozen || kind != gemma4_31b::AttentionKind::local || i.rows > 1120))
+      throw std::invalid_argument("FP8 image attention requires a complete 26B local image span");
     checked_splits(i.query, i.staged_key, i.staged_value, i.cache, k_norm,
-        i.base_position, i.rows, kind, i.context, scratch, bytes, frozen);
+        i.base_position, i.rows, kind, i.context, scratch, bytes, frozen, Heads, Heads == 16 ? 4096 : 1280);
+  }
   const bool global = kind == gemma4_31b::AttentionKind::global;
   AttentionBatch batch{};
   unsigned count = 0;
@@ -1249,14 +1431,14 @@ void run_fp8_batch(const std::vector<BatchInput>& inputs, const BF16* k_norm,
   const auto flush = [&] {
     if (!count) return;
     if (global && paged) {
-      if (frozen) launch_fp8_attention<true, true, true>(batch, count, k_norm, stream);
-      else launch_fp8_attention<true, true, false>(batch, count, k_norm, stream);
+      if (frozen) launch_fp8_attention<Heads, true, true, true>(batch, count, k_norm, stream);
+      else launch_fp8_attention<Heads, true, true, false>(batch, count, k_norm, stream);
     } else if (global) {
-      if (frozen) launch_fp8_attention<true, false, true>(batch, count, k_norm, stream);
-      else launch_fp8_attention<true, false, false>(batch, count, k_norm, stream);
+      if (frozen) launch_fp8_attention<Heads, true, false, true>(batch, count, k_norm, stream);
+      else launch_fp8_attention<Heads, true, false, false>(batch, count, k_norm, stream);
     } else {
-      if (frozen) launch_fp8_attention<false, false, true>(batch, count, nullptr, stream);
-      else launch_fp8_attention<false, false, false>(batch, count, nullptr, stream);
+      if (frozen) launch_fp8_attention<Heads, false, false, true>(batch, count, nullptr, stream);
+      else launch_fp8_attention<Heads, false, false, false>(batch, count, nullptr, stream);
     }
     count = 0;
   };
@@ -1268,15 +1450,35 @@ void run_fp8_batch(const std::vector<BatchInput>& inputs, const BF16* k_norm,
       const unsigned group_rows = global ? (frozen ? 2 : 4) : 8;
       const AttentionTile tile{i, first, rows, 0, (rows + group_rows - 1) / group_rows};
       batch.tiles[count] = tile;
-      if (!plan_batch(batch, count + 1, global, scratch, bytes, frozen)) {
+      if (!plan_batch(batch, count + 1, global, scratch, bytes, frozen, Heads)) {
         flush(); batch.tiles[0] = tile;
-        if (!plan_batch(batch, 1, global, scratch, bytes, frozen))
+        if (!plan_batch(batch, 1, global, scratch, bytes, frozen, Heads))
           throw std::logic_error("validated FP8 attention tile does not fit scratch");
       }
       ++count;
     }
   }
   flush();
+}
+
+std::size_t fp8_scratch_bytes(unsigned heads, std::uint32_t rows, std::uint32_t context) {
+  if ((heads != 16 && heads != 32) || !rows || rows > (heads == 16 ? 4096U : 1280U) ||
+      !context || context > kMaxContext)
+    throw std::invalid_argument("FP8 attention scratch geometry outside capacity");
+  return std::max(bytes_for(rows, splits_for(context), 512, heads),
+                 bytes_for(rows, default_splits(context, rows, false), 256, heads));
+}
+
+void run_fp8_batch(unsigned heads, const std::vector<BatchInput>& inputs, const BF16* k_norm,
+                   gemma4_31b::AttentionKind kind, void* scratch,
+                   std::size_t bytes, cudaStream_t stream, bool frozen) {
+  if (heads != 16 && heads != 32)
+    throw std::invalid_argument("FP8 attention invalid query head count");
+  for (const auto& i : inputs)
+    if (i.cache.format != kv_cache::Format::bf16 && i.cache.format != kv_cache::Format::fp8)
+      throw std::invalid_argument("FP8 attention invalid KV storage format");
+  if (heads == 16) fp8_batch<16>(inputs, k_norm, kind, scratch, bytes, stream, frozen);
+  else fp8_batch<32>(inputs, k_norm, kind, scratch, bytes, stream, frozen);
 }
 
 static void run_impl(const BF16* query, const BF16* staged_key, const BF16* staged_value,
@@ -1385,28 +1587,35 @@ void run_batch(const std::vector<BatchInput>& inputs, const BF16* k_norm,
     }
     count = 0;
   };
-  for (const auto& i : inputs) {
-    for (unsigned first = 0; first < i.rows; first += kQueryTileRows) {
-      const auto tile_rows = std::min(kQueryTileRows, i.rows - first);
-      if (count == kBatchTiles ||
-          (count && (paged != bool(i.cache.page_pool) || four_rows != (i.rows > 1) ||
-                     batch.tiles[0].input.cache.format != i.cache.format))) flush();
-      paged = bool(i.cache.page_pool);
-      four_rows = i.rows > 1;
-      const unsigned group_rows = global ? 4 : 8;
-      const auto groups = four_rows ? (tile_rows + group_rows - 1) / group_rows : tile_rows;
-      const AttentionTile tile{i, first, tile_rows, 0, groups};
-      batch.tiles[count] = tile;
-      if (!plan_batch(batch, count + 1, global, scratch, bytes)) {
-        flush();
-        batch.tiles[0] = tile;
-        if (!plan_batch(batch, 1, global, scratch, bytes))
-          throw std::logic_error("validated MTP attention tile does not fit scratch");
+  // A depth-zero request needs the single-row specialization. Interleaving
+  // those requests with draft prefixes needlessly flushes compatible tiles.
+  // Visit each specialization together; request buffers and causal bounds stay
+  // attached to their own descriptors, and launches still reuse scratch serially.
+  for (const bool multirow : {false, true}) {
+    for (const auto& i : inputs) {
+      if ((i.rows > 1) != multirow) continue;
+      for (unsigned first = 0; first < i.rows; first += kQueryTileRows) {
+        const auto tile_rows = std::min(kQueryTileRows, i.rows - first);
+        if (count == kBatchTiles ||
+            (count && (paged != bool(i.cache.page_pool) ||
+                       batch.tiles[0].input.cache.format != i.cache.format))) flush();
+        paged = bool(i.cache.page_pool);
+        four_rows = i.rows > 1;
+        const unsigned group_rows = global ? 4 : 8;
+        const auto groups = four_rows ? (tile_rows + group_rows - 1) / group_rows : tile_rows;
+        const AttentionTile tile{i, first, tile_rows, 0, groups};
+        batch.tiles[count] = tile;
+        if (!plan_batch(batch, count + 1, global, scratch, bytes)) {
+          flush();
+          batch.tiles[0] = tile;
+          if (!plan_batch(batch, 1, global, scratch, bytes))
+            throw std::logic_error("validated MTP attention tile does not fit scratch");
+        }
+        ++count;
       }
-      ++count;
     }
+    flush();
   }
-  flush();
 }
 
 void run_frozen_global_batch(const std::vector<BatchInput>& inputs,

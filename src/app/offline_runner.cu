@@ -6,6 +6,7 @@
 #include "gewell/vision_engine.h"
 #include "gewell/weight_qdq.h"
 #include "models/gemma4/31b/sm120/runtime_backend.h"
+#include "models/gemma4/26b_a4b/sm120/runtime_backend.h"
 #include "models/gemma4/31b/sm120/weights.cuh"
 #include "models/gemma4/31b/sm120/runner_support.cuh"
 #include "offline_io.h"
@@ -111,7 +112,7 @@ struct Job {
   }
 };
 
-BatchRequest parse_request(const Json& command, Job& job, std::uint32_t max_context) {
+BatchRequest parse_request(const Json& command, Job& job, std::uint32_t max_context, const text::TextContract& contract) {
   keys(command, {"op", "id", "prompt_path", "max_tokens", "temperature", "top_p", "top_k",
       "seed", "honor_eos", "cache", "checkpoint_offsets", "prepared_images", "outputs", "prompt_id"});
   BatchRequest request;
@@ -143,7 +144,7 @@ BatchRequest parse_request(const Json& command, Job& job, std::uint32_t max_cont
     const auto* p = input.data() + 4 * i;
     (*prompt)[i] = std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) |
         (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24);
-    if ((*prompt)[i] >= gemma4::text_contract_31b().vocabulary_size)
+    if ((*prompt)[i] >= contract.vocabulary_size)
       throw std::invalid_argument("prompt token is outside the vocabulary");
   }
   request.prompt = prompt;
@@ -153,7 +154,7 @@ BatchRequest parse_request(const Json& command, Job& job, std::uint32_t max_cont
   (void)generation_cache_capacity(prompt->size(), request.max_new_tokens, max_context);
   request.sampling.temperature = command.value("temperature", 0.0F);
   request.sampling.top_p = command.value("top_p", 1.0F);
-  request.sampling.top_k = integer(command, "top_k", 0, gemma4::text_contract_31b().vocabulary_size);
+  request.sampling.top_k = integer(command, "top_k", 0, contract.vocabulary_size);
   if (!std::isfinite(request.sampling.temperature) || request.sampling.temperature < 0 ||
       !std::isfinite(request.sampling.top_p) || request.sampling.top_p < 0 || request.sampling.top_p > 1)
     throw std::invalid_argument("temperature must be nonnegative and top_p must be in [0,1]");
@@ -248,11 +249,11 @@ Json stats_json(const kv_cache::CacheStats& stats) {
       {"copy_on_write_pages", stats.copy_on_write_pages}};
 }
 
-Json result(const BatchRequest& request, std::uint32_t mtp_depth) {
+Json result(const BatchRequest& request, std::uint32_t mtp_depth, const text::TextContract& contract) {
   const auto operation = request.operation == Operation::generate ? "generate" :
       request.operation == Operation::prefill ? "prefill" : request.operation == Operation::finish ? "finish" : "stats";
   const bool stopped = request.honor_eos && !request.outputs.empty() &&
-      gemma4::text_contract_31b().is_stop(request.outputs.back());
+      contract.is_stop(request.outputs.back());
   Json out{{"event", "offline_result"}, {"id", request.id}, {"operation", operation},
       {"prompt_tokens", request.prompt->size()}, {"completion_tokens", request.completion_tokens},
       {"processed_tokens", request.cursor}, {"cached_tokens", request.cached_tokens},
@@ -273,14 +274,23 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
              RuntimeSettings settings, const std::string& qdq_mask_path) {
   settings.mtp_depth = effective_mtp_depth(settings.mtp_depth, settings.assistant_path, settings.mtp_min_depth);
   if (!settings.mtp_depth) settings.mtp_min_depth = 0;
-  const auto limits = live_batch_limits(max_batch, settings, 256);
+  const auto selected_model = artifact_model(artifact_path);
+  const auto& contract = text_contract(selected_model);
+  const auto limits = live_batch_limits(max_batch, settings, 256, selected_model);
   Signals signals;
   DiagnosticsToStderr diagnostics;
   offline::Channel channel(STDIN_FILENO, STDOUT_FILENO);
-  auto file = artifact::ArtifactFile::Open(artifact_path);
-  const auto mask = qdq_mask_path.empty() ? qdq::Mask{} : qdq::Mask::Load(qdq_mask_path);
   sm120::validate_cuda_device();
-  sm120::WeightArena weights(file, mask, settings.mtp_depth ? settings.assistant_path : "", settings.vision_path);
+  std::unique_ptr<sm120::WeightArena> weights;
+  std::unique_ptr<ExecutionBackend> backend;
+  if (selected_model == ModelKind::gemma4_26b_a4b) {
+    backend = gemma4_26b_a4b::sm120::make_runtime_backend(gemma4_26b_a4b::ArtifactFile::Open(artifact_path), limits, settings.nvfp4_activation_policy, settings.assistant_path, settings.vision_path, qdq_mask_path);
+  } else {
+    auto file = artifact::ArtifactFile::Open(artifact_path);
+    const auto mask = qdq_mask_path.empty() ? qdq::Mask{} : qdq::Mask::Load(qdq_mask_path);
+    weights = std::make_unique<sm120::WeightArena>(file, mask, settings.mtp_depth ? settings.assistant_path : "", settings.vision_path);
+    backend = sm120::make_runtime_backend(*weights, limits, settings.nvfp4_activation_policy);
+  }
   std::map<std::string, Job> jobs;
   const auto prepared_image_bytes = std::make_shared<std::size_t>(0);
   std::vector<std::string> retired;
@@ -338,7 +348,7 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
   };
   callbacks.emit = [&](auto& request, const auto* tokens, std::size_t count, const void* logits, const TokenLogprobs*) {
     auto& job = jobs.at(request.id);
-    if (job.logits) job.logits->append(logits, count * std::size_t(gemma4::text_contract_31b().vocabulary_size) * 2);
+    if (job.logits) job.logits->append(logits, count * std::size_t(contract.vocabulary_size) * 2);
     channel.event(Json{{"event", "offline_tokens"}, {"id", request.id},
         {"tokens", std::vector<std::uint32_t>(tokens, tokens + count)}}.dump());
   };
@@ -350,7 +360,7 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
       job.tokens->complete();
     }
     if (job.logits) job.logits->complete();
-    job.result_event = channel.event(result(request, limits.mtp_depth).dump());
+    job.result_event = channel.event(result(request, limits.mtp_depth, contract).dump());
   };
   callbacks.done = [&](auto& request) {
     auto& job = jobs.at(request.id);
@@ -361,7 +371,7 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
           {"processed_tokens", request.cursor}}.dump());
     }
     log(request.phase == BatchPhase::cancelled ? "offline_batch_cancelled" : "offline_batch_result",
-        result(request, limits.mtp_depth));
+        result(request, limits.mtp_depth, contract));
     stats_dirty = true;
     retired.push_back(request.id);
   };
@@ -415,7 +425,7 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
         if (jobs.count(id)) throw std::invalid_argument("id is already active");
         if (jobs.size() == limits.max_requests) throw BatchCapacityError("offline job queue is full (256 jobs)");
         Job job;
-        auto request = parse_request(command, job, limits.max_horizon);
+        auto request = parse_request(command, job, limits.max_horizon, contract);
         if (!request.images.empty() && settings.vision_path.empty())
           throw std::invalid_argument("image input requires --vision PATH");
         const auto slot = current->submit(std::move(request));
@@ -428,17 +438,17 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
       }
     }
   };
-  BatchScheduler scheduler(sm120::make_runtime_backend(weights, limits, settings.nvfp4_activation_policy),
+  BatchScheduler scheduler(std::move(backend),
                            limits, std::move(callbacks));
   current = &scheduler;
   scheduler.write_startup_capacity();
   channel.event(Json{{"event", "offline_ready"}, {"max_batch", max_batch}, {"max_pending", limits.max_requests},
       {"prefill_chunk_tokens", limits.prefill_chunk_tokens}, {"prefill_batch_tokens", limits.prefill_batch_tokens},
       {"prefill_budget_tokens", limits.prefill_budget_tokens},
-      {"max_context_tokens", limits.max_horizon}, {"vocab_size", gemma4::text_contract_31b().vocabulary_size},
+      {"max_context_tokens", limits.max_horizon}, {"vocab_size", contract.vocabulary_size},
       {"mtp_depth", limits.mtp_depth}, {"mtp_min_depth", limits.mtp_min_depth},
       {"decode_width", limits.decode_width}, {"max_logit_chunk_bytes",
-          (std::size_t(limits.mtp_depth) + 1) * gemma4::text_contract_31b().vocabulary_size * 2}}.dump());
+          (std::size_t(limits.mtp_depth) + 1) * contract.vocabulary_size * 2}}.dump());
   while (!shutdown && (!channel.eof() || scheduler.has_pending() || !channel.empty())) {
     const bool progressed = scheduler.step();
     for (const auto& id : retired) {

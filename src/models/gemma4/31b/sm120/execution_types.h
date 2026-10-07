@@ -9,7 +9,7 @@
 
 namespace gewell::gemma4_31b::sm120 {
 
-using LayerCacheView = mtp_target::CacheView;
+using LayerCacheView = kv_cache::DeviceView;
 constexpr auto kLocalCacheCapacity = model::kLocalWindowSize;
 constexpr std::size_t kLocalCacheBytesPerKind = std::size_t(model::kLocalLayerCount) * model::kLocalKvHeadCount * kLocalCacheCapacity * model::kLocalHeadSize * sizeof(BFloat16);
 

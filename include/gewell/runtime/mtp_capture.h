@@ -11,9 +11,10 @@ struct MtpOutcome;
 
 class MtpCapture {
  public:
-  explicit MtpCapture(const BatchLimits& limits);
+  MtpCapture(const BatchLimits& limits, const MtpCaptureGeometry& geometry);
   ~MtpCapture();
   bool enabled() const;
+  const std::vector<std::uint32_t>& layers() const;
   // First unused request sequence after the existing capture.
   std::uint64_t next_sequence() const;
   // Deterministic sampling, independent of inference RNG and acceptance. Each

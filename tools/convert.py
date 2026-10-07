@@ -393,8 +393,10 @@ def convert(source_path: Path, mask: str, input_scales: dict, output: Path,
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--architecture", choices=("gemma4_31b", "gemma4_26b_a4b"),
+                        default="gemma4_31b", help="fixed model architecture (independent of serving alias)")
     inputs = parser.add_mutually_exclusive_group()
-    inputs.add_argument("--snapshot", type=Path, help="Gemma 4 31B safetensors file or directory")
+    inputs.add_argument("--snapshot", type=Path, help="safetensors file or directory for the selected architecture")
     inputs.add_argument("--artifact", type=Path, help="native source weights")
     parser.add_argument("--mask", type=Path, help="LAYER PROJECTION TYPE mask; omitted projections retain source storage")
     parser.add_argument("--input-scales", type=Path,
@@ -406,6 +408,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--verify", type=Path, help="fully verify existing native weights")
     args = parser.parse_args(argv)
     try:
+        if args.architecture == "gemma4_26b_a4b":
+            from tools.gemma4_26b_convert import convert_bundle
+            print(json.dumps(convert_bundle(args), indent=2))
+            return 0
         specs = bf16.expected_tensor_specs()
         if args.verify is not None:
             with args.verify.open("rb") as stream:

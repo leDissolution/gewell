@@ -30,6 +30,7 @@ struct BackendLimits {
   std::size_t logit_row_bytes{};
   std::vector<std::uint32_t> stop_tokens;
   std::uint32_t max_image_tokens{};
+  MtpCaptureGeometry mtp_capture;
 };
 struct BatchMemoryPlan {
   std::size_t staging_bytes{}, hidden_slots{}, hidden_staging_bytes{}, committed_kv_bytes{};
@@ -44,6 +45,15 @@ struct BatchPrefillInput {
   std::uint32_t position{}, rows{};
   TerminalState hidden;
   std::shared_ptr<const ImageInput> image;
+};
+struct MtpDepthInput {
+  kv_cache::ExecutionId execution{};
+  std::uint32_t position{}, pending_token{}, output_begin{};
+  TerminalState target_hidden;
+  SamplingSettings sampling;
+  std::uint32_t previous_accepted{}, previous_depth{};
+  std::uint64_t prior_accepted{}, prior_proposed{};
+  std::uint32_t min_depth{}, max_depth{};
 };
 struct BatchMtpInput {
   kv_cache::ExecutionId execution{};
@@ -134,6 +144,7 @@ class ExecutionBackend {
                                    const std::uint32_t*) = 0;
   virtual void check_constraint_sampling() = 0;
   virtual BatchMtpOutcome run_batch_mtp(const std::vector<BatchMtpInput>&) = 0;
+  virtual std::vector<std::uint32_t> predict_mtp_depths(const std::vector<MtpDepthInput>&) = 0;
   virtual void commit_batch_mtp(const std::vector<BatchMtpCommit>&) = 0;
   virtual void download_ids(std::size_t) = 0;
   virtual void download_logits(std::size_t) = 0;

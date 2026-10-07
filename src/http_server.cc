@@ -1,4 +1,5 @@
 #include "gewell/http_server.h"
+#include "gewell/chat_codec.h"
 #include "gewell/console.h"
 #include "gewell/metrics.h"
 
@@ -487,7 +488,19 @@ struct Server::Impl {
       std::optional<Request> request;
       std::optional<Error> error;
       if (alive) {
-        try { request = parse_request(client->method, client->path, body, tokenizer, settings.model, compiler, bounded_images); }
+        try {
+          request = parse_request(client->method, client->path, body, tokenizer, settings.model, compiler, bounded_images);
+          if (settings.verbose && request->prompt) {
+            text::IncrementalTextDecoder decoder(tokenizer);
+            std::string prompt;
+            for (const auto token : *request->prompt) prompt += decoder.push(token);
+            prompt += decoder.finish();
+            console::event("server_request_prompt",
+                {{"request_id", client->request_id}, {"path", client->path.substr(0, client->path.find('?'))},
+                 {"prompt", prompt}},
+                "Request " + client->request_id + " prompt: " + prompt);
+          }
+        }
         catch (const Error& problem) { error = problem; }
         catch (const std::exception&) { error = Error(500, "HTTP request preparation failed"); }
       }

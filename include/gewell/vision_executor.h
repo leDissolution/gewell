@@ -14,10 +14,8 @@ namespace gewell::vision_executor {
 
 using BFloat16 = __nv_bfloat16;
 
-// Physical tensors 832..1187, in artifact order with every tensor beginning
-// on the next 4 KiB boundary. The first byte is physical tensor 832, not the
-// beginning of the complete model payload.
-inline constexpr std::size_t kVisionWeightSliceBytes = 1'151'897'600;
+// Separate component order, with each tensor padded to a 4 KiB boundary.
+std::size_t vision_weight_slice_bytes(vision_engine::Model model);
 
 struct VisionWeightSlice {
   // base must be 256-byte aligned.
@@ -53,7 +51,8 @@ class CaptureSink {
 // request buffers, stream, and their lifetimes remain caller-owned.
 class VisionExecutor {
  public:
-  VisionExecutor(VisionWeightSlice weights, std::uint32_t soft_token_count);
+  VisionExecutor(vision_engine::Model model, VisionWeightSlice weights,
+                 std::uint32_t soft_token_count);
   ~VisionExecutor();
 
   VisionExecutor(const VisionExecutor&) = delete;

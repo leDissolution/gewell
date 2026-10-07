@@ -1,6 +1,7 @@
 #include "runtime_backend.h"
 #include "batch_execution.cuh"
 #include "vision/prepared_image.h"
+#include "mtp/head.h"
 #include "gewell/runtime/scheduler.h"
 
 namespace gewell::gemma4_31b::sm120 {
@@ -13,6 +14,26 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
         memory_(limits.kv_bytes, limits.capacity, limits.mtp_depth, limits.local_kv_format, limits.global_kv_format),
         config_(compact_pool_config(memory_.committed_kv_bytes, limits.cpu_bytes, limits.index_bytes, limits.local_kv_format, limits.global_kv_format)),
         execution_(memory_, limits.capacity, limits.mtp_depth) {
+    if (!limits.mtp_head.path.empty()) {
+      if (!limits.mtp_depth || !std::isfinite(limits.mtp_head.threshold) ||
+          limits.mtp_head.threshold < 0 || limits.mtp_head.threshold > 1)
+        fail("MTP head", "requires positive --mtp-depth and threshold in [0,1]");
+      if (!std::isfinite(limits.mtp_head.tail_fraction) || limits.mtp_head.tail_fraction < 0 ||
+          limits.mtp_head.tail_fraction > 1 || (limits.mtp_head.tail_fraction > 0 && !limits.decode_width))
+        fail("MTP head", "tail fraction must be in [0,1] and requires positive --decode-width");
+      head_ = std::make_unique<mtp_head::Head>(limits.mtp_head.path, limits.capacity);
+      if (limits.mtp_depth > head_->max_depth())
+        fail("MTP head", "--mtp-depth exceeds trained head horizon");
+      head_threshold_ = limits.mtp_head.threshold;
+      head_tail_fraction_ = limits.mtp_head.tail_fraction;
+      head_width_ = limits.decode_width;
+      head_probes_ = std::make_unique<DeviceAllocation>(
+          std::size_t(limits.capacity) * head_->layers().size() * model::kHiddenSize * sizeof(BFloat16));
+      console::field("mtp_head_path", limits.mtp_head.path);
+      console::field("mtp_head_threshold", head_threshold_);
+      console::field("mtp_head_tail_fraction", head_tail_fraction_);
+      console::field("mtp_head_bytes", head_->bytes() + head_probes_->size());
+    }
     log_nvfp4_policy(weights, policy);
     console::field("attention_local_compute", attention::compute_name(limits.local_attention_compute));
     console::field("attention_global_compute", attention::compute_name(limits.global_attention_compute));
@@ -30,7 +51,7 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
   kv_cache::PoolConfig cache_config() const override { return config_; }
   runtime::CacheStorageFactory cache_storage_factory() const override {
     return [](const auto& config, auto& ledger, std::size_t offsets) {
-      return std::make_unique<PhysicalCache>(config, ledger, offsets);
+      return std::make_unique<runtime::PhysicalCache>(kCacheGeometry, config, ledger, offsets);
     };
   }
   void allocate_staging() override { execution_.allocate_staging(); }
@@ -129,7 +150,41 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
     execution_.engine->prefix_head_step(id, nullptr, static_cast<const BFloat16*>(hidden.value));
   }
   void decode_batch(const std::vector<runtime::BatchDecodeInput>& inputs) override {
+    previous_probes_.clear();
     execution_.engine->decode_batch(inputs);
+  }
+  std::vector<std::uint32_t> predict_mtp_depths(const std::vector<runtime::MtpDepthInput>& inputs) override {
+    std::vector<MtpDepthPrediction> predictions;
+    std::vector<mtp_head::Input> features;
+    std::vector<std::size_t> rows;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      const auto& input = inputs[i];
+      predictions.push_back({input.min_depth, input.max_depth, {}});
+      if (input.min_depth == input.max_depth) continue;
+      for (std::size_t j = 0; j < previous_probes_.size(); ++j) {
+        const auto& old = previous_probes_[j];
+        if (old.execution != input.execution || old.position != input.position || old.token != input.pending_token) continue;
+        const float horizon = head_->max_depth();
+        mtp_head::Input feature;
+        feature.probes = static_cast<const BFloat16*>(head_probes_->data()) +
+            j * head_->layers().size() * model::kHiddenSize;
+        feature.final_hidden = static_cast<const BFloat16*>(input.target_hidden.value);
+        feature = {feature.probes, feature.final_hidden, {input.sampling.temperature, input.sampling.top_p,
+            float(std::log1p(input.sampling.top_k) / 16), float(std::log1p(input.position) / 16),
+            float(std::log1p(input.output_begin) / 16), input.previous_accepted / horizon,
+            input.previous_depth / horizon, float(double(input.prior_accepted) / std::max<std::uint64_t>(input.prior_proposed, 1)),
+            float(std::log1p(inputs.size()) / 8)}};
+        features.push_back(feature); rows.push_back(i); break;
+      }
+    }
+    if (!features.empty()) {
+      const auto probabilities = head_->predict(features, execution_.engine->stream());
+      for (std::size_t i = 0; i < rows.size(); ++i) {
+        predictions[rows[i]].survival.assign(probabilities.begin() + i * head_->max_depth(),
+            probabilities.begin() + (i + 1) * head_->max_depth());
+      }
+    }
+    return choose_mtp_depths(predictions, head_width_, head_threshold_, head_tail_fraction_);
   }
   void sample_batch_row(std::uint32_t row, const runtime::SamplingSettings& sampling,
                         std::mt19937_64& rng, const std::uint32_t* mask) override {
@@ -149,8 +204,19 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
           static_cast<const BFloat16*>(input.target_hidden.value), input.temperature, input.top_p,
           input.top_k, input.return_probabilities, input.uniforms,
           input.constraint_mask, input.capture, input.capture_next});
+      if (head_) proposals.back().depth_probes = {head_->layers(),
+          static_cast<BFloat16*>(head_probes_->data()) +
+              (proposals.size() - 1) * head_->layers().size() * model::kHiddenSize};
     }
     auto result = execution_.engine->run_batch_mtp(proposals);
+    if (head_) {
+      previous_probes_.assign(inputs.size(), {});
+      for (std::size_t i = 0; i < inputs.size(); ++i)
+        if (result.requests[i].status == mtp_sampling::Status::success)
+          previous_probes_[i] = {inputs[i].execution,
+              inputs[i].position + static_cast<std::uint32_t>(result.requests[i].tokens.size()),
+              result.requests[i].tokens.back()};
+    }
     runtime::BatchMtpOutcome output;
     output.draft_gpu_milliseconds = result.draft_gpu_milliseconds;
     output.verify_gpu_milliseconds = result.verify_gpu_milliseconds;
@@ -215,13 +281,20 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
   const runtime::BackendLimits limits_{model::kVocabSize, primitives::kMaxContextTokenCount,
       kMaxBatchRows, mtp_target::kMaxDepth, mtp_target::kMaxDepth + 1,
       kMaxPrefillChunkTokens, kMaxPrefillBatchTokens, kLocalWindowTokens, kGenerationLogitRowBytes,
-      {kGenerationStopTokenIds.begin(), kGenerationStopTokenIds.end()}, model::kVisionMaxSoftTokenCount};
+      {kGenerationStopTokenIds.begin(), kGenerationStopTokenIds.end()}, model::kVisionMaxSoftTokenCount,
+      {model::kHiddenSize, model::kAssistantHiddenSize, model::kLayerCount, {4, 12, 24, 40, 56}}};
   const BatchMemoryPlan memory_;
   const kv_cache::PoolConfig config_;
   std::unique_ptr<ExecutionCache> cache_;
   BatchExecution execution_;
   std::unique_ptr<PreparedImage> image_;
   std::unique_ptr<DeviceAllocation> image_features_;
+  std::unique_ptr<mtp_head::Head> head_;
+  std::unique_ptr<DeviceAllocation> head_probes_;
+  std::vector<runtime::BatchDecodeInput> previous_probes_;
+  float head_threshold_{};
+  float head_tail_fraction_{};
+  std::uint32_t head_width_{};
 };
 }
 std::unique_ptr<runtime::ExecutionBackend> make_runtime_backend(

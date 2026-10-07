@@ -1,4 +1,5 @@
 #pragma once
+#include "gewell/mtp_head.h"
 
 #include "gewell/attention_compute.h"
 #include "gewell/runtime/backend.h"
@@ -131,6 +132,7 @@ struct BatchLimits {
   std::string mtp_stats_path;
   std::uint32_t mtp_stats_window{64};
   MtpCaptureSettings mtp_capture;
+  MtpHeadSettings mtp_head;
   std::uint32_t prefill_chunk_tokens{0};
   std::uint32_t prefill_batch_tokens{0};
   // Soft prefill-token budget between decode passes; zero runs decode after
@@ -226,7 +228,7 @@ class BatchScheduler {
   std::uint64_t constraint_draft_downloads{}, constraint_mask_uploads{};
   std::uint64_t constraint_draft_bytes{}, constraint_mask_bytes{};
   double prefill_gpu_seconds{}, decode_gpu_seconds{}, mtp_draft_gpu_seconds{},
-         mtp_verify_gpu_seconds{}, mtp_select_gpu_seconds{};
+         mtp_verify_gpu_seconds{}, mtp_select_gpu_seconds{}, mtp_head_seconds{};
   std::size_t peak_batch{}, prefill_turn{};
   static void stop_waiting(BatchRequest& request);
 
@@ -282,6 +284,6 @@ class BatchScheduler {
   std::uint64_t prefill_since_decode{};
 
   std::chrono::steady_clock::time_point started{};
-  std::map<std::size_t, std::uint64_t> occupancy, verifier_occupancy;
+  std::map<std::size_t, std::uint64_t> occupancy, verifier_occupancy, mtp_depth_occupancy;
 };
 } // namespace gewell::runtime

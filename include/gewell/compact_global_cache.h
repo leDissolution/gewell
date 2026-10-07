@@ -2,7 +2,6 @@
 
 #include "gewell/kv_format.h"
 
-#include "gewell/models/gemma4/31b/model.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -11,7 +10,7 @@ namespace gewell::compact_global_cache {
 
 inline constexpr std::uint32_t kRotatedKeyElements = 128;
 inline constexpr std::uint32_t kRowElements =
-    kRotatedKeyElements + gemma4_31b::kGlobalHeadSize;
+    kRotatedKeyElements + 512;
 
 template <typename Element>
 struct PagedView {

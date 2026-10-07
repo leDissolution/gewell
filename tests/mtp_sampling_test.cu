@@ -522,6 +522,47 @@ void greedy_batch_tests() {
   std::cout << "mtp_greedy_batch: rows=129 bounded_groups_ties_masks_errors_ok\n";
 }
 
+void greedy_tiled_vocabulary_tests() {
+  constexpr unsigned rows = 5, vocabulary = 262144;
+  std::vector<__nv_bfloat16> logits(std::size_t(rows) * vocabulary,
+                                    __float2bfloat16(-2.0F));
+  // Ties span tiles, including the final token and the 4095/4096 boundary.
+  for (unsigned token : {4095U, 4096U, vocabulary - 1})
+    logits[token] = __float2bfloat16(3.0F);
+  logits[vocabulary + vocabulary - 1] = __float2bfloat16(4.0F);
+  logits[2 * vocabulary + 77] = __float2bfloat16(INFINITY);
+  logits[3 * vocabulary + 123] = __float2bfloat16(NAN);
+  logits[4 * vocabulary + 4095] = __float2bfloat16(-0.0F);
+  logits[4 * vocabulary + 4096] = __float2bfloat16(0.0F);
+  const auto words = mtp::mask_words(vocabulary);
+  std::vector<unsigned> mask(words, 0);
+  mask.back() = 1U << 31;
+  Device<__nv_bfloat16> dl(logits.size()); dl.put(logits);
+  Device<unsigned> dm(words), empty(words), best(rows), selected(rows);
+  dm.put(mask); empty.put(std::vector<unsigned>(words, 0));
+  Device<mtp::Status> status(rows);
+  std::vector<mtp::GreedyDistributionInput> inputs;
+  for (unsigned row = 0; row < rows; ++row)
+    inputs.push_back({dl.get() + std::size_t(row) * vocabulary, nullptr,
+        row == 1 ? dm.get() : row == 3 ? empty.get() : nullptr,
+        status.get() + row, best.get() + row, selected.get() + row});
+  for (unsigned repeat = 0; repeat < 20; ++repeat) {
+    status.put(std::vector<mtp::Status>(rows, mtp::Status::success));
+    mtp::build_greedy_distributions(inputs, vocabulary);
+    const auto ids = selected.read(rows);
+    const auto errors = status.read(rows);
+    expect(ids[0] == 4095 && ids[1] == vocabulary - 1 && ids[4] == 4095,
+           "tiled greedy changed cross-tile ties, masks or signed-zero order");
+    expect(errors[0] == mtp::Status::success && errors[1] == mtp::Status::success &&
+               errors[4] == mtp::Status::success,
+           "valid tiled greedy row failed");
+    expect(errors[2] == mtp::Status::invalid_logits && errors[3] == mtp::Status::invalid_logits &&
+               ids[2] == 0 && ids[3] == 0,
+           "tiled greedy lost invalid-logit priority, including masked NaN");
+  }
+  std::cout << "mtp_greedy_tiled: full_vocabulary_cross_tile_ties_masks_errors_repeat_PASS\n";
+}
+
 void greedy_verification_batch_tests() {
   constexpr std::uint32_t rows = 129, depth = 3, vocabulary = 8;
   std::vector<std::uint32_t> target_ids(std::size_t(rows) * (depth + 1));
@@ -1374,6 +1415,7 @@ int main(int argc, char** argv) {
     distribution_tests();
     masked_distribution_tests();
     greedy_batch_tests();
+    greedy_tiled_vocabulary_tests();
     greedy_verification_batch_tests();
     verification_cases();
     masked_verification_cases();

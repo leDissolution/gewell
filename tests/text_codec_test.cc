@@ -374,10 +374,13 @@ int main(int argc, char** argv) {
     std::ifstream input(argv[2]);
     require(input.good(), "cannot read committed oracle fixture");
     const json fixture = json::parse(input);
-    require(fixture.at("schema_version") == 1 &&
-                fixture.at("source").at("repository") == "google/gemma-4-31B-it" &&
-                fixture.at("source").at("revision") ==
-                    "842da3794eaa0b77d5f08bae87a17459d91ff475",
+    const auto& source = fixture.at("source");
+    const bool pinned_source =
+        (source.at("repository") == "google/gemma-4-31B-it" &&
+         source.at("revision") == "842da3794eaa0b77d5f08bae87a17459d91ff475") ||
+        (source.at("repository") == "google/gemma-4-26B-A4B-it" &&
+         source.at("revision") == "4d7ae4984b7db7de8f8457170b3f1a419ee76d52");
+    require(fixture.at("schema_version") == 1 && pinned_source,
             "fixture source is not the pinned serving revision");
     expect_equal(sha256(tokenizer_path), fixture.at("source").at("assets").at("tokenizer.json"),
                  "reference tokenizer SHA256");

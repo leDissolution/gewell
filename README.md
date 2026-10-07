@@ -1,6 +1,6 @@
 <img width="1672" height="350" alt="gewell" src="https://github.com/user-attachments/assets/53d54098-4310-4714-a343-a9cf6d84600f" />
 
-Gewell is a single-GPU inference engine for Gemma 4 31B (more to come) on NVIDIA Blackwell
+Gewell is a single-GPU inference engine for Gemma 4 31B and 26B A4B on NVIDIA Blackwell
 GPUs with compute capability 12.0 (`sm_120a`) (*potentially* more to come).
 
 Features include streamed responses, PNG/JPEG image input with configurable

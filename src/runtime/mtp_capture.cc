@@ -22,15 +22,20 @@ struct MtpCapture::Impl {
   mtp_file::File index, data;
   MtpCaptureSettings settings;
   std::uint64_t attempts{}, samples{}, offset{}, next_sequence{};
-  std::uint32_t target_width{}, assistant_width{};
+  const std::uint32_t target_width, assistant_width;
 
-  explicit Impl(const BatchLimits& limits) : settings(limits.mtp_capture) {
+  Impl(const BatchLimits& limits, const MtpCaptureGeometry& geometry)
+      : settings(limits.mtp_capture), target_width(geometry.target_width), assistant_width(geometry.assistant_width) {
+    if (!target_width || !assistant_width || !geometry.layer_count)
+      throw std::runtime_error("MTP capture requires the loaded model geometry");
+    if (settings.layers.empty()) settings.layers = geometry.default_layers;
     if (settings.path.empty() || !settings.every || !settings.max_samples || !limits.mtp_depth)
       throw std::runtime_error("MTP capture requires a directory, positive sampling limits, and MTP enabled");
-    if (settings.layers.empty() || !settings.layers.front() ||
+    if (settings.layers.empty() || !settings.layers.front() || settings.layers.back() > geometry.layer_count ||
         !std::is_sorted(settings.layers.begin(), settings.layers.end()) ||
         std::adjacent_find(settings.layers.begin(), settings.layers.end()) != settings.layers.end())
-      throw std::runtime_error("MTP capture requires increasing positive target layer counts");
+      throw std::runtime_error("--mtp-capture-layers must be increasing completed-layer counts in 1.." +
+                               std::to_string(geometry.layer_count));
     std::filesystem::create_directory(settings.path);
     const auto root = std::filesystem::path(settings.path);
     const auto index_path = (root / "samples.jsonl").string();
@@ -60,7 +65,6 @@ struct MtpCapture::Impl {
       const auto assistant = row.at("assistant_width").get<std::uint32_t>();
       const auto depth = row.at("depth").get<std::uint32_t>();
       const auto bytes = 2 * ((settings.layers.size() + 1) * target + std::uint64_t(depth) * assistant);
-      if (!samples) { target_width = target; assistant_width = assistant; }
       if (!target || !assistant || !depth || depth > limits.mtp_depth ||
           target != target_width || assistant != assistant_width || row.at("target_layers") != settings.layers ||
           row.at("sample") != samples || row.at("byte_offset") != offset || row.at("byte_length") != bytes)
@@ -94,8 +98,10 @@ struct MtpCapture::Impl {
   }
 };
 
-MtpCapture::MtpCapture(const BatchLimits& limits) : impl_(std::make_unique<Impl>(limits)) {}
+MtpCapture::MtpCapture(const BatchLimits& limits, const MtpCaptureGeometry& geometry)
+    : impl_(std::make_unique<Impl>(limits, geometry)) {}
 MtpCapture::~MtpCapture() = default;
+const std::vector<std::uint32_t>& MtpCapture::layers() const { return impl_->settings.layers; }
 bool MtpCapture::enabled() const { return impl_->index && impl_->attempts < impl_->settings.max_samples; }
 std::uint64_t MtpCapture::next_sequence() const { return impl_->next_sequence; }
 bool MtpCapture::select(std::uint64_t sequence, std::uint64_t cycle) {
@@ -111,8 +117,7 @@ void MtpCapture::record(const BatchRequest& request, const BatchMtpInput& input,
   auto& s = *impl_;
   if (!s.index || !input.capture || !result.error.empty()) return;
   const auto& features = *input.capture;
-  if (!features.target_width || !features.assistant_width ||
-      (s.target_width && (features.target_width != s.target_width || features.assistant_width != s.assistant_width)) ||
+  if (features.target_width != s.target_width || features.assistant_width != s.assistant_width ||
       features.target_hidden.size() != features.target_width ||
       features.assistant_hidden.size() != std::size_t(input.depth) * features.assistant_width ||
       features.draft_tokens.size() != input.depth || features.scores.size() != input.depth ||
@@ -122,8 +127,6 @@ void MtpCapture::record(const BatchRequest& request, const BatchMtpInput& input,
     s.disable("backend returned an invalid feature shape");
     return;
   }
-  s.target_width = features.target_width;
-  s.assistant_width = features.assistant_width;
   auto scores = nlohmann::json::array();
   for (const auto& score : features.scores)
     scores.push_back({score.draft_probability, score.target_probability,

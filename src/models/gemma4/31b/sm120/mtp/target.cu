@@ -1,4 +1,4 @@
-#include "../kernels/kv_storage.cuh"
+#include "kv_storage.cuh"
 #include "gewell/mtp_target.h"
 
 #include "gewell/bf16_primitives.h"
@@ -90,7 +90,7 @@ __global__ void softcap(BFloat16* logits, std::size_t count) {
 }
 
 __global__ void commit_local(const BFloat16* key, const BFloat16* value,
-                             CacheView cache, std::uint32_t base,
+                             kv_cache::DeviceView cache, std::uint32_t base,
                              std::uint32_t source_rows, std::uint32_t count) {
   if (cache.format == kv_cache::Format::fp8) {
     const unsigned head = blockIdx.x % 16, row = blockIdx.x / 16;
@@ -115,7 +115,7 @@ __global__ void commit_local(const BFloat16* key, const BFloat16* value,
 }
 
 __global__ void commit_global(const BFloat16* key, const BFloat16* value,
-                              CacheView cache, std::uint32_t base,
+                              kv_cache::DeviceView cache, std::uint32_t base,
                               std::uint32_t source_rows, std::uint32_t count) {
   if (cache.format == kv_cache::Format::fp8) {
     const unsigned head = blockIdx.x % 4, row = blockIdx.x / 4;
@@ -153,7 +153,7 @@ constexpr unsigned kCommitBatchEntries = 32;
 struct CommitJob {
   const BFloat16* key{};
   const BFloat16* value{};
-  CacheView cache{};
+  kv_cache::DeviceView cache{};
   std::uint32_t base{}, source_rows{}, count{};
 };
 struct CommitBatch { CommitJob jobs[kCommitBatchEntries]; };
@@ -513,7 +513,7 @@ void Verifier::run_batch(const std::uint32_t* tokens,
     if (joined_qkv && batched)
       p::qkv_rms_rope_batch(rope_inputs, weight(3 + shift), weight(4 + shift), kind, stream);
     if (fp8_attention)
-      mtp_attention::run_fp8_batch(attention_inputs, global ? weight(4) : nullptr, kind,
+      mtp_attention::run_fp8_batch(32, attention_inputs, global ? weight(4) : nullptr, kind,
           s.attention_scratch.data(), s.attention_scratch.size(), stream);
     else if (batched)
       mtp_attention::run_batch(attention_inputs, global ? weight(4) : nullptr, kind,

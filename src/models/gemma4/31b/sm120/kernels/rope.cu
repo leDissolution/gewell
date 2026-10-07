@@ -1,4 +1,5 @@
 #include "bf16_common.cuh"
+#include "gewell/models/gemma4/26b_a4b/model.h"
 #include "rope_inverse_frequency.cuh"
 #include <algorithm>
 #include <cmath>
@@ -481,9 +482,10 @@ void apply_rope_m1(const BFloat16* input, const BFloat16* cos,
   const bool global = kind == gemma4_31b::AttentionKind::global;
   const std::uint32_t kv_heads = global ? gemma4_31b::kGlobalKvHeadCount
                                         : gemma4_31b::kLocalKvHeadCount;
-  if (heads != gemma4_31b::kQueryHeadCount && heads != kv_heads) {
+  if (heads != gemma4_31b::kQueryHeadCount &&
+      heads != gemma4_26b_a4b::kQueryHeadCount && heads != kv_heads) {
     fail("apply_rope_m1",
-         "head count is neither Q nor the selected kind's KV count");
+         "head count is neither 26B/31B Q nor the selected 31B KV count");
   }
   const std::uint32_t head_size = global ? gemma4_31b::kGlobalHeadSize
                                          : gemma4_31b::kLocalHeadSize;
@@ -516,9 +518,10 @@ void apply_rope_m1_batch(const BFloat16* input, const BFloat16* cos,
   const bool global = kind == gemma4_31b::AttentionKind::global;
   const auto kv_heads = global ? gemma4_31b::kGlobalKvHeadCount
                                : gemma4_31b::kLocalKvHeadCount;
-  if (heads != gemma4_31b::kQueryHeadCount && heads != kv_heads)
+  if (heads != gemma4_31b::kQueryHeadCount &&
+      heads != gemma4_26b_a4b::kQueryHeadCount && heads != kv_heads)
     fail("apply_rope_m1_batch",
-         "head count is neither Q nor the selected kind's KV count");
+         "head count is neither 26B/31B Q nor the selected 31B KV count");
   const std::size_t row_elements = std::size_t(heads) * (global ? 512 : 256);
   const dim3 grid{blocks_for(row_elements), rows};
   if (global)

@@ -2,21 +2,22 @@
 
 #include "gewell/kv_cache.h"
 #include "gewell/runtime/cache_storage.h"
-#include "gewell/mtp_target.h"
-#include "resources.cuh"
+#include "gewell/kv_view.h"
+#include "gewell/compact_cache_geometry.h"
+#include "cuda_memory.cuh"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string_view>
 
-namespace gewell::gemma4_31b::sm120 {
+namespace gewell::runtime {
 
-// Physical storage for the 31B compact-global cache. The caller's ledger owns
+// Physical storage for the supported compact-global caches. The caller's ledger owns
 // every allocation and decides reservation, retention and publication order.
 class PhysicalCache final : public runtime::CacheStorage {
  public:
-  PhysicalCache(const kv_cache::PoolConfig& config, kv_cache::CacheLedger& ledger,
+  PhysicalCache(kv_cache::CompactGeometry geometry, const kv_cache::PoolConfig& config, kv_cache::CacheLedger& ledger,
                 std::size_t page_offsets_count);
   PhysicalCache(const PhysicalCache&) = delete;
   PhysicalCache& operator=(const PhysicalCache&) = delete;
@@ -24,7 +25,7 @@ class PhysicalCache final : public runtime::CacheStorage {
   [[nodiscard]] const kv_cache::PoolConfig& config() const { return config_; }
   [[nodiscard]] bool has_cpu_pool() const { return cpu_pool_ != nullptr; }
   [[nodiscard]] void* device_pointer(const kv_cache::Allocation& allocation) const;
-  [[nodiscard]] mtp_target::CacheView layer(kv_cache::ExecutionId execution,
+  [[nodiscard]] kv_cache::DeviceView layer(kv_cache::ExecutionId execution,
                                           std::uint32_t layer_index) const;
   void clear_page_table(const kv_cache::ExecutionInfo& info) override;
   void upload_page_table(const kv_cache::ExecutionInfo& info, runtime::CompletionContext completion) override;
@@ -77,16 +78,13 @@ class PhysicalCache final : public runtime::CacheStorage {
                                 std::size_t destination_kind_bytes,
                                 cudaStream_t stream) const;
 
+  const kv_cache::CompactGeometry geometry_;
   const kv_cache::PoolConfig& config_;
   kv_cache::CacheLedger& ledger_;
   const std::size_t page_offsets_count_;
-  DeviceAllocation pool_;
-  std::unique_ptr<PinnedHostAllocation> cpu_pool_;
+  cuda_detail::DeviceAllocation pool_;
+  std::unique_ptr<cuda_detail::PinnedHostAllocation> cpu_pool_;
   std::unique_ptr<std::uint64_t[]> page_offsets_host_;
 };
 
-std::unique_ptr<runtime::CacheStorage> make_cache_storage(
-    const kv_cache::PoolConfig& config, kv_cache::CacheLedger& ledger,
-    std::size_t page_offsets_count);
-
-}  // namespace gewell::gemma4_31b::sm120
+}  // namespace gewell::runtime

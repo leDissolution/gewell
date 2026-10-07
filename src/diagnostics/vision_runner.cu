@@ -2,6 +2,7 @@
 #include "vision_runner.h"
 
 #include "gewell/models/gemma4/31b/component_weights.h"
+#include "gewell/models/gemma4/26b_a4b/component_weights.h"
 #include "gewell/models/gemma4/31b/model.h"
 #include "gewell/vision_engine.h"
 #include "gewell/vision_executor.h"
@@ -162,7 +163,7 @@ struct CaptureRecord {
 class CapturePlan final : public executor::CaptureSink {
  public:
   CapturePlan(std::filesystem::path directory, std::uint32_t padded_patch_rows,
-              std::uint32_t soft_tokens)
+              std::uint32_t soft_tokens, std::uint32_t output_width)
       : directory_(std::move(directory)) {
     std::error_code error;
     if (std::filesystem::exists(directory_, error) || error) {
@@ -194,7 +195,7 @@ class CapturePlan final : public executor::CaptureSink {
     add("vision.bridge_norm", executor::CaptureDType::bf16, soft_tokens,
         model::kVisionHiddenSize);
     add("vision.soft_features", executor::CaptureDType::bf16, soft_tokens,
-        model::kHiddenSize);
+        output_width);
     if (records_.size() != 34) {
       fail("vision capture", "capture inventory must contain 34 tensors");
     }
@@ -298,7 +299,7 @@ class CudaEvent {
 
 }  // namespace
 
-int run(const std::string& artifact_path, const std::string& pixel_values_path,
+int run(vision_engine::Model selected, const std::string& artifact_path, const std::string& pixel_values_path,
         const std::string& position_ids_path,
         std::uint32_t soft_token_count,
         const std::string& capture_directory) {
@@ -325,7 +326,9 @@ int run(const std::string& artifact_path, const std::string& pixel_values_path,
   const std::uint32_t padded_patch_rows = static_cast<std::uint32_t>(
       pixels.size() / (model::kVisionPatchWidth * sizeof(float)));
 
-  model::ComponentFile file(artifact_path, model::Component::vision);
+  const auto output_width = vision_engine::output_width(selected);
+  gewell::component::File file(artifact_path, selected == vision_engine::Model::gemma4_26b_a4b
+      ? gemma4_26b_a4b::vision_tensor_specs() : model::component_specs(model::Component::vision));
   console::section("Vision prefill diagnostic");
   DeviceAllocation weights(file.device_bytes());
   auto* destination = static_cast<std::uint8_t*>(weights.data());
@@ -337,13 +340,13 @@ int run(const std::string& artifact_path, const std::string& pixel_values_path,
     offset += model::align_up(tensor.bytes, model::kStorageAlignment);
   }
 
-  executor::VisionExecutor tower(
+  executor::VisionExecutor tower(selected,
       {static_cast<const BFloat16*>(weights.data()), weights.size()},
       soft_token_count);
   DeviceAllocation device_pixels(pixels.size());
   DeviceAllocation device_positions(positions.size());
   DeviceAllocation output(static_cast<std::size_t>(soft_token_count) *
-                          model::kHiddenSize * sizeof(BFloat16));
+                          output_width * sizeof(BFloat16));
   DeviceAllocation scratch(tower.scratch_bytes());
   check_cuda(cudaMemcpy(device_pixels.data(), pixels.data(), pixels.size(),
                         cudaMemcpyHostToDevice),
@@ -358,7 +361,7 @@ int run(const std::string& artifact_path, const std::string& pixel_values_path,
        padded_patch_rows, soft_token_count},
       output.data(), soft_token_count};
   CapturePlan captures(capture_directory, padded_patch_rows,
-                       soft_token_count);
+                       soft_token_count, output_width);
   CudaEvent begin;
   CudaEvent end;
   check_cuda(cudaEventRecord(begin.get()), "record vision start event");

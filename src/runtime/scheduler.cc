@@ -47,8 +47,15 @@ BatchScheduler::BatchScheduler(std::unique_ptr<ExecutionBackend> executor, Batch
         !limits.plan_rows || limits.plan_rows > limits.prefill_chunk_tokens ||
         limits.max_horizon < limits.plan_rows || limits.max_horizon > supported.context_tokens)
       fail("batch configuration", "invalid scheduler limits");
+    if (!limits.mtp_head.path.empty() && (!mtp_depth ||
+        !std::isfinite(limits.mtp_head.threshold) || limits.mtp_head.threshold < 0 || limits.mtp_head.threshold > 1))
+      fail("MTP head", "requires positive maximum depth and threshold in [0,1]");
+    if (!std::isfinite(limits.mtp_head.tail_fraction) || limits.mtp_head.tail_fraction < 0 ||
+        limits.mtp_head.tail_fraction > 1 || (limits.mtp_head.tail_fraction > 0 &&
+        (limits.mtp_head.path.empty() || !limits.decode_width)))
+      fail("MTP head", "tail fraction must be in [0,1] and requires a head and positive decode width");
     if (!limits.mtp_stats_path.empty()) mtp_stats = std::make_unique<MtpStats>(limits);
-    if (!limits.mtp_capture.path.empty()) mtp_capture = std::make_unique<MtpCapture>(limits);
+    if (!limits.mtp_capture.path.empty()) mtp_capture = std::make_unique<MtpCapture>(limits, supported.mtp_capture);
     // Both sinks use the same admission sequence, including after a restart.
     if (mtp_stats) sequence_begin = mtp_stats->next_sequence();
     if (mtp_capture) sequence_begin = std::max(sequence_begin, mtp_capture->next_sequence());
@@ -881,9 +888,12 @@ bool BatchScheduler::step() {
           ? std::clamp<std::uint32_t>(rows_per_request ? rows_per_request - 1 : 0,
                                       limits.mtp_min_depth, mtp_depth)
           : mtp_depth;
-      const bool speculate = depth && std::any_of(indices.begin(), indices.end(),
+      const bool learned_depth = !limits.mtp_head.path.empty();
+      // Depth-zero rounds still use the verifier when the head is enabled, so
+      // their committed layer states can choose a positive depth next round.
+      const bool speculate = learned_depth || (depth && std::any_of(indices.begin(), indices.end(),
           [&](std::size_t i) { return !requests[i].ordinary_decode &&
-              requests[i].outputs.size() + 1 < requests[i].max_new_tokens; });
+              requests[i].outputs.size() + 1 < requests[i].max_new_tokens; }));
       if (callbacks.trace) {
         nlohmann::json ids = nlohmann::json::array(), image_ids = nlohmann::json::array();
         for (const auto i : indices) {
@@ -894,6 +904,23 @@ bool BatchScheduler::step() {
             ",\"mtp\":" + (speculate ? "true" : "false") + "," + number("mtp_depth", depth));
       }
       if (speculate) {
+        std::vector<std::uint32_t> depths(indices.size(), depth);
+        if (learned_depth) {
+          std::vector<MtpDepthInput> head_inputs;
+          for (std::size_t row = 0; row < indices.size(); ++row) {
+            const auto& request = requests[indices[row]];
+            auto maximum = request.ordinary_decode ? 0 : std::min<std::uint32_t>(mtp_depth,
+                request.max_new_tokens - request.outputs.size() - 1);
+            maximum = std::min(maximum, checkpoint_distance(request, inputs[row].position) - 1);
+            head_inputs.push_back({request.execution, inputs[row].position, inputs[row].token,
+                static_cast<std::uint32_t>(request.outputs.size()), request.terminal_hidden, request.sampling,
+                request.mtp_previous_accepted, request.mtp_previous_depth, request.mtp_accepted, request.mtp_proposed,
+                std::min(limits.mtp_min_depth, maximum), maximum});
+          }
+          const auto head_begin = std::chrono::steady_clock::now();
+          depths = backend.predict_mtp_depths(head_inputs);
+          mtp_head_seconds += seconds_since(head_begin);
+        }
         std::vector<BatchMtpInput> proposals;
         proposals.reserve(indices.size());
         std::vector<MtpCaptureFeatures> captures(mtp_capture ? indices.size() : 0);
@@ -906,7 +933,7 @@ bool BatchScheduler::step() {
           proposal.pending_token = inputs[row].token;
           proposal.target_hidden = request.terminal_hidden;
           proposal.position = inputs[row].position;
-          proposal.depth = request.ordinary_decode ? 0 : std::min<std::uint32_t>(depth,
+          proposal.depth = request.ordinary_decode ? 0 : std::min<std::uint32_t>(depths[row],
               request.max_new_tokens - request.outputs.size() - 1);
           proposal.depth = std::min(proposal.depth, checkpoint_distance(request, proposal.position) - 1);
           if (request.mtp_capture_probes) {
@@ -920,10 +947,11 @@ bool BatchScheduler::step() {
             request.mtp_capture_probes.reset();
           }
           if (!next_probes.empty() && proposal.depth && mtp_capture->select(request.accepted_order, request.mtp_cycles)) {
-            next_probes[row].layers = limits.mtp_capture.layers;
+            next_probes[row].layers = mtp_capture->layers();
             proposal.capture_next = &next_probes[row];
           }
           verifier_rows += proposal.depth + 1;
+          ++mtp_depth_occupancy[proposal.depth];
           proposal.temperature = request.sampling.temperature;
           proposal.top_p = request.sampling.top_p;
           proposal.top_k = request.sampling.top_k;
@@ -1273,6 +1301,13 @@ void BatchScheduler::write_live_stats(std::ostream& out) const {
         << ",\"decode_batch_histogram\":{";
     bool comma = false;
     for (const auto& item : occupancy) {
+      if (comma) out << ',';
+      out << '"' << item.first << "\":" << item.second;
+      comma = true;
+    }
+    out << "},\"mtp_head_seconds\":" << mtp_head_seconds << ",\"mtp_depth_histogram\":{";
+    comma = false;
+    for (const auto& item : mtp_depth_occupancy) {
       if (comma) out << ',';
       out << '"' << item.first << "\":" << item.second;
       comma = true;

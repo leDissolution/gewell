@@ -1,6 +1,6 @@
 #pragma once
 
-#include "gewell/kv_format.h"
+#include "gewell/kv_view.h"
 #include "gewell/attention_compute.h"
 
 #include "gewell/models/gemma4/31b/model.h"
@@ -20,21 +20,7 @@ using BFloat16 = __nv_bfloat16;
 inline constexpr std::uint32_t kMaxDepth = 1279;
 using Weights = std::array<const BFloat16*, gemma4_31b::kLogicalTensorCount>;
 
-// The serving backend's concrete compact-global cache: local K and V are
-// separate head-major rings; global rows are [Krot128,V512], contiguous or paged.
-struct CacheView {
-  BFloat16* key{};
-  BFloat16* value{};
-  std::uint32_t capacity{};
-  BFloat16* page_pool{};
-  std::uint64_t* page_offsets{};
-  std::uint32_t page_tokens{};
-  std::uint32_t page_count{};
-  std::size_t page_stride_elements{};
-  std::size_t layer_offset_elements{};
-  kv_cache::Format format{kv_cache::Format::bf16};
-};
-using Caches = std::array<CacheView, gemma4_31b::kLayerCount>;
+using Caches = std::array<kv_cache::DeviceView, gemma4_31b::kLayerCount>;
 
 // Tokens occupy consecutive rows within each request. Every request supplies
 // private KV staging, whose physical slot stride may exceed its current rows.

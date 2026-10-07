@@ -279,7 +279,7 @@ class WeightArena {
 
  private:
   std::unique_ptr<DeviceAllocation> load_component(const std::string& path, model::Component component) {
-    model::ComponentFile file(path, component);
+    gewell::component::File file(path, model::component_specs(component));
     auto allocation = std::make_unique<DeviceAllocation>(file.device_bytes());
     auto* base = static_cast<std::uint8_t*>(allocation->data());
     check_cuda(cudaMemset(base, 0, allocation->size()), "zero component weight padding");

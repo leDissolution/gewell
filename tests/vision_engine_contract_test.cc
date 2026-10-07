@@ -146,19 +146,30 @@ void test_prepared_host_bytes() {
 void test_valid_requests() {
   for (const std::uint32_t capacity : kSupportedSoftTokenCapacities) {
     PreparedImage prepared = image(capacity, capacity);
-    if (validate_prefill_request(request(prepared, capacity)) != capacity) {
-      fail("single-image output row count mismatch");
-    }
+    for (auto model : {Model::gemma4_31b, Model::gemma4_26b_a4b})
+      if (validate_prefill_request(request(prepared, capacity), model) != capacity)
+        fail("single-image output row count mismatch");
   }
 }
 
 void test_request_validation() {
+  if (output_width(Model::gemma4_31b) != 5376 || output_width(Model::gemma4_26b_a4b) != 2816)
+    fail("vision model output width mismatch");
+  require_invalid([] { static_cast<void>(output_width(static_cast<Model>(99))); },
+      "unknown vision model accepted");
+  auto adjacent = request(image(70, 1), 1);
+  adjacent.soft_features_bf16_device = reinterpret_cast<void*>(kPositionAddress - 2816 * 2);
+  if (validate_prefill_request(adjacent, Model::gemma4_26b_a4b) != 1)
+    fail("26B adjacent output region rejected");
+  require_invalid([&] { static_cast<void>(validate_prefill_request(adjacent, Model::gemma4_31b)); },
+      "31B overlapping output region accepted");
+
   PreparedImage valid = image(280, 280);
 
   PrefillRequest null_output = request(valid, 280);
   null_output.soft_features_bf16_device = nullptr;
   require_invalid(
-      [&] { static_cast<void>(validate_prefill_request(null_output)); },
+      [&] { static_cast<void>(validate_prefill_request(null_output, Model::gemma4_31b)); },
       "null output was accepted");
 
   PreparedImage null_patches = valid;
@@ -166,7 +177,7 @@ void test_request_validation() {
   require_invalid(
       [&] {
         static_cast<void>(
-            validate_prefill_request(request(null_patches, 280)));
+            validate_prefill_request(request(null_patches, 280), Model::gemma4_31b));
       },
       "null patch values were accepted");
 
@@ -175,7 +186,7 @@ void test_request_validation() {
   require_invalid(
       [&] {
         static_cast<void>(
-            validate_prefill_request(request(null_positions, 280)));
+            validate_prefill_request(request(null_positions, 280), Model::gemma4_31b));
       },
       "null positions were accepted");
 
@@ -184,7 +195,7 @@ void test_request_validation() {
   require_invalid(
       [&] {
         static_cast<void>(
-            validate_prefill_request(request(wrong_rows, 280)));
+            validate_prefill_request(request(wrong_rows, 280), Model::gemma4_31b));
       },
       "wrong padded row count was accepted");
 
@@ -193,7 +204,7 @@ void test_request_validation() {
   require_invalid(
       [&] {
         static_cast<void>(
-            validate_prefill_request(request(no_tokens, 280)));
+            validate_prefill_request(request(no_tokens, 280), Model::gemma4_31b));
       },
       "zero soft tokens were accepted");
 
@@ -202,13 +213,13 @@ void test_request_validation() {
   require_invalid(
       [&] {
         static_cast<void>(
-            validate_prefill_request(request(too_many_tokens, 281)));
+            validate_prefill_request(request(too_many_tokens, 281), Model::gemma4_31b));
       },
       "excess soft tokens were accepted");
 
   require_invalid(
       [&] {
-        static_cast<void>(validate_prefill_request(request(valid, 279)));
+        static_cast<void>(validate_prefill_request(request(valid, 279), Model::gemma4_31b));
       },
       "short output capacity was accepted");
 
@@ -218,7 +229,7 @@ void test_request_validation() {
   require_invalid(
       [&] {
         static_cast<void>(
-            validate_prefill_request(output_overlaps_patches));
+            validate_prefill_request(output_overlaps_patches, Model::gemma4_31b));
       },
       "output overlapping patch values was accepted");
 
@@ -228,7 +239,7 @@ void test_request_validation() {
   require_invalid(
       [&] {
         static_cast<void>(
-            validate_prefill_request(request(overlapping_inputs, 280)));
+            validate_prefill_request(request(overlapping_inputs, 280), Model::gemma4_31b));
       },
       "overlapping inputs were accepted");
 
@@ -238,7 +249,7 @@ void test_request_validation() {
   require_invalid(
       [&] {
         static_cast<void>(
-            validate_prefill_request(request(overflowing_input, 280)));
+            validate_prefill_request(request(overflowing_input, 280), Model::gemma4_31b));
       },
       "overflowing input range was accepted");
 }

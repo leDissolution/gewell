@@ -53,7 +53,16 @@ std::int32_t read_i32_le(const std::uint8_t* bytes) {
 
 }  // namespace
 
-std::size_t validate_prefill_request(const PrefillRequest& request) {
+std::uint32_t output_width(Model model) {
+  switch (model) {
+    case Model::gemma4_31b: return 5376;
+    case Model::gemma4_26b_a4b: return 2816;
+  }
+  throw std::invalid_argument("unknown vision model");
+}
+
+std::size_t validate_prefill_request(const PrefillRequest& request, Model model) {
+  const auto width = output_width(model);
   if (request.soft_features_bf16_device == nullptr) {
     throw std::invalid_argument("vision prefill output is null");
   }
@@ -86,7 +95,7 @@ std::size_t validate_prefill_request(const PrefillRequest& request) {
       prepared_position_bytes(image.padded_patch_rows);
   const std::size_t output_bytes =
       static_cast<std::size_t>(image.soft_token_count) *
-      gemma4_31b::kHiddenSize * sizeof(std::uint16_t);
+      width * sizeof(std::uint16_t);
   const AddressRange patches =
       address_range(image.patch_values_device, patch_bytes, "patch input");
   const AddressRange positions = address_range(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gewell/mtp_capture.h"
+#include "gewell/mtp_head.h"
 
 #include "gewell/attention_compute.h"
 
@@ -33,6 +34,7 @@ struct RuntimeSettings {
   std::string mtp_stats_path;
   std::uint32_t mtp_stats_window{64};
   MtpCaptureSettings mtp_capture;
+  MtpHeadSettings mtp_head;
   std::uint32_t prefill_chunk_tokens{gemma4_31b::sm120::kDefaultPrefillChunkTokens};
   std::uint32_t prefill_batch_tokens{gemma4_31b::sm120::kDefaultPrefillBatchTokens};
   std::uint32_t prefill_budget_tokens{};
@@ -59,6 +61,7 @@ struct GenerationSettings {
   std::string mtp_stats_path;
   std::uint32_t mtp_stats_window{64};
   MtpCaptureSettings mtp_capture;
+  MtpHeadSettings mtp_head;
   std::uint32_t prefill_chunk_tokens{gemma4_31b::sm120::kDefaultPrefillChunkTokens};
   std::uint32_t prefill_batch_tokens{gemma4_31b::sm120::kDefaultPrefillBatchTokens};
   std::uint32_t prefill_budget_tokens{};
@@ -109,7 +112,8 @@ int run_generate_batch(const std::string& artifact_path,
                        std::uint32_t decode_width = 0,
                        const std::string& mtp_stats_path = {},
                        std::uint32_t mtp_stats_window = 64,
-                       const MtpCaptureSettings& mtp_capture = {});
+                       const MtpCaptureSettings& mtp_capture = {},
+                       const MtpHeadSettings& mtp_head = {});
 
 // Native HTTP uses the same scheduler directly, with one GPU owner.
 int run_http_server(const std::string& model_directory,
@@ -118,7 +122,8 @@ int run_http_server(const std::string& model_directory,
                     const http::Settings& http_settings,
                     const std::string& qdq_mask_path = {});
 
-// Teacher-forced text replay through causal prefill. Four TSV fields: ID,
+// Teacher-forced text replay:31B causal prefill;26B prompt prefill followed
+// by single-row cached decode, honoring activation_policy. Four TSV fields: ID,
 // prompt.u32, continuation.u32, saved generating-model logits.bf16.
 // Streams compact per-position comparison metrics, including the final EOS
 // prediction, while feeding prompt + continuation[:-1]. No generation/MTP.
@@ -126,6 +131,7 @@ int run_replay_rollout(const std::string& artifact_path,
                        const std::string& requests_path,
                        std::uint32_t chunk_rows, std::uint32_t head_rows,
                        const std::string& output_directory,
+                       nvfp4::ActivationPolicy activation_policy,
                        const std::string& qdq_mask_path = {});
 
 // Runs one image-conditioned Gemma 4 caption request. PROMPT.u32 is one

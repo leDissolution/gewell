@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gewell/models/gemma4/31b/model.h"
+#include "gewell/storage_type.h"
 
 #include <array>
 #include <cstddef>
@@ -23,8 +24,6 @@ inline constexpr std::uint64_t kFileBytes = 61'395'791'872ULL;
 inline constexpr std::size_t kIoChunkBytes = 8 * 1'024 * 1'024;
 
 using Digest = std::array<std::uint8_t, 32>;
-
-enum class StorageType : std::uint8_t { bf16 = 0, nvfp4_w4a4 = 1, fp8_w8a8 = 2 };
 
 [[nodiscard]] constexpr std::uint64_t fp8_packed_bytes(
     std::uint32_t rows, std::uint32_t columns) {

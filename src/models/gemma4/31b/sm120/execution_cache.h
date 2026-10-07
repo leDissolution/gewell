@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cache.h"
+#include "runtime/physical_cache.h"
 #include "execution_types.h"
 #include "gewell/runtime/cache.h"
 #include <functional>
@@ -11,7 +11,7 @@ namespace gewell::gemma4_31b::sm120 {
 // work boundaries. Layer access stays concrete; policy retains reservations.
 struct ExecutionCache {
   explicit ExecutionCache(runtime::PersistentCacheManager& manager)
-      : state(static_cast<PhysicalCache&>(manager.storage())),
+      : state(static_cast<runtime::PhysicalCache&>(manager.storage())),
         prepare_write([&manager](kv_cache::ExecutionId id, std::uint32_t position,
                                   std::uint32_t rows, cudaStream_t stream) {
           manager.prepare_write(id, position, rows, runtime::CompletionContext{stream});
@@ -30,7 +30,7 @@ struct ExecutionCache {
           return manager.processed_tokens(id);
         }) {}
 
-  PhysicalCache& state;
+  runtime::PhysicalCache& state;
   std::function<void(kv_cache::ExecutionId, std::uint32_t, std::uint32_t, cudaStream_t)> prepare_write;
   std::function<void(kv_cache::ExecutionId, BFloat16*, cudaStream_t)> restore_terminal_hidden;
   std::function<void*(kv_cache::ExecutionId, std::size_t)> acquire_speculative_staging;

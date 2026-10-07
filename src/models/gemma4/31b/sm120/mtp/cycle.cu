@@ -1,6 +1,7 @@
 #include "gewell/mtp_cycle.h"
 
 #include "gewell/mtp_assistant.h"
+#include "gewell/models/gemma4/26b_a4b/model.h"
 #include "cuda.cuh"
 
 #include <algorithm>
@@ -24,11 +25,11 @@ void require(bool condition, const char* message) {
 }
 
 std::uint32_t batch_capacity(std::uint32_t capacity, std::uint32_t depth,
-                              void* staging, std::size_t bytes) {
+                              void* staging, std::size_t bytes, std::size_t stride) {
   require(capacity > 0 && depth > 0 && depth <= mtp_target::kMaxDepth &&
               std::uint64_t(capacity) * (depth + 1) <= mtp_target::kMaxDepth + 1,
           "batch verification exceeds 1280 rows");
-  require(staging && bytes >= capacity * mtp_target::Verifier::staging_bytes(depth + 1),
+  require(staging && bytes / capacity >= stride,
           "batch staging is too small");
   return capacity;
 }
@@ -154,10 +155,11 @@ mtp_assistant::Weights assistant_weights(const mtp_target::Weights& weights) {
   return result;
 }
 
-mtp_assistant::FrozenCache frozen_cache(const mtp_target::Caches& caches,
-                                       std::uint32_t processed) {
-  const auto& local = caches[58];
-  const auto& global = caches[59];
+template<class Caches>
+mtp_assistant::FrozenCache frozen_cache(const Caches& caches,
+                                       std::uint32_t processed, unsigned local_layer = 58) {
+  const auto& local = caches[local_layer];
+  const auto& global = caches[local_layer + 1];
   mtp_assistant::FrozenCache frozen{};
   frozen.local_key = local.key;
   frozen.local_format = local.format;
@@ -190,7 +192,7 @@ struct Layout {
   std::size_t result;
   std::size_t bytes{};
 
-  explicit Layout(std::uint32_t depth) {
+  explicit Layout(std::uint32_t depth, unsigned hidden_width = model::kHiddenSize) {
     require(depth > 0 && depth <= mtp_target::kMaxDepth,
             "maximum depth must be in 1..1279");
     const auto add = [this](std::size_t length) {
@@ -209,7 +211,7 @@ struct Layout {
     output_ids = add((static_cast<std::size_t>(depth) + 1) * sizeof(std::uint32_t));
     greedy_ids = add((static_cast<std::size_t>(depth) + 1) * sizeof(std::uint32_t));
     assistant_logits = add(kVocabulary * sizeof(mtp_target::BFloat16));
-    feedback = add(model::kHiddenSize * sizeof(mtp_target::BFloat16));
+    feedback = add(hidden_width * sizeof(mtp_target::BFloat16));
     uniforms = add((2 * static_cast<std::size_t>(depth) + 1) * sizeof(float));
     status = add(sizeof(mtp_sampling::Status));
     result = add(sizeof(mtp_sampling::Result));
@@ -318,7 +320,7 @@ struct Cycle::Impl {
         layout(depth),
         own(layout.bytes),
         constraints(depth + 1),
-        assistant(handle, assistant_weights(weights), capacity, 1, local_compute, global_compute),
+        assistant(mtp_assistant::Model::gemma4_31b, handle, assistant_weights(weights), capacity, 1, local_compute, global_compute),
         target(handle, weights, depth + 1, capacity, native_weights,
                activation_policy, fp8_weights, local_compute, global_compute) {
     require(capacity > 0 && capacity <= 262'144,
@@ -523,7 +525,66 @@ const std::uint32_t* Cycle::output_ids() const {
   return impl_->at<std::uint32_t>(impl_->layout.output_ids);
 }
 
+namespace {
+class Target31 final : public BatchTarget {
+ public:
+  Target31(cublasLtHandle_t handle, const mtp_target::Weights& weights,
+      unsigned rows, unsigned context, const nvfp4::Weights* native,
+      nvfp4::ActivationPolicy policy, const fp8::Weights* fp8,
+      attention::Compute local, attention::Compute global)
+      : assistant_(mtp_cycle::assistant_weights(weights)),
+        verifier_(handle, weights, rows, context, native, policy, fp8, local, global) {}
+  mtp_assistant::Model model() const override { return mtp_assistant::Model::gemma4_31b; }
+  mtp_assistant::Weights assistant_weights() const override { return assistant_; }
+  std::size_t staging_bytes(std::uint32_t rows) const override { return mtp_target::Verifier::staging_bytes(rows); }
+  std::size_t scratch_bytes() const override { return verifier_.scratch_bytes(); }
+  void prepare(std::uint32_t rows) override { verifier_.prepare(rows); }
+  void run_batch(const std::uint32_t* tokens, const std::vector<TargetInput>& inputs, cudaStream_t stream) override {
+    std::vector<mtp_target::BatchInput> native;
+    for (const auto& i : inputs) {
+      require(i.caches.size() == 60, "31B target requires60 cache layers");
+      mtp_target::Caches caches;std::copy(i.caches.begin(), i.caches.end(), caches.begin());
+      native.push_back({i.base_position, i.rows, caches, i.staging, i.staging_size,
+                        i.staging_capacity_rows, i.captures});
+    }
+    verifier_.run_batch(tokens, native, stream);
+  }
+  void commit_batch(const std::vector<TargetCommit>& inputs, cudaStream_t stream) override {
+    std::vector<mtp_target::Caches> caches(inputs.size());
+    std::vector<mtp_target::CommitInput> commits;
+    for (std::size_t j=0;j<inputs.size();++j) {
+      const auto& i=inputs[j];
+      require(i.caches && i.caches->size()==60, "31B commit requires60 cache layers");
+      std::copy(i.caches->begin(),i.caches->end(),caches[j].begin());
+      commits.push_back({&caches[j],i.base_position,i.source_rows,i.capacity_rows,
+                         i.staging,i.staging_size,i.commit_rows});
+    }
+    mtp_target::commit_staged_rows_batch(commits,stream);
+  }
+  const mtp_target::BFloat16* logits() const override { return verifier_.logits(); }
+  const mtp_target::BFloat16* hidden() const override { return verifier_.hidden(); }
+ private:
+  mtp_assistant::Weights assistant_;
+  mtp_target::Verifier verifier_;
+};
+}  // namespace
+
+std::unique_ptr<BatchTarget> make_31b_batch_target(cublasLtHandle_t handle,
+    const mtp_target::Weights& weights, std::uint32_t rows, std::uint32_t context,
+    const nvfp4::Weights* native, nvfp4::ActivationPolicy policy, const fp8::Weights* fp8,
+    attention::Compute local, attention::Compute global) {
+  return std::make_unique<Target31>(handle,weights,rows,context,native,policy,fp8,local,global);
+}
+
+static std::unique_ptr<BatchTarget> checked_target(std::unique_ptr<BatchTarget> target) {
+  require(target && (target->model()==mtp_assistant::Model::gemma4_31b ||
+      target->model()==mtp_assistant::Model::gemma4_26b_a4b), "missing or invalid batch target");
+  return target;
+}
+
 struct Batch::Impl {
+  std::unique_ptr<BatchTarget> target;
+  unsigned hidden_width, layer_count;
   std::uint32_t capacity, max_depth, context_capacity;
   void* staging;
   std::size_t stage_stride;
@@ -533,45 +594,42 @@ struct Batch::Impl {
   std::unique_ptr<mtp_cuda::Buffer> capture, probe_capture;
   ConstraintBuffers constraints;
   mtp_assistant::Executor assistant;
-  mtp_target::Verifier target;
-  std::vector<mtp_target::BatchInput> verification;
+  std::vector<TargetInput> verification;
   std::vector<std::uint32_t> offsets, selected, compact_sizes;
   Event draft_begin, verify_begin, select_begin, select_end;
 
-  Impl(cublasLtHandle_t handle, const mtp_target::Weights& weights,
+  Impl(cublasLtHandle_t handle, std::unique_ptr<BatchTarget> backend,
        std::uint32_t context, std::uint32_t cap, std::uint32_t depth,
-       void* stage, std::size_t bytes, const nvfp4::Weights* native_weights,
-       nvfp4::ActivationPolicy activation_policy, const fp8::Weights* fp8_weights,
+       void* stage, std::size_t bytes,
        attention::Compute local_compute, attention::Compute global_compute)
-      : capacity(batch_capacity(cap, depth, stage, bytes)), max_depth(depth), context_capacity(context), staging(stage),
-        stage_stride(mtp_target::Verifier::staging_bytes(depth + 1)), layout(depth),
+      : target(checked_target(std::move(backend))),
+        hidden_width(target->model()==mtp_assistant::Model::gemma4_26b_a4b ? gemma4_26b_a4b::kHiddenSize : model::kHiddenSize),
+        layer_count(hidden_width==gemma4_26b_a4b::kHiddenSize ? 30 : 60),
+        capacity(batch_capacity(cap, depth, stage, bytes, target->staging_bytes(depth+1))),
+        max_depth(depth), context_capacity(context), staging(stage),
+        stage_stride(target->staging_bytes(depth+1)), layout(depth, hidden_width),
         own(std::size_t(cap) * layout.bytes),
         tokens(std::size_t(cap) * (depth + 1) * sizeof(std::uint32_t)),
         constraints(cap * (depth + 1)),
-        assistant(handle, assistant_weights(weights), context, cap, local_compute, global_compute),
-        target(handle, weights, cap * (depth + 1), context, native_weights,
-               activation_policy, fp8_weights, local_compute, global_compute) {}
+        assistant(target->model(),
+            handle,target->assistant_weights(),context,cap,local_compute,global_compute) {}
 
   template <typename T> T* at(std::size_t request, std::size_t offset) const {
     return own.at<T>(request * layout.bytes + offset);
   }
 };
 
-Batch::Batch(cublasLtHandle_t handle, const mtp_target::Weights& weights,
+Batch::Batch(cublasLtHandle_t handle, std::unique_ptr<BatchTarget> target,
              std::uint32_t context_capacity, std::uint32_t capacity,
              std::uint32_t max_depth, void* staging, std::size_t staging_size,
-             const nvfp4::Weights* native_weights,
-             nvfp4::ActivationPolicy activation_policy,
-             const fp8::Weights* fp8_weights,
              attention::Compute local_compute, attention::Compute global_compute)
-    : impl_(std::make_unique<Impl>(handle, weights, context_capacity, capacity,
-                                   max_depth, staging, staging_size, native_weights,
-                                   activation_policy, fp8_weights, local_compute, global_compute)) {}
+    : impl_(std::make_unique<Impl>(handle, std::move(target), context_capacity, capacity,
+                                   max_depth, staging, staging_size, local_compute, global_compute)) {}
 Batch::~Batch() = default;
 
 std::size_t Batch::scratch_bytes() const {
   return impl_->own.size() + impl_->tokens.size() + impl_->assistant.scratch_bytes() +
-      impl_->target.scratch_bytes() + impl_->constraints.device_masks.size() +
+      impl_->target->scratch_bytes() + impl_->constraints.device_masks.size() +
       (impl_->capture ? impl_->capture->size() : 0) +
       (impl_->probe_capture ? impl_->probe_capture->size() : 0);
 }
@@ -594,6 +652,7 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
   std::vector<std::size_t> capture_offsets(inputs.size());
   std::size_t capture_rows = 0, probe_elements = 0, probe_outputs = 0;
   std::vector<std::size_t> probe_offsets(inputs.size()), probe_output_offsets(inputs.size());
+  std::vector<std::size_t> head_probe_offsets(inputs.size());
   std::uint32_t total_rows = 0;
   bool constrained = false;
   bool greedy = true;
@@ -604,6 +663,7 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
         kVocabulary, input.temperature, input.top_p, input.top_k);
     greedy &= input.temperature == 0.0F || input.top_p == 0.0F ||
               input.top_k == 1;
+    require(input.caches.size() == s.layer_count, "batch cache layer count does not match target");
     require(input.target_hidden && input.pending_token < kVocabulary &&
                 input.depth <= s.max_depth && input.position > 0 &&
                 std::uint64_t(input.position) + input.depth + 1 <= s.context_capacity,
@@ -623,19 +683,24 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
     if (input.capture_next) {
       auto& probes = *input.capture_next;
       require(!probes.layers.empty(), "target probe layers are empty");
-      probes.width = model::kHiddenSize;
+      probes.width = s.hidden_width;
       probes.hidden.resize(probes.layers.size() * probes.width);
       probe_offsets[i] = probe_elements;
       probe_output_offsets[i] = probe_outputs;
       probe_elements += (input.depth + 1) * probes.hidden.size();
       probe_outputs += probes.hidden.size();
     }
+    if (!input.depth_probes.layers.empty()) {
+      require(input.depth_probes.output, "missing depth head probe destination");
+      head_probe_offsets[i] = probe_elements;
+      probe_elements += (input.depth + 1) * input.depth_probes.layers.size() * s.hidden_width;
+    }
     if (input.capture) {
       require(input.depth > 0, "capture requires a positive proposal depth");
       capture_offsets[i] = capture_rows;
       capture_rows += input.depth;
       auto& features = *input.capture;
-      features.target_width = model::kHiddenSize;
+      features.target_width = s.hidden_width;
       features.assistant_width = model::kAssistantHiddenSize;
       features.target_hidden.resize(features.target_width);
       features.assistant_hidden.resize(std::size_t(input.depth) * features.assistant_width);
@@ -657,8 +722,12 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
         s.verification[i].captures.push_back({probes->layers[j],
             s.probe_capture->at<mtp_target::BFloat16>() + probe_offsets[i] +
                 j * (inputs[i].depth + 1) * probes->width});
+    for (std::size_t j = 0; j < inputs[i].depth_probes.layers.size(); ++j)
+      s.verification[i].captures.push_back({inputs[i].depth_probes.layers[j],
+          s.probe_capture->at<mtp_target::BFloat16>() + head_probe_offsets[i] +
+              j * (inputs[i].depth + 1) * s.hidden_width});
   }
-  s.target.prepare(total_rows);
+  s.target->prepare(total_rows);
   s.draft_begin.record(stream);
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     const auto& input = inputs[i];
@@ -689,7 +758,7 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
       if (step >= input.depth) continue;
       auto* feedback = s.at<mtp_target::BFloat16>(i, l.feedback);
       drafts.push_back({s.tokens.at<std::uint32_t>() + s.offsets[i] + step,
-          step ? feedback : input.target_hidden, frozen_cache(input.caches, input.position),
+          step ? feedback : input.target_hidden, frozen_cache(input.caches, input.position, s.layer_count - 2),
           s.at<mtp_target::BFloat16>(i, l.assistant_logits), feedback,
           input.capture ? s.capture->at<mtp_target::BFloat16>() +
               (capture_offsets[i] + step) * model::kAssistantHiddenSize : nullptr});
@@ -752,7 +821,7 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
     outcome.constraint_draft_bytes = std::size_t(total_rows) * sizeof(std::uint32_t);
   }
   s.verify_begin.record(stream);
-  s.target.run_batch(s.tokens.at<std::uint32_t>(), s.verification, stream);
+  s.target->run_batch(s.tokens.at<std::uint32_t>(), s.verification, stream);
   s.select_begin.record(stream);
   if (constrained) {
     try {
@@ -863,6 +932,11 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
       check(cudaMemcpyAsync(probes->hidden.data(), selected_probes, probes->hidden.size() * sizeof(std::uint16_t),
           cudaMemcpyDeviceToHost, stream), "capture selected target layer probes");
     }
+    if (!inputs[i].depth_probes.layers.empty())
+      mtp_sampling::gather_capture_rows(s.probe_capture->at<std::uint16_t>() + head_probe_offsets[i],
+          inputs[i].depth_probes.layers.size(), inputs[i].depth + 1, s.hidden_width,
+          s.at<mtp_sampling::Result>(i, l.result), s.at<mtp_sampling::Status>(i, l.status),
+          reinterpret_cast<std::uint16_t*>(inputs[i].depth_probes.output), stream);
     if (auto* features = inputs[i].capture) {
       auto* scores = s.capture->at<MtpCaptureScores>(score_offset) + capture_offsets[i];
       mtp_sampling::capture_scores(s.at<void>(i, l.target_probs), s.at<void>(i, l.draft_probs),
@@ -916,7 +990,7 @@ void Batch::commit_batch(const std::vector<BatchCommitInput>& inputs,
                          cudaStream_t stream) {
   auto& s = *impl_;
   require(!inputs.empty(), "batch commit is empty");
-  std::vector<mtp_target::CommitInput> commits;
+  std::vector<TargetCommit> commits;
   std::vector<bool> seen(s.selected.size());
   commits.reserve(inputs.size());
   for (const auto& input : inputs) {
@@ -931,12 +1005,12 @@ void Batch::commit_batch(const std::vector<BatchCommitInput>& inputs,
         verified.staging_capacity_rows, verified.staging,
         verified.staging_size, input.count});
   }
-  mtp_target::commit_staged_rows_batch(commits, stream);
+  s.target->commit_batch(commits, stream);
   for (const auto& input : inputs) s.selected[input.request] = 0;
 }
 
 const mtp_target::BFloat16* Batch::logits(std::uint32_t request) const {
-  return impl_->target.logits() + std::size_t(impl_->offsets.at(request)) * kVocabulary;
+  return impl_->target->logits() + std::size_t(impl_->offsets.at(request)) * kVocabulary;
 }
 void Batch::summarize_logprobs(std::uint32_t request, std::uint32_t row_count,
                               std::uint32_t top_logprobs,
@@ -955,7 +1029,7 @@ void Batch::summarize_logprobs(std::uint32_t request, std::uint32_t row_count,
         kVocabulary, top_logprobs, output, stream);
 }
 const mtp_target::BFloat16* Batch::hidden(std::uint32_t request) const {
-  return impl_->target.hidden() + std::size_t(impl_->offsets.at(request)) * model::kHiddenSize;
+  return impl_->target->hidden() + std::size_t(impl_->offsets.at(request)) * impl_->hidden_width;
 }
 const std::uint32_t* Batch::output_ids(std::uint32_t request) const {
   (void)impl_->offsets.at(request);

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(gewell LANGUAGES CXX)
+project(gewell VERSION 0.1.9 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,7 @@ add_library(gewell_text_codec STATIC
   src/chat_codec.cc
   src/stop_matcher.cc
   src/models/gemma4/31b/serving_assets.cc
+  src/models/gemma4/26b_a4b/serving_assets.cc
   src/models/gemma4/text/contract.cc
   src/models/gemma4/text/chat_template.cc
   src/text_codec_cli.cc
@@ -81,17 +82,27 @@ target_link_libraries(gewell_http PUBLIC gewell_text_codec gewell_json_constrain
 target_compile_features(gewell_http PUBLIC cxx_std_17)
 
 # These libraries and tests configure without a CUDA toolkit.
+add_library(gewell_component_weights STATIC src/component_weights.cc)
+target_include_directories(gewell_component_weights PUBLIC include)
+target_include_directories(gewell_component_weights SYSTEM PRIVATE vendor/nlohmann)
+target_compile_features(gewell_component_weights PUBLIC cxx_std_17)
+
 add_library(gewell_artifact STATIC src/models/gemma4/31b/artifact.cc src/models/gemma4/31b/component_weights.cc)
 target_include_directories(gewell_artifact PUBLIC include)
 target_include_directories(gewell_artifact SYSTEM PRIVATE vendor/nlohmann)
 target_compile_features(gewell_artifact PUBLIC cxx_std_17)
-target_link_libraries(gewell_artifact PUBLIC OpenSSL::Crypto)
+target_link_libraries(gewell_artifact PUBLIC OpenSSL::Crypto gewell_component_weights)
 
-add_library(gewell_cache STATIC src/kv_cache.cc src/prefix_index.cc src/pending_prefix.cc)
+add_library(gewell_gemma4_26b_artifact STATIC src/models/gemma4/26b_a4b/artifact.cc src/models/gemma4/26b_a4b/component_weights.cc src/models/gemma4/26b_a4b/weight_qdq.cc)
+target_include_directories(gewell_gemma4_26b_artifact PUBLIC include)
+target_compile_features(gewell_gemma4_26b_artifact PUBLIC cxx_std_17)
+target_link_libraries(gewell_gemma4_26b_artifact PUBLIC OpenSSL::Crypto gewell_component_weights)
+
+add_library(gewell_cache STATIC src/compact_cache_geometry.cc src/kv_cache.cc src/prefix_index.cc src/pending_prefix.cc)
 target_include_directories(gewell_cache PUBLIC include)
 target_compile_features(gewell_cache PUBLIC cxx_std_17)
 
-add_library(gewell_runtime STATIC src/runtime/cache.cc src/runtime/scheduler.cc src/runtime/image.cc src/runtime/mtp_stats.cc src/runtime/mtp_capture.cc)
+add_library(gewell_runtime STATIC src/runtime/cache.cc src/runtime/scheduler.cc src/runtime/image.cc src/runtime/mtp_stats.cc src/runtime/mtp_capture.cc src/runtime/mtp_head.cc)
 target_include_directories(gewell_runtime PUBLIC include)
 target_include_directories(gewell_runtime SYSTEM PUBLIC vendor/nlohmann)
 target_compile_features(gewell_runtime PUBLIC cxx_std_17)
@@ -104,6 +115,15 @@ target_compile_features(gewell_gemma4_31b_cache_config PUBLIC cxx_std_17)
 target_link_libraries(gewell_gemma4_31b_cache_config PUBLIC gewell_cache)
 
 if(BUILD_TESTING)
+  add_executable(gewell_gemma4_26b_qdq_test tests/gemma4_26b_qdq_test.cc)
+  target_link_libraries(gewell_gemma4_26b_qdq_test PRIVATE gewell_gemma4_26b_artifact)
+  add_test(NAME gewell_gemma4_26b_qdq_test COMMAND gewell_gemma4_26b_qdq_test)
+  add_executable(gewell_gemma4_26b_artifact_probe tests/gemma4_26b_artifact_probe.cc)
+  target_link_libraries(gewell_gemma4_26b_artifact_probe PRIVATE gewell_gemma4_26b_artifact)
+  add_executable(gewell_gemma4_26b_model_contract_test tests/gemma4_26b_model_contract_test.cc)
+  target_include_directories(gewell_gemma4_26b_model_contract_test PRIVATE include)
+  target_compile_features(gewell_gemma4_26b_model_contract_test PRIVATE cxx_std_17)
+  add_test(NAME gewell_gemma4_26b_model_contract_test COMMAND gewell_gemma4_26b_model_contract_test)
   add_executable(gewell_offline_io_test tests/offline_io_test.cc)
   target_link_libraries(gewell_offline_io_test PRIVATE gewell_offline_io)
   add_test(NAME gewell_offline_io_test COMMAND gewell_offline_io_test)
@@ -112,7 +132,7 @@ if(BUILD_TESTING)
   target_link_libraries(gewell_image_processor_test PRIVATE gewell_gemma4_image_processor OpenSSL::Crypto)
   add_test(NAME gewell_image_processor_test COMMAND gewell_image_processor_test
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/image_processor.json")
-  foreach(suite IN ITEMS runtime_cache runtime_scheduler runtime_mtp_stats runtime_mtp_capture image_identity)
+  foreach(suite IN ITEMS runtime_cache runtime_scheduler runtime_mtp_stats runtime_mtp_capture runtime_mtp_head image_identity)
     add_executable(gewell_${suite}_test tests/${suite}_test.cc)
     target_link_libraries(gewell_${suite}_test PRIVATE gewell_runtime)
     add_test(NAME gewell_${suite}_test COMMAND gewell_${suite}_test)
@@ -156,10 +176,12 @@ FetchContent_Declare(cutlass
 )
 FetchContent_MakeAvailable(cutlass)
 set_property(SOURCE src/nvfp4_linear.cu src/fp8_linear.cu
+  src/models/gemma4/26b_a4b/sm120/moe.cu
   src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu
   src/models/gemma4/31b/sm120/vision/attention.cu APPEND PROPERTY
   INCLUDE_DIRECTORIES "${cutlass_SOURCE_DIR}/include" "${cutlass_SOURCE_DIR}/tools/util/include")
 set_property(SOURCE src/nvfp4_linear.cu src/fp8_linear.cu
+  src/models/gemma4/26b_a4b/sm120/moe.cu
   src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu
   src/models/gemma4/31b/sm120/vision/attention.cu APPEND PROPERTY
   COMPILE_OPTIONS --expt-relaxed-constexpr)
@@ -177,10 +199,77 @@ function(gewell_cuda_target target)
     CUDA_ARCHITECTURES "120a-real" CUDA_RUNTIME_LIBRARY Shared CUDA_SEPARABLE_COMPILATION OFF)
 endfunction()
 
+add_library(gewell_cuda_sampling STATIC src/runtime/sampling.cu)
+gewell_cuda_target(gewell_cuda_sampling)
+target_link_libraries(gewell_cuda_sampling PUBLIC CUDA::cudart)
+
+add_library(gewell_cuda_cache STATIC src/runtime/physical_cache.cu)
+gewell_cuda_target(gewell_cuda_cache)
+target_link_libraries(gewell_cuda_cache PUBLIC gewell_cache CUDA::cudart)
+
+add_library(gewell_cuda_quantized_linear STATIC src/nvfp4_linear.cu src/fp8_linear.cu)
+gewell_cuda_target(gewell_cuda_quantized_linear)
+target_link_libraries(gewell_cuda_quantized_linear PUBLIC CUDA::cudart CUDA::cublasLt)
+
+add_library(gewell_gemma4_26b_a4b_sm120 STATIC
+  src/models/gemma4/26b_a4b/weight_qdq.cu
+  src/models/gemma4/26b_a4b/sm120/runtime_backend.cu
+  src/models/gemma4/26b_a4b/sm120/executor.cu
+  src/models/gemma4/26b_a4b/sm120/batched_executor.cu
+  src/models/gemma4/26b_a4b/sm120/projection.cu
+  src/models/gemma4/26b_a4b/sm120/attention.cu
+  src/models/gemma4/26b_a4b/sm120/mtp_target.cu
+  src/models/gemma4/26b_a4b/sm120/mtp_staging.cu
+  src/models/gemma4/26b_a4b/sm120/kv_write.cu
+  src/models/gemma4/26b_a4b/sm120/moe.cu)
+gewell_cuda_target(gewell_gemma4_26b_a4b_sm120)
+target_compile_options(gewell_gemma4_26b_a4b_sm120 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+target_link_libraries(gewell_gemma4_26b_a4b_sm120 PUBLIC gewell_gemma4_31b_sm120 gewell_gemma4_26b_artifact gewell_runtime gewell_cuda_cache gewell_cuda_sampling gewell_cuda_quantized_linear CUDA::cudart CUDA::cublas)
+add_executable(gewell_gemma4_26b_qdq_device EXCLUDE_FROM_ALL tests/gemma4_26b_qdq_device.cu)
+gewell_cuda_target(gewell_gemma4_26b_qdq_device)
+target_compile_options(gewell_gemma4_26b_qdq_device PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+target_link_libraries(gewell_gemma4_26b_qdq_device PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_projection EXCLUDE_FROM_ALL tests/gemma4_26b_projection.cu)
+gewell_cuda_target(gewell_gemma4_26b_projection)
+target_link_libraries(gewell_gemma4_26b_projection PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_horizon EXCLUDE_FROM_ALL tests/gemma4_26b_horizon.cu)
+add_executable(gewell_gemma4_26b_rope EXCLUDE_FROM_ALL tests/gemma4_26b_rope.cu)
+gewell_cuda_target(gewell_gemma4_26b_rope)
+target_compile_options(gewell_gemma4_26b_rope PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+target_link_libraries(gewell_gemma4_26b_rope PRIVATE gewell_gemma4_26b_a4b_sm120)
+gewell_cuda_target(gewell_gemma4_26b_horizon)
+target_link_libraries(gewell_gemma4_26b_horizon PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_runtime EXCLUDE_FROM_ALL tests/gemma4_26b_runtime.cu)
+gewell_cuda_target(gewell_gemma4_26b_runtime)
+target_link_libraries(gewell_gemma4_26b_runtime PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_mtp_verifier EXCLUDE_FROM_ALL tests/gemma4_26b_mtp_verifier.cu)
+gewell_cuda_target(gewell_gemma4_26b_mtp_verifier)
+target_link_libraries(gewell_gemma4_26b_mtp_verifier PRIVATE gewell_gemma4_26b_a4b_sm120 gewell_gemma4_31b_sm120)
+add_executable(gewell_gemma4_26b_packed EXCLUDE_FROM_ALL tests/gemma4_26b_packed.cu)
+gewell_cuda_target(gewell_gemma4_26b_packed)
+target_link_libraries(gewell_gemma4_26b_packed PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_batch EXCLUDE_FROM_ALL tests/gemma4_26b_batch.cu)
+gewell_cuda_target(gewell_gemma4_26b_batch)
+target_link_libraries(gewell_gemma4_26b_batch PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_forward EXCLUDE_FROM_ALL tests/gemma4_26b_forward.cc)
+target_link_libraries(gewell_gemma4_26b_forward PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_attention EXCLUDE_FROM_ALL tests/gemma4_26b_attention.cu)
+gewell_cuda_target(gewell_gemma4_26b_attention)
+target_link_libraries(gewell_gemma4_26b_attention PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_attention_batch EXCLUDE_FROM_ALL tests/gemma4_26b_attention_batch.cu)
+gewell_cuda_target(gewell_gemma4_26b_attention_batch)
+target_link_libraries(gewell_gemma4_26b_attention_batch PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_moe_quantized EXCLUDE_FROM_ALL tests/gemma4_26b_moe_quantized.cu)
+gewell_cuda_target(gewell_gemma4_26b_moe_quantized)
+target_link_libraries(gewell_gemma4_26b_moe_quantized PRIVATE gewell_gemma4_26b_a4b_sm120)
+add_executable(gewell_gemma4_26b_moe EXCLUDE_FROM_ALL tests/gemma4_26b_moe.cu)
+gewell_cuda_target(gewell_gemma4_26b_moe)
+target_link_libraries(gewell_gemma4_26b_moe PRIVATE gewell_gemma4_26b_a4b_sm120)
+
+
 # Test bodies and fixed-fixture runners are excluded from this library.
 add_library(gewell_gemma4_31b_sm120 STATIC
   src/models/gemma4/31b/sm120/runtime_backend.cu
-  src/models/gemma4/31b/sm120/cache.cu
   src/models/gemma4/31b/sm120/kernels/linear.cu
   src/models/gemma4/31b/sm120/kernels/embedding.cu
   src/models/gemma4/31b/sm120/kernels/norm.cu
@@ -196,11 +285,9 @@ add_library(gewell_gemma4_31b_sm120 STATIC
   src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu
   src/models/gemma4/31b/sm120/mtp/assistant.cu
   src/models/gemma4/31b/sm120/mtp/attention.cu
-  src/models/gemma4/31b/sm120/mtp/sampling.cu
   src/models/gemma4/31b/sm120/mtp/target.cu
   src/models/gemma4/31b/sm120/mtp/cycle.cu
-  src/nvfp4_linear.cu
-  src/fp8_linear.cu
+  src/models/gemma4/31b/sm120/mtp/head.cu
   src/replay_metrics.cu
   src/models/gemma4/31b/sm120/vision/engine.cc
   src/models/gemma4/31b/sm120/vision/executor.cu
@@ -211,13 +298,14 @@ add_library(gewell_gemma4_31b_sm120 STATIC
 )
 gewell_cuda_target(gewell_gemma4_31b_sm120)
 target_link_libraries(gewell_gemma4_31b_sm120 PUBLIC
-  gewell_artifact gewell_gemma4_31b_cache_config gewell_runtime gewell_console
+  gewell_artifact gewell_gemma4_26b_artifact gewell_gemma4_31b_cache_config gewell_cuda_cache gewell_cuda_sampling gewell_runtime gewell_console gewell_cuda_quantized_linear
   CUDA::cudart CUDA::cublas CUDA::cublasLt)
 
 add_executable(gewell src/app/runner.cu src/app/main.cu)
-target_sources(gewell PRIVATE src/app/offline_runner.cu)
+target_sources(gewell PRIVATE src/app/offline_runner.cu src/app/model_selection.cc)
+target_compile_definitions(gewell PRIVATE GEWELL_VERSION="${PROJECT_VERSION}")
 install(TARGETS gewell RUNTIME DESTINATION bin)
-target_link_libraries(gewell PRIVATE gewell_offline_io)
+target_link_libraries(gewell PRIVATE gewell_offline_io gewell_gemma4_26b_a4b_sm120)
 gewell_cuda_target(gewell)
 target_link_libraries(gewell PRIVATE gewell_gemma4_31b_sm120 gewell_http gewell_gemma4_image_processor)
 
@@ -230,6 +318,11 @@ if(GEWELL_BUILD_DIAGNOSTICS)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(gewell_gemma4_26b_kv_test tests/gemma4_26b_kv_test.cu)
+  gewell_cuda_target(gewell_gemma4_26b_kv_test)
+  target_link_libraries(gewell_gemma4_26b_kv_test PRIVATE gewell_gemma4_26b_a4b_sm120)
+  add_test(NAME gewell_gemma4_26b_kv_test COMMAND gewell_gemma4_26b_kv_test)
+  set_tests_properties(gewell_gemma4_26b_kv_test PROPERTIES RUN_SERIAL TRUE TIMEOUT 300)
   foreach(suite IN ITEMS fp8_kv fp8_linear nvfp4_linear replay_metrics vision_primitives
       mtp_sampling mtp_assistant mtp_target mtp_attention mtp_norm
       bf16_primitives weight_qdq cuda_target bos_runner app)
@@ -239,7 +332,8 @@ if(BUILD_TESTING)
     add_test(NAME gewell_${suite}_test COMMAND gewell_${suite}_test)
     set_tests_properties(gewell_${suite}_test PROPERTIES RUN_SERIAL TRUE TIMEOUT 300)
   endforeach()
-  target_link_libraries(gewell_app_test PRIVATE gewell_http gewell_gemma4_image_processor)
+  target_sources(gewell_app_test PRIVATE src/app/model_selection.cc)
+  target_link_libraries(gewell_app_test PRIVATE gewell_http gewell_gemma4_image_processor gewell_gemma4_26b_a4b_sm120)
   add_test(NAME gewell_weight_qdq_device_test COMMAND gewell_weight_qdq_test --device)
   set_tests_properties(gewell_weight_qdq_device_test PROPERTIES RUN_SERIAL TRUE TIMEOUT 300)
   add_executable(gewell_prefill_primitive_self_test tests/prefill_primitives_test.cu)
@@ -249,10 +343,14 @@ if(BUILD_TESTING)
   set_tests_properties(gewell_prefill_primitive_self_test PROPERTIES RUN_SERIAL TRUE TIMEOUT 300)
 
   # Actual-weight oracle is opt-in; its fixture is generated locally.
+  target_link_libraries(gewell_fp8_kv_test PRIVATE gewell_gemma4_26b_a4b_sm120)
   add_executable(gewell_mtp_assistant_oracle tests/mtp_assistant_oracle.cu)
   gewell_cuda_target(gewell_mtp_assistant_oracle)
   target_link_libraries(gewell_mtp_assistant_oracle PRIVATE gewell_gemma4_31b_sm120)
-  foreach(benchmark IN ITEMS compact_attention prefill_chunk mtp_sampling)
+  add_executable(gewell_mtp_head_oracle tests/mtp_head_oracle.cu)
+  gewell_cuda_target(gewell_mtp_head_oracle)
+  target_link_libraries(gewell_mtp_head_oracle PRIVATE gewell_gemma4_31b_sm120)
+  foreach(benchmark IN ITEMS compact_attention prefill_chunk mtp_sampling mtp_oracle)
     add_executable(gewell_${benchmark}_benchmark EXCLUDE_FROM_ALL tests/${benchmark}_benchmark.cu)
     gewell_cuda_target(gewell_${benchmark}_benchmark)
     target_link_libraries(gewell_${benchmark}_benchmark PRIVATE gewell_gemma4_31b_sm120)

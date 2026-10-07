@@ -87,7 +87,7 @@ struct Fixture {
   std::vector<BF16> query, key, value, cache_key, cache_value, norm;
   std::vector<std::uint64_t> offsets;
   Device dq, dk, dv, dc, dcv, dn, doff, out, old_out, scratch;
-  gewell::mtp_target::CacheView cache{};
+  gewell::kv_cache::DeviceView cache{};
 
   Fixture(unsigned position, unsigned count, bool full, bool pages)
       : base(position), rows(count), heads(full ? 4 : 16), width(full ? 512 : 256),
@@ -251,6 +251,11 @@ void geometry(unsigned base, unsigned rows, bool global, bool paged) {
   Fixture f(base, rows, global, paged);
   f.run(); f.generic();
   const auto actual = f.out.host(), generic = f.old_out.host();
+  if (rows == 1) {
+    a::run_decode_batch(32, {{f.dq.get(), f.dk.get(), f.dv.get(), f.cache, base, 1, f.out.get()}},
+        f.dn.get(), f.kind(), f.scratch.get<void>(), f.scratch.bytes(), nullptr);
+    require(same(actual, f.out.host()), f.label() + " shared single-row decode changed arithmetic");
+  }
   Error generic_drift, cpu_error;
   const auto generic_label = f.label() + " generic";
   // Generic chunk attention retains FP32 P*V probabilities. Keep it as a
@@ -359,7 +364,7 @@ void bounds_and_long_context() {
   page.upload(std::vector<BF16>(page_elements, bf(0.25F)));
   norm.upload(std::vector<BF16>(512, bf(1)));
   offsets.upload(std::vector<std::uint64_t>(1024, 0));
-  gewell::mtp_target::CacheView cache{};
+  gewell::kv_cache::DeviceView cache{};
   cache.page_pool = page.get(); cache.page_offsets = offsets.get<std::uint64_t>();
   cache.page_tokens = 256; cache.page_count = 1024; cache.page_stride_elements = page_elements;
   a::run(query.get(), key.get(), value.get(), cache, norm.get(), base, 1,
@@ -378,6 +383,51 @@ void bounds_and_long_context() {
       output.get(), scratch.get<void>(), scratch.bytes() - 1, nullptr); }, "undersized frozen scratch");
   std::cout << "max_context=262144 max_rows=1280 scratch_bytes="
             << a::scratch_bytes(1280, 262144) << " bounded=1 validation=passed\n";
+}
+
+void mixed_batch_launches() {
+  constexpr unsigned batch = 64;
+  for (const bool global : {false, true}) {
+    Fixture single(4093, 1, global, global), multi(4093, 4, global, global);
+    single.run(); multi.run();
+    const auto one = single.out.host(), four = multi.out.host();
+    Device outputs((one.size()+four.size())*(batch/2)*sizeof(BF16));
+    Device scratch(a::scratch_bytes(160, 8192));
+    std::vector<a::BatchInput> inputs;
+    std::size_t offset = 0;
+    for (unsigned i = 0; i < batch; ++i) {
+      auto& f = i%2 ? multi : single;
+      inputs.push_back({f.dq.get(), f.dk.get(), f.dv.get(), f.cache,
+          f.base, f.rows, outputs.get()+offset});
+      offset += f.query.size();
+    }
+    cudaStream_t stream;
+    check(cudaStreamCreate(&stream));
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    a::run_batch(inputs, global ? single.dn.get() : nullptr, single.kind(),
+                 scratch.get<void>(), scratch.bytes(), stream);
+    check(cudaStreamEndCapture(stream, &graph));
+    std::size_t nodes = 0;
+    check(cudaGraphGetNodes(graph, nullptr, &nodes));
+    require(nodes == 4, "interleaved single/multirow requests fragmented attention launches");
+    check(cudaGraphInstantiate(&executable, graph, 0));
+    check(cudaGraphLaunch(executable, stream));
+    check(cudaStreamSynchronize(stream));
+    const auto actual = outputs.host();
+    Error error;
+    offset = 0;
+    for (unsigned i = 0; i < batch; ++i) {
+      const auto& reference = i%2 ? four : one;
+      for (std::size_t j = 0; j < reference.size(); ++j)
+        error.observe(actual[offset+j], reference[j], "mixed attention output routing");
+      offset += reference.size();
+    }
+    error.finish("mixed attention/serial", .005, .001);
+    cudaGraphExecDestroy(executable); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
+    std::cout << "mixed_attention global=" << global << " requests=64 launches=4 routing=passed\n";
+  }
 }
 
 void batched_equivalence() {
@@ -670,6 +720,7 @@ int main(int argc, char** argv) {
     tiny_probability(true);
     misaligned_local_copies();
     batched_equivalence();
+    mixed_batch_launches();
     split_budget_launches();
     geometry(1023, 1280, false, false);
     // Cross the split cap with varying keys/values, including a partial extra
