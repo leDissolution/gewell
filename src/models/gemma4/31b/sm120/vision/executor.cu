@@ -337,7 +337,7 @@ class VisionExecutor::Impl {
     const auto* const positions = request.image.position_ids_device;
 
     capture(captures, "input.pixel_values",
-            request.image.patch_values_device, CaptureDType::f32,
+            request.image.patch_values_device, CaptureDType::u8,
             request.image.padded_patch_rows, model::kVisionPatchWidth,
             stream);
     capture(captures, "input.image_position_ids", positions,

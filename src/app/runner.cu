@@ -1078,7 +1078,7 @@ int run_caption(const std::string& artifact_path,
        vision_engine::kSupportedSoftTokenCapacities) {
     const std::uint32_t rows =
         vision_engine::padded_patch_rows_for_capacity(capacity);
-    if (pixel_byte_count == vision_engine::prepared_pixel_bytes(rows)) {
+    if (pixel_byte_count == vision_engine::prepared_pixel_file_bytes(rows)) {
       image_max_soft_tokens = capacity;
       break;
     }
@@ -1089,10 +1089,10 @@ int run_caption(const std::string& artifact_path,
   }
   const std::uint32_t padded_patch_rows =
       vision_engine::padded_patch_rows_for_capacity(image_max_soft_tokens);
-  std::vector<std::uint8_t> pixels = read_exact_input(
+  std::vector<std::uint8_t> pixels = vision_engine::prepared_pixels_from_file_bytes(read_exact_input(
       pixel_values_path,
-      vision_engine::prepared_pixel_bytes(padded_patch_rows),
-      "read caption pixel input");
+      vision_engine::prepared_pixel_file_bytes(padded_patch_rows),
+      "read caption pixel input"));
   std::vector<std::uint8_t> positions = read_exact_input(
       position_ids_path,
       vision_engine::prepared_position_bytes(padded_patch_rows),

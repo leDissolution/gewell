@@ -32,6 +32,8 @@ class File {
   File& operator=(const File&) = delete;
   const std::vector<Tensor>& tensors() const { return tensors_; }
   std::size_t device_bytes() const { return device_bytes_; }
+  // Unmaps resident pages from this process; later reads fault back from the page cache.
+  void drop_resident_pages() const;
  private:
   const std::uint8_t* mapping_{};
   std::size_t mapping_bytes_{};

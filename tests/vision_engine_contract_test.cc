@@ -33,7 +33,7 @@ constexpr std::uintptr_t kOutputAddress = 0x3000'0000ULL;
 PreparedImage image(std::uint32_t soft_token_capacity,
                     std::uint32_t soft_token_count) {
   return {
-      reinterpret_cast<const float*>(kPatchAddress),
+      reinterpret_cast<const std::uint8_t*>(kPatchAddress),
       reinterpret_cast<const std::int32_t*>(kPositionAddress),
       padded_patch_rows_for_capacity(soft_token_capacity),
       soft_token_count,
@@ -61,9 +61,9 @@ void test_shape_constants() {
   static_assert(padded_patch_rows_for_capacity(1'120) == 10'080);
   static_assert(gemma4_31b::kVisionPatchWidth == 768);
   static_assert(gemma4_31b::kHiddenSize == 5'376);
-  static_assert(prepared_pixel_bytes(2'520) == 7'741'440);
+  static_assert(prepared_pixel_bytes(2'520) == 1'935'360);
   static_assert(prepared_position_bytes(2'520) == 20'160);
-  static_assert(prepared_pixel_bytes(10'080) == 30'965'760);
+  static_assert(prepared_pixel_bytes(10'080) == 7'741'440);
   static_assert(prepared_position_bytes(10'080) == 80'640);
 }
 
@@ -225,7 +225,7 @@ void test_request_validation() {
 
   PrefillRequest output_overlaps_patches = request(valid, 280);
   output_overlaps_patches.soft_features_bf16_device =
-      const_cast<float*>(valid.patch_values_device);
+      const_cast<std::uint8_t*>(valid.patch_values_device);
   require_invalid(
       [&] {
         static_cast<void>(
@@ -244,7 +244,7 @@ void test_request_validation() {
       "overlapping inputs were accepted");
 
   PreparedImage overflowing_input = valid;
-  overflowing_input.patch_values_device = reinterpret_cast<const float*>(
+  overflowing_input.patch_values_device = reinterpret_cast<const std::uint8_t*>(
       std::numeric_limits<std::uintptr_t>::max() - 1);
   require_invalid(
       [&] {

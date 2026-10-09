@@ -13,11 +13,25 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+  libavformat>=62.3 libavcodec>=62.11 libavutil>=60.8 libswscale>=9.1 libswresample>=6.1)
 
 add_library(gewell_gemma4_image_processor STATIC src/models/gemma4/text/image_processor.cc)
 target_include_directories(gewell_gemma4_image_processor PUBLIC include)
 target_compile_features(gewell_gemma4_image_processor PUBLIC cxx_std_17)
 target_link_libraries(gewell_gemma4_image_processor PRIVATE PNG::PNG JPEG::JPEG)
+add_library(gewell_embeddinggemma2_video STATIC src/models/embeddinggemma2/video.cc)
+target_include_directories(gewell_embeddinggemma2_video PUBLIC include)
+target_compile_features(gewell_embeddinggemma2_video PUBLIC cxx_std_17)
+target_link_libraries(gewell_embeddinggemma2_video PUBLIC gewell_gemma4_image_processor PRIVATE PkgConfig::FFMPEG OpenSSL::Crypto)
+add_library(gewell_embeddinggemma2_audio_processor STATIC src/models/embeddinggemma2/audio_processor.cc)
+target_include_directories(gewell_embeddinggemma2_audio_processor PUBLIC include)
+target_compile_features(gewell_embeddinggemma2_audio_processor PUBLIC cxx_std_17)
+target_link_libraries(gewell_embeddinggemma2_audio_processor PRIVATE PkgConfig::FFMPEG OpenSSL::Crypto)
+add_library(gewell_vision_contract STATIC src/models/gemma4/31b/sm120/vision/engine.cc)
+target_include_directories(gewell_vision_contract PUBLIC include)
+target_compile_features(gewell_vision_contract PUBLIC cxx_std_17)
 
 add_library(gewell_text_codec STATIC
   src/tokenizer.cc
@@ -77,7 +91,7 @@ target_include_directories(gewell_metrics PUBLIC include)
 target_include_directories(gewell_metrics SYSTEM PUBLIC vendor/nlohmann)
 target_compile_features(gewell_metrics PUBLIC cxx_std_17)
 
-add_library(gewell_http STATIC src/http_api.cc src/http_server.cc src/models/gemma4/text/tool_output.cc)
+add_library(gewell_http STATIC src/http_api.cc src/embedding_api.cc src/http_server.cc src/models/gemma4/text/tool_output.cc)
 target_link_libraries(gewell_http PUBLIC gewell_text_codec gewell_json_constraint gewell_console gewell_metrics Threads::Threads)
 target_compile_features(gewell_http PUBLIC cxx_std_17)
 
@@ -86,6 +100,16 @@ add_library(gewell_component_weights STATIC src/component_weights.cc)
 target_include_directories(gewell_component_weights PUBLIC include)
 target_include_directories(gewell_component_weights SYSTEM PRIVATE vendor/nlohmann)
 target_compile_features(gewell_component_weights PUBLIC cxx_std_17)
+
+add_library(gewell_embeddinggemma2_contract STATIC src/models/embeddinggemma2/contract.cc src/models/embeddinggemma2/text.cc src/models/embeddinggemma2/vision_contract.cc src/models/embeddinggemma2/audio_contract.cc)
+target_include_directories(gewell_embeddinggemma2_contract PUBLIC include)
+target_include_directories(gewell_embeddinggemma2_contract SYSTEM PUBLIC vendor/nlohmann)
+target_link_libraries(gewell_embeddinggemma2_contract PUBLIC gewell_component_weights gewell_text_codec gewell_vision_contract gewell_embeddinggemma2_audio_processor)
+target_link_libraries(gewell_http PUBLIC gewell_embeddinggemma2_contract PRIVATE gewell_embeddinggemma2_video)
+if(BUILD_TESTING)
+  add_executable(gewell_embeddinggemma2_contract_test tests/embeddinggemma2_contract.cc)
+  target_link_libraries(gewell_embeddinggemma2_contract_test PRIVATE gewell_embeddinggemma2_contract OpenSSL::Crypto)
+endif()
 
 add_library(gewell_artifact STATIC src/models/gemma4/31b/artifact.cc src/models/gemma4/31b/component_weights.cc)
 target_include_directories(gewell_artifact PUBLIC include)
@@ -130,6 +154,14 @@ if(BUILD_TESTING)
   add_executable(gewell_image_processor_test tests/image_processor_test.cc)
   target_include_directories(gewell_image_processor_test SYSTEM PRIVATE vendor/nlohmann)
   target_link_libraries(gewell_image_processor_test PRIVATE gewell_gemma4_image_processor OpenSSL::Crypto)
+  add_executable(gewell_embeddinggemma2_video_test tests/embeddinggemma2_video.cc)
+  target_include_directories(gewell_embeddinggemma2_video_test SYSTEM PRIVATE vendor/nlohmann)
+  target_link_libraries(gewell_embeddinggemma2_video_test PRIVATE gewell_embeddinggemma2_video OpenSSL::Crypto)
+  add_test(NAME gewell_embeddinggemma2_video_test COMMAND gewell_embeddinggemma2_video_test)
+  add_executable(gewell_embeddinggemma2_audio_processor_test tests/embeddinggemma2_audio_processor.cc)
+  target_include_directories(gewell_embeddinggemma2_audio_processor_test SYSTEM PRIVATE vendor/nlohmann)
+  target_link_libraries(gewell_embeddinggemma2_audio_processor_test PRIVATE gewell_embeddinggemma2_audio_processor OpenSSL::Crypto)
+  add_test(NAME gewell_embeddinggemma2_audio_processor_test COMMAND gewell_embeddinggemma2_audio_processor_test)
   add_test(NAME gewell_image_processor_test COMMAND gewell_image_processor_test
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/image_processor.json")
   foreach(suite IN ITEMS runtime_cache runtime_scheduler runtime_mtp_stats runtime_mtp_capture runtime_mtp_head image_identity)
@@ -142,8 +174,7 @@ if(BUILD_TESTING)
     target_link_libraries(gewell_${suite}_test PRIVATE gewell_artifact gewell_cache gewell_http)
     add_test(NAME gewell_${suite}_test COMMAND gewell_${suite}_test)
   endforeach()
-  target_sources(gewell_vision_engine_contract_test PRIVATE
-    src/models/gemma4/31b/sm120/vision/engine.cc)
+  target_link_libraries(gewell_vision_engine_contract_test PRIVATE gewell_vision_contract)
 
   set(GEWELL_TOKENIZER_DIRECTORY
       ""
@@ -166,6 +197,15 @@ if(NOT GEWELL_ENABLE_CUDA)
 endif()
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
+find_path(CUDNN_INCLUDE_DIR cudnn.h HINTS ${CUDNN_ROOT} ENV CUDNN_ROOT PATH_SUFFIXES include REQUIRED)
+find_library(CUDNN_LIBRARY NAMES cudnn libcudnn.so.9 HINTS ${CUDNN_ROOT} ENV CUDNN_ROOT PATH_SUFFIXES lib lib64 REQUIRED)
+file(STRINGS "${CUDNN_INCLUDE_DIR}/cudnn_version.h" CUDNN_MAJOR_DEFINITION REGEX "^#define CUDNN_MAJOR +[0-9]+")
+if(NOT CUDNN_MAJOR_DEFINITION MATCHES "^#define CUDNN_MAJOR +9$")
+  message(FATAL_ERROR "EmbeddingGemma 2 audio requires cuDNN 9 headers")
+endif()
+add_library(CUDNN::cudnn UNKNOWN IMPORTED)
+set_target_properties(CUDNN::cudnn PROPERTIES IMPORTED_LOCATION "${CUDNN_LIBRARY}"
+  INTERFACE_INCLUDE_DIRECTORIES "${CUDNN_INCLUDE_DIR}")
 
 # Only headers are needed for the fixed SM120 GEMM instantiations.
 FetchContent_Declare(cutlass
@@ -178,14 +218,17 @@ FetchContent_MakeAvailable(cutlass)
 set_property(SOURCE src/nvfp4_linear.cu src/fp8_linear.cu
   src/models/gemma4/26b_a4b/sm120/moe.cu
   src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu
-  src/models/gemma4/31b/sm120/vision/attention.cu APPEND PROPERTY
+  src/models/gemma4/31b/sm120/vision/attention.cu
+  src/models/embeddinggemma2/sm120/attention.cu APPEND PROPERTY
   INCLUDE_DIRECTORIES "${cutlass_SOURCE_DIR}/include" "${cutlass_SOURCE_DIR}/tools/util/include")
 set_property(SOURCE src/nvfp4_linear.cu src/fp8_linear.cu
   src/models/gemma4/26b_a4b/sm120/moe.cu
   src/models/gemma4/31b/sm120/kernels/prefill_fp8_attention.cu
-  src/models/gemma4/31b/sm120/vision/attention.cu APPEND PROPERTY
+  src/models/gemma4/31b/sm120/vision/attention.cu
+  src/models/embeddinggemma2/sm120/attention.cu APPEND PROPERTY
   COMPILE_OPTIONS --expt-relaxed-constexpr)
-set_property(SOURCE src/models/gemma4/31b/sm120/vision/attention.cu APPEND PROPERTY
+set_property(SOURCE src/models/gemma4/31b/sm120/vision/attention.cu
+  src/models/embeddinggemma2/sm120/attention.cu APPEND PROPERTY
   INCLUDE_DIRECTORIES "${cutlass_SOURCE_DIR}/examples/41_fused_multi_head_attention")
 
 function(gewell_cuda_target target)
@@ -198,6 +241,25 @@ function(gewell_cuda_target target)
     CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES CUDA_EXTENSIONS NO
     CUDA_ARCHITECTURES "120a-real" CUDA_RUNTIME_LIBRARY Shared CUDA_SEPARABLE_COMPILATION OFF)
 endfunction()
+
+add_library(gewell_embeddinggemma2_sm120 STATIC src/models/embeddinggemma2/sm120/encoder.cu
+  src/models/embeddinggemma2/sm120/attention.cu)
+gewell_cuda_target(gewell_embeddinggemma2_sm120)
+target_compile_options(gewell_embeddinggemma2_sm120 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+target_link_libraries(gewell_embeddinggemma2_sm120 PUBLIC gewell_embeddinggemma2_contract CUDA::cudart CUDA::cublas)
+target_link_libraries(gewell_embeddinggemma2_sm120 PRIVATE CUDNN::cudnn)
+if(BUILD_TESTING)
+  add_executable(gewell_embeddinggemma2_encoder_test tests/embeddinggemma2_encoder.cc)
+  target_link_libraries(gewell_embeddinggemma2_encoder_test PRIVATE gewell_embeddinggemma2_sm120)
+  add_executable(gewell_embeddinggemma2_images_test tests/embeddinggemma2_images.cc)
+  target_link_libraries(gewell_embeddinggemma2_images_test PRIVATE gewell_embeddinggemma2_sm120 gewell_gemma4_image_processor)
+  add_executable(gewell_embeddinggemma2_audios_test tests/embeddinggemma2_audios.cc)
+  target_link_libraries(gewell_embeddinggemma2_audios_test PRIVATE gewell_embeddinggemma2_sm120)
+endif()
+if(GEWELL_BUILD_DIAGNOSTICS)
+  add_executable(gewell_embeddinggemma2 src/diagnostics/embeddinggemma2.cc)
+  target_link_libraries(gewell_embeddinggemma2 PRIVATE gewell_embeddinggemma2_sm120 gewell_embeddinggemma2_video)
+endif()
 
 add_library(gewell_cuda_sampling STATIC src/runtime/sampling.cu)
 gewell_cuda_target(gewell_cuda_sampling)
@@ -289,7 +351,6 @@ add_library(gewell_gemma4_31b_sm120 STATIC
   src/models/gemma4/31b/sm120/mtp/cycle.cu
   src/models/gemma4/31b/sm120/mtp/head.cu
   src/replay_metrics.cu
-  src/models/gemma4/31b/sm120/vision/engine.cc
   src/models/gemma4/31b/sm120/vision/executor.cu
   src/models/gemma4/31b/sm120/vision/attention.cu
   src/models/gemma4/31b/sm120/vision/primitives.cu
@@ -298,16 +359,16 @@ add_library(gewell_gemma4_31b_sm120 STATIC
 )
 gewell_cuda_target(gewell_gemma4_31b_sm120)
 target_link_libraries(gewell_gemma4_31b_sm120 PUBLIC
-  gewell_artifact gewell_gemma4_26b_artifact gewell_gemma4_31b_cache_config gewell_cuda_cache gewell_cuda_sampling gewell_runtime gewell_console gewell_cuda_quantized_linear
+  gewell_artifact gewell_gemma4_26b_artifact gewell_gemma4_31b_cache_config gewell_cuda_cache gewell_cuda_sampling gewell_runtime gewell_console gewell_cuda_quantized_linear gewell_vision_contract
   CUDA::cudart CUDA::cublas CUDA::cublasLt)
 
 add_executable(gewell src/app/runner.cu src/app/main.cu)
-target_sources(gewell PRIVATE src/app/offline_runner.cu src/app/model_selection.cc)
+target_sources(gewell PRIVATE src/app/offline_runner.cu src/app/model_selection.cc src/app/embedding_server.cc)
 target_compile_definitions(gewell PRIVATE GEWELL_VERSION="${PROJECT_VERSION}")
 install(TARGETS gewell RUNTIME DESTINATION bin)
 target_link_libraries(gewell PRIVATE gewell_offline_io gewell_gemma4_26b_a4b_sm120)
 gewell_cuda_target(gewell)
-target_link_libraries(gewell PRIVATE gewell_gemma4_31b_sm120 gewell_http gewell_gemma4_image_processor)
+target_link_libraries(gewell PRIVATE gewell_gemma4_31b_sm120 gewell_http gewell_gemma4_image_processor gewell_embeddinggemma2_sm120)
 
 if(GEWELL_BUILD_DIAGNOSTICS)
   add_executable(gewell_diagnostics

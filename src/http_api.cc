@@ -4,11 +4,14 @@
 #include "gewell/tool_output.h"
 #include "gewell/stop_matcher.h"
 
+#include <atomic>
 #include <cmath>
 #include <deque>
+#include <exception>
 #include <initializer_list>
 #include <limits>
 #include <set>
+#include <thread>
 #include <utility>
 
 namespace gewell::http {
@@ -404,13 +407,25 @@ std::vector<std::shared_ptr<runtime::ImageInput>> prepare_chat_images(
   for (auto& image : pending) *image.part = {{"type", "text"}, {"text", ""}};
   try { (void)tokenizer.contract().normalize_messages(messages); }
   catch (const std::invalid_argument& error) { invalid("messages", error.what()); }
-  std::vector<std::shared_ptr<runtime::ImageInput>> prepared;
-  prepared.reserve(pending.size());
+  std::vector<std::shared_ptr<runtime::ImageInput>> prepared(pending.size());
+  std::vector<std::exception_ptr> errors(pending.size());
+  // Decode concurrently; validation and error order stay sequential below.
+  // Images skipped after a failure have neither a value nor an error.
+  run_image_tasks(pending.size(), [&](std::size_t k) {
+    try { prepared[k] = images.prepare(pending[k].url, max_soft_tokens); }
+    catch (...) { errors[k] = std::current_exception(); }
+    return !errors[k];
+  });
   std::uint64_t image_tokens = 0;
-  for (auto& image : pending) {
-    std::shared_ptr<runtime::ImageInput> value;
-    try { value = images.prepare(image.url, max_soft_tokens); }
-    catch (const std::invalid_argument& error) { invalid(image.param + ".image_url.url", error.what(), "invalid_image"); }
+  for (std::size_t k = 0; k < pending.size(); ++k) {
+    auto& image = pending[k];
+    auto& value = prepared[k];
+    try {
+      if (errors[k]) std::rethrow_exception(errors[k]);
+      if (!value) value = images.prepare(image.url, max_soft_tokens);
+    } catch (const std::invalid_argument& error) {
+      invalid(image.param + ".image_url.url", error.what(), "invalid_image");
+    }
     if (!value || value->begin || !value->end || value->end > max_soft_tokens ||
         value->end > images.max_image_tokens)
       execution_error("image processor returned an invalid feature span");
@@ -421,7 +436,6 @@ std::vector<std::shared_ptr<runtime::ImageInput>> prepare_chat_images(
     for (std::uint32_t i = 0; i < value->end; ++i) placeholder += tokenizer.token_piece(images.image_token);
     placeholder += tokenizer.token_piece(images.end_token);
     (*image.part)["text"] = std::move(placeholder);
-    prepared.push_back(std::move(value));
   }
   return prepared;
 }
@@ -572,6 +586,33 @@ json pool_json(const kv_cache::PoolStats& stats) {
 }
 
 }  // namespace
+
+void run_image_tasks(std::size_t count, const std::function<bool(std::size_t)>& task) {
+  // Each thread holds at most one decoded image.
+  constexpr int kImageHelperThreads = 8;
+  static std::atomic<int> helpers{0};
+  std::atomic<std::size_t> next{0};
+  std::atomic<bool> failed{false};
+  auto work = [&] {
+    for (std::size_t k; !failed && (k = next++) < count;)
+      if (!task(k)) failed = true;
+  };
+  int granted = 0;
+  for (int active = helpers.load(); granted + 1 < static_cast<int>(count) && active < kImageHelperThreads;)
+    if (helpers.compare_exchange_weak(active, active + 1)) { ++granted; ++active; }
+  std::vector<std::thread> workers;
+  try {
+    for (; static_cast<int>(workers.size()) < granted;) workers.emplace_back(work);
+  } catch (...) {
+    failed = true;
+    for (auto& worker : workers) worker.join();
+    helpers -= granted;
+    throw;
+  }
+  work();
+  for (auto& worker : workers) worker.join();
+  helpers -= granted;
+}
 
 Error::Error(int status_value, std::string message, std::string parameter, std::string error_code)
     : std::runtime_error(std::move(message)), status(status_value),

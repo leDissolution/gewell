@@ -254,7 +254,7 @@ class RuntimeBackend final : public ExecutionBackend {
         check_cuda(cudaMemcpyAsync(image_positions_->data(),image.positions.data(),image.positions.size(),
             cudaMemcpyHostToDevice,stream_.value),"upload26B image positions");
         auto* output=static_cast<BF16*>(image_features_->data())+offset*kHiddenSize;
-        vision_tower_->run({{static_cast<const float*>(image_pixels_->data()),
+        vision_tower_->run({{static_cast<const std::uint8_t*>(image_pixels_->data()),
             static_cast<const std::int32_t*>(image_positions_->data()),image.padded_patch_rows,input.rows},
             output,input.rows},image_scratch_->data(),image_scratch_->size(),stream_.value);
         features[i]=output;

@@ -4,6 +4,7 @@
 #include <json.hpp>
 
 #include <array>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -22,6 +23,16 @@ std::string sha256(const std::vector<std::uint8_t>& bytes) {
   std::ostringstream result;
   for (const auto byte : digest) result << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
   return result.str();
+}
+
+// Pinned HF fixtures hash FP32 pixel_values; uint8 pixels rescale exactly.
+std::string pixels_sha256(const std::vector<std::uint8_t>& pixels) {
+  std::vector<std::uint8_t> bytes(pixels.size() * sizeof(float));
+  for (std::size_t i = 0; i < pixels.size(); ++i) {
+    const float value = pixels[i] * (1.0F / 255.0F);
+    std::memcpy(bytes.data() + i * sizeof(float), &value, sizeof(float));
+  }
+  return sha256(bytes);
 }
 
 void require_invalid(std::string_view data, std::string_view name) {
@@ -55,9 +66,9 @@ int main(int argc, char** argv) {
         const auto budget = expected.at("max_soft_tokens").get<std::uint32_t>();
         const auto image = gewell::gemma4::prepare_image_data_url(test.at("data_url").get<std::string>(), budget);
         if (image.padded_patch_rows != budget * 9 || image.soft_token_count != expected.at("soft_token_count") ||
-            image.pixels.size() != std::size_t(budget) * 9 * 768 * 4 || image.positions.size() != budget * 9 * 8 ||
-            sha256(image.pixels) != expected.at("pixels_sha256") || sha256(image.positions) != expected.at("positions_sha256")) {
-          std::cerr << name << " budget=" << budget << ": pixels=" << sha256(image.pixels)
+            image.pixels.size() != std::size_t(budget) * 9 * 768 || image.positions.size() != budget * 9 * 8 ||
+            pixels_sha256(image.pixels) != expected.at("pixels_sha256") || sha256(image.positions) != expected.at("positions_sha256")) {
+          std::cerr << name << " budget=" << budget << ": pixels=" << pixels_sha256(image.pixels)
                     << " positions=" << sha256(image.positions) << " soft_tokens=" << image.soft_token_count << '\n';
           throw std::runtime_error(name + " differs from pinned processor");
         }
@@ -100,8 +111,8 @@ int main(int argc, char** argv) {
       std::ifstream encoded_stream(argv[2], std::ios::binary);
       const std::vector<unsigned char> encoded{std::istreambuf_iterator<char>(encoded_stream), {}};
       const auto image = gewell::gemma4::prepare_image_data_url("data:image/png;base64," + base64(encoded));
-      if (sha256(image.pixels) != argv[3] || sha256(image.positions) != argv[4]) {
-        std::cerr << "caption pixels=" << sha256(image.pixels) << " positions=" << sha256(image.positions) << '\n';
+      if (pixels_sha256(image.pixels) != argv[3] || sha256(image.positions) != argv[4]) {
+        std::cerr << "caption pixels=" << pixels_sha256(image.pixels) << " positions=" << sha256(image.positions) << '\n';
         throw std::runtime_error("caption source differs from prepared-image reference");
       }
       std::cout << "caption source exact (" << image.soft_token_count << " soft tokens)\n";

@@ -12,13 +12,38 @@ Required tools and libraries:
   or Make.
 - CUDA development libraries, including cuBLAS and cuBLASLt, and a compatible
   NVIDIA driver for execution.
-- OpenSSL, libpng, and libjpeg development packages, and the `patch` command.
+- cuDNN 9 development headers and libraries for the EmbeddingGemma 2 audio tower.
+- OpenSSL, libpng, libjpeg, and FFmpeg 8 development packages, plus `pkg-config`
+  and the `patch` command. Video decoding uses libavformat, libavcodec, libavutil
+  and libswscale; audio preparation also uses libswresample.
 
 On Debian/Ubuntu, the non-CUDA packages can be installed with:
 
 ```bash
-sudo apt-get install build-essential cmake ninja-build patch libssl-dev libpng-dev libjpeg-dev
+sudo apt-get install build-essential cmake ninja-build patch pkg-config \
+  libssl-dev libpng-dev libjpeg-dev libavformat-dev libavcodec-dev \
+  libavutil-dev libswscale-dev libswresample-dev
 ```
+
+The distribution must supply FFmpeg 8 development packages. Installing the
+`ffmpeg` executable alone does not provide the headers or `.pc` files used by
+CMake. Check discovery with:
+
+```bash
+pkg-config --modversion libavformat libavcodec libavutil libswscale libswresample
+```
+
+For a separate FFmpeg development installation, add
+`-DCMAKE_PREFIX_PATH=/path/to/ffmpeg/prefix` when configuring. This is saved in
+the build cache for later `cmake --build` calls; keep the installation outside
+temporary directories. The prefix must contain usable headers, libraries and
+pkg-config metadata.
+
+If cuDNN is outside the system search path, also add
+`-DCUDNN_ROOT=/path/to/cudnn`, containing `include` and `lib` or `lib64`.
+The development environment's Python package can supply it at
+`.venv/lib/python3.12/site-packages/nvidia/cudnn` when that package is installed.
+Production execution links the native cuDNN library and does not invoke Python.
 
 CMake downloads XGrammar and CUTLASS sources during
 configuration. To use already downloaded

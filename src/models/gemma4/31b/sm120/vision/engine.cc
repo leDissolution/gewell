@@ -121,7 +121,7 @@ void validate_prepared_image_bytes(const void* pixel_bytes,
     throw std::invalid_argument("vision prepared positions are null");
   }
   const std::uint32_t pixel_rows = prepared_rows(
-      pixel_byte_count, gemma4_31b::kVisionPatchWidth * sizeof(float),
+      pixel_byte_count, gemma4_31b::kVisionPatchWidth,
       "vision prepared pixels");
   const std::uint32_t position_rows = prepared_rows(
       position_byte_count, 2 * sizeof(std::int32_t),
@@ -184,22 +184,34 @@ void validate_prepared_image_bytes(const void* pixel_bytes,
   }
 
   const std::size_t valid_pixel_bytes =
-      valid_rows * gemma4_31b::kVisionPatchWidth * sizeof(float);
+      valid_rows * gemma4_31b::kVisionPatchWidth;
   if (!std::all_of(pixels + valid_pixel_bytes,
                    pixels + pixel_byte_count,
                    [](std::uint8_t value) { return value == 0; })) {
     throw std::invalid_argument(
         "vision prepared padding patch rows must be exact zero");
   }
-  for (std::size_t offset = 0; offset < valid_pixel_bytes;
-       offset += sizeof(float)) {
-    float value = 0.0F;
-    std::memcpy(&value, pixels + offset, sizeof(value));
-    if (!std::isfinite(value) || value < 0.0F || value > 1.0F) {
-      throw std::invalid_argument(
-          "vision prepared valid patch values must be finite and in [0,1]");
+}
+
+std::vector<std::uint8_t> prepared_pixels_from_file_bytes(
+    const std::vector<std::uint8_t>& file_bytes) {
+  if (file_bytes.size() % sizeof(float) != 0) {
+    throw std::invalid_argument("vision pixel file has an invalid byte length");
+  }
+  std::vector<std::uint8_t> pixels(file_bytes.size() / sizeof(float));
+  for (std::size_t i = 0; i < pixels.size(); ++i) {
+    float value;
+    std::memcpy(&value, file_bytes.data() + i * sizeof(float), sizeof(value));
+    const float level = value * 255.0F;
+    if (!(level >= 0.0F && level <= 255.0F)) {
+      throw std::invalid_argument("vision pixel file values must be in [0,1]");
+    }
+    pixels[i] = static_cast<std::uint8_t>(std::lrint(level));
+    if (pixels[i] * (1.0F / 255.0F) != value) {
+      throw std::invalid_argument("vision pixel file values must be uint8/255");
     }
   }
+  return pixels;
 }
 
 }  // namespace gewell::vision_engine

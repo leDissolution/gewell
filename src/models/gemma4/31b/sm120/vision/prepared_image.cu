@@ -28,7 +28,7 @@ void PreparedImage::prepare(const std::vector<std::uint8_t>& pixels,
   check_cuda(cudaMemcpyAsync(positions_->data(), positions.data(), positions.size(),
                             cudaMemcpyHostToDevice, stream), "copy prepared positions to device");
   const vision_engine::PrefillRequest request{
-      {static_cast<const float*>(pixels_->data()),
+      {static_cast<const std::uint8_t*>(pixels_->data()),
        static_cast<const std::int32_t*>(positions_->data()), padded_patch_rows, soft_token_count},
       features_->data(), soft_token_count};
   check_cuda(cudaEventRecord(begin_.get(), stream), "record prepared vision start");

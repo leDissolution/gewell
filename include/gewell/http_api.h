@@ -5,6 +5,8 @@
 #include "gewell/logprobs.h"
 #include "gewell/tokenizer.h"
 #include "gewell/runtime/image.h"
+#include "gewell/models/embeddinggemma2/input.h"
+#include "gewell/models/embeddinggemma2/video.h"
 #include "json.hpp"
 
 #include <chrono>
@@ -21,7 +23,7 @@
 namespace gewell::http {
 
 using ClientId = std::uint64_t;
-enum class Operation { health, models, model, metrics, cache_index, generate, prefill, finish, stats };
+enum class Operation { health, models, model, metrics, cache_index, generate, prefill, finish, stats, embed };
 enum class Priority { low, normal, high };
 
 struct CacheControls {
@@ -35,11 +37,31 @@ struct CacheControls {
 // the resident GPU owner interprets the resulting patch tensors.
 struct ImageSupport {
   std::function<std::shared_ptr<runtime::ImageInput>(std::string_view, std::uint32_t)> prepare;
+  // Embedding videos decode into the same image storage at a fixed frame budget.
+  embeddinggemma2::PrepareVideoFrame prepare_video_frame;
+  embeddinggemma2::PreparationPoll poll_preparation;
   std::uint32_t begin_token{}, image_token{}, end_token{}, max_image_tokens{};
   std::uint32_t default_max_soft_tokens{};
   // Supported token budgets and their per-image host tensor reservations.
   std::map<std::uint32_t, std::size_t> prepared_bytes;
 };
+
+// Runs task(i) for every i < count on the caller plus helper threads shared by
+// all requests (a process-wide cap bounds decode/resize scratch). Once a task
+// returns false, unclaimed tasks are skipped. Tasks must not throw.
+void run_image_tasks(std::size_t count, const std::function<bool(std::size_t)>& task);
+
+struct EmbeddingLimits {
+  std::size_t max_inputs = 32;
+  std::uint32_t max_batch_tokens = 8192;
+  bool audio = false;
+};
+struct EmbeddingInput {
+  std::vector<embeddinggemma2::PreparedInput> inputs;
+  int dimensions = 768;
+  bool base64 = false;
+};
+struct EmbeddingResult { std::vector<std::vector<float>> vectors; };
 
 struct Request {
   Operation operation = Operation::generate;
@@ -67,6 +89,7 @@ struct Request {
   std::shared_ptr<const constraint::Compiled> constraint;
   std::vector<std::string> tool_names;
   CacheControls cache;
+  std::shared_ptr<const EmbeddingInput> embeddings;
 };
 
 struct Error : std::runtime_error {
@@ -95,6 +118,12 @@ nlohmann::json model_json(const std::string& model, std::int64_t created);
 nlohmann::json immediate_json(const Request& request, const std::string& model,
                              std::int64_t created, bool ready);
 nlohmann::json control_json(const Request& request, const Result& result);
+Request parse_embedding_request(std::string_view method, std::string_view path,
+    std::string_view body, const text::Tokenizer& tokenizer, const std::string& model,
+    constraint::Compiler& compiler, const EmbeddingLimits& limits, std::size_t max_output_bytes,
+    const ImageSupport& images = {}, const embeddinggemma2::audio::Acquire& acquire_audio = {});
+nlohmann::json embedding_json(const Request& request, const EmbeddingResult& result,
+                             const std::string& model);
 
 // Called only by the HTTP I/O thread. push() returns SSE text for streams and
 // accumulates bounded text for buffered responses. finish() verifies execution

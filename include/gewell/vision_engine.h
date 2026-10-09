@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace gewell::vision_engine {
 
@@ -42,10 +43,18 @@ static_assert(kSupportedSoftTokenCapacities[4] ==
   return false;
 }
 
+// Prepared pixels are uint8 RGB values; the tower rescales them by 1/255 on
+// device, which reproduces the processor's FP32 values exactly.
 [[nodiscard]] constexpr std::size_t prepared_pixel_bytes(
     std::uint32_t padded_patch_rows) {
   return static_cast<std::size_t>(padded_patch_rows) *
-         gemma4_31b::kVisionPatchWidth * sizeof(float);
+         gemma4_31b::kVisionPatchWidth;
+}
+
+// External pixel_values files keep the processor's FP32 [rows,768] layout.
+[[nodiscard]] constexpr std::size_t prepared_pixel_file_bytes(
+    std::uint32_t padded_patch_rows) {
+  return prepared_pixel_bytes(padded_patch_rows) * sizeof(float);
 }
 
 [[nodiscard]] constexpr std::size_t prepared_position_bytes(
@@ -56,9 +65,9 @@ static_assert(kSupportedSoftTokenCapacities[4] ==
 
 // One image after the pinned external Gemma 4 image preprocessing step.
 //
-// patch_values_device is row-major FP32 [padded_patch_rows,768]. Values are
-// RGB patches rescaled to [0,1], with pixels laid out in patch-height,
-// patch-width, channel order. position_ids_device is row-major int32
+// patch_values_device is row-major uint8 [padded_patch_rows,768]. Values are
+// RGB patches whose processor values are value/255, with pixels laid out in
+// patch-height, patch-width, channel order. position_ids_device is row-major int32
 // [padded_patch_rows,2] containing (x,y). The supported padded capacities are
 // 630, 1260, 2520, 5040, and 10080 rows. The first soft_token_count*9 rows
 // describe the real rectangular patch grid in row-major order; every
@@ -67,7 +76,7 @@ static_assert(kSupportedSoftTokenCapacities[4] ==
 // Vision execution compacts to that valid prefix; padded rows are part of the
 // processor-facing ABI but are not evaluated by the tower.
 struct PreparedImage {
-  const float* patch_values_device{};
+  const std::uint8_t* patch_values_device{};
   const std::int32_t* position_ids_device{};
   std::uint32_t padded_patch_rows{};
   std::uint32_t soft_token_count{};
@@ -99,5 +108,11 @@ void validate_prepared_image_bytes(const void* pixel_bytes,
                                    const void* position_bytes,
                                    std::size_t position_byte_count,
                                    std::uint32_t soft_token_count);
+
+// Converts little-endian FP32 pixel_values file bytes to prepared uint8
+// pixels. Every value must be exactly k/255 (k in 0..255) as produced by the
+// processor's uint8 rescale. Throws std::invalid_argument otherwise.
+[[nodiscard]] std::vector<std::uint8_t> prepared_pixels_from_file_bytes(
+    const std::vector<std::uint8_t>& file_bytes);
 
 }  // namespace gewell::vision_engine

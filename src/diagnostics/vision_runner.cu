@@ -135,15 +135,19 @@ std::size_t dtype_bytes(executor::CaptureDType dtype) {
       return sizeof(float);
     case executor::CaptureDType::i32:
       return sizeof(std::int32_t);
+    case executor::CaptureDType::u8:
+      return 1;
   }
   fail("vision capture", "unknown dtype");
 }
 
+// uint8 prepared pixels are written as the processor's FP32 values.
 std::string_view dtype_extension(executor::CaptureDType dtype) {
   switch (dtype) {
     case executor::CaptureDType::bf16:
       return ".bf16";
     case executor::CaptureDType::f32:
+    case executor::CaptureDType::u8:
       return ".f32";
     case executor::CaptureDType::i32:
       return ".i32";
@@ -171,7 +175,7 @@ class CapturePlan final : public executor::CaptureSink {
            error ? error.message() : "path already exists (overwrite refused)");
     }
     const std::uint32_t patches = soft_tokens * 9;
-    add("input.pixel_values", executor::CaptureDType::f32,
+    add("input.pixel_values", executor::CaptureDType::u8,
         padded_patch_rows, model::kVisionPatchWidth);
     add("input.image_position_ids", executor::CaptureDType::i32,
         padded_patch_rows, 2);
@@ -247,10 +251,15 @@ class CapturePlan final : public executor::CaptureSink {
                                 record.columns * dtype_bytes(record.dtype);
       const std::filesystem::path path =
           directory_ / (record.name + std::string(dtype_extension(record.dtype)));
-      write_exclusive(path,
-                      static_cast<const std::uint8_t*>(host_data_) +
-                          record.offset,
-                      bytes);
+      const auto* data = static_cast<const std::uint8_t*>(host_data_) + record.offset;
+      if (record.dtype == executor::CaptureDType::u8) {
+        std::vector<float> values(data, data + bytes);
+        for (float& value : values) value *= 1.0F / 255.0F;
+        write_exclusive(path, reinterpret_cast<const std::uint8_t*>(values.data()),
+                        values.size() * sizeof(float));
+        continue;
+      }
+      write_exclusive(path, data, bytes);
     }
   }
 
@@ -309,11 +318,11 @@ int run(vision_engine::Model selected, const std::string& artifact_path, const s
   }
 
   const std::vector<std::uint8_t> pixels =
-      read_file(pixel_values_path,
-                vision_engine::prepared_pixel_bytes(
+      vision_engine::prepared_pixels_from_file_bytes(read_file(pixel_values_path,
+                vision_engine::prepared_pixel_file_bytes(
                     vision_engine::padded_patch_rows_for_capacity(
                         model::kVisionMaxSoftTokenCount)),
-                "vision pixel input");
+                "vision pixel input"));
   const std::vector<std::uint8_t> positions =
       read_file(position_ids_path,
                 vision_engine::prepared_position_bytes(
@@ -324,7 +333,7 @@ int run(vision_engine::Model selected, const std::string& artifact_path, const s
       pixels.data(), pixels.size(), positions.data(), positions.size(),
       soft_token_count);
   const std::uint32_t padded_patch_rows = static_cast<std::uint32_t>(
-      pixels.size() / (model::kVisionPatchWidth * sizeof(float)));
+      pixels.size() / model::kVisionPatchWidth);
 
   const auto output_width = vision_engine::output_width(selected);
   gewell::component::File file(artifact_path, selected == vision_engine::Model::gemma4_26b_a4b
@@ -356,7 +365,7 @@ int run(vision_engine::Model selected, const std::string& artifact_path, const s
              "copy vision positions to device");
 
   vision_engine::PrefillRequest request{
-      {static_cast<const float*>(device_pixels.data()),
+      {static_cast<const std::uint8_t*>(device_pixels.data()),
        static_cast<const std::int32_t*>(device_positions.data()),
        padded_patch_rows, soft_token_count},
       output.data(), soft_token_count};

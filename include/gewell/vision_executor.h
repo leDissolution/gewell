@@ -27,6 +27,7 @@ enum class CaptureDType : std::uint8_t {
   bf16,
   f32,
   i32,
+  u8,
 };
 
 struct CaptureTensor {

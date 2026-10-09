@@ -3,6 +3,7 @@
 #include "gewell/models/gemma4/31b/artifact.h"
 #include "gewell/models/gemma4/31b/model.h"
 #include "gewell/http_server.h"
+#include "gewell/embedding_server.h"
 #include "gewell/app.h"
 #include "gewell/offline_runner.h"
 #include "gewell/text_codec_cli.h"
@@ -500,6 +501,7 @@ void print_usage(const char* executable) {
 
 Serving
   serve-http --model-dir DIR --max-batch N --kv-cache-gpu-mib N [options]
+  serve-embeddings MODEL_DIR [options]
 
 Generation
   generate ARTIFACT PROMPT.u32 NEW_TOKENS OUTPUT.u32 [LOGITS.bf16]
@@ -550,6 +552,16 @@ Options
   --kv-cache-index-mib N              Host cache-index budget (default 512 MiB)
   --kv-checkpoint-interval-tokens N   Periodic checkpoint spacing (0 disables it)
 
+Embedding options (after serve-embeddings MODEL_DIR)
+  --vision                           Load the bundle's vision component; enables image/video content
+  --audio                            Load the bundle's audio component; enables audio content
+  --max-inputs N                     Inputs per request, 1..256 (default 32)
+  --max-pending N                    Active + queued requests, 1..256 (default 8)
+  --max-batch-tokens N               Scratch and per-input token limit, 3..8192 (default 8192)
+                                     Short inputs are packed together; images share vision forwards
+  --max-body-total-bytes N           Bodies plus prepared media (default 1 GiB in this mode)
+  Also accepts shared host, port, model, connection, body, output and timeout options below.
+
 HTTP options (after serve-http)
   --verbose                          Print received prompts to the console (default off)
   --host HOST                        IPv4 bind address (default 127.0.0.1)
@@ -581,19 +593,24 @@ int main(int argc, char** argv) {
   try {
     // Console format is global, including commands whose remaining arguments are positional.
     std::string assistant_path, vision_path;
+    bool embedding_command = false;
     int remaining = 1;
     for (int index = 1; index < argc; ++index) {
       if (std::string_view(argv[index]) == "--log-format") {
         if (index + 1 == argc) throw std::runtime_error("--log-format requires a value");
         console::set_format(argv[++index]);
-      } else if (std::string_view(argv[index]) == "--assistant" || std::string_view(argv[index]) == "--vision") {
+      } else if (std::string_view(argv[index]) == "--assistant" ||
+                 (std::string_view(argv[index]) == "--vision" && !embedding_command)) {
         const std::string option(argv[index]);
         if (index + 1 == argc || !argv[index + 1][0] || std::string_view(argv[index + 1]).substr(0, 2) == "--")
           throw std::runtime_error(option + " requires a path");
         auto& path = option == "--assistant" ? assistant_path : vision_path;
         if (!path.empty()) throw std::runtime_error(option + " was supplied more than once");
         path = argv[++index];
-      } else argv[remaining++] = argv[index];
+      } else {
+        if (remaining==1 && std::string_view(argv[index])=="serve-embeddings") embedding_command=true;
+        argv[remaining++] = argv[index];
+      }
     }
     argc = remaining;
     argv[argc] = nullptr;
@@ -605,6 +622,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
       print_usage(argv[0]);
       return 0;
+    }
+    if (argc >= 2 && std::string_view(argv[1]) == "serve-embeddings") {
+      if (!assistant_path.empty() || !vision_path.empty())
+        throw std::runtime_error("serve-embeddings does not accept --assistant or global --vision PATH; use --vision after MODEL_DIR");
+      return app::serve_embeddings(argc - 2, argv + 2);
     }
     app::GenerationSettings generation_settings;
     generation_settings.assistant_path = assistant_path;

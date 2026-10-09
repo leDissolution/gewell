@@ -104,7 +104,7 @@ A checkpoint becomes reusable only after its layer state and required copies
 are complete. Independently recomputed KV is not merged merely because its
 tokens match; sharing follows the actual reused execution state.
 
-A later local ring cannot generally reconstruct an earlier window. If two
+A later local ring cannot reconstruct an earlier window. If two
 prompts match through token 5,000 but the deepest usable checkpoint is at
 4,096, the request resumes at 4,096 and recomputes the remainder. Keeping global
 pages alone does not make every token boundary resumable.

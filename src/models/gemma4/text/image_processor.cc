@@ -64,12 +64,6 @@ std::vector<std::uint8_t> decode_base64(std::string_view data) {
   return bytes;
 }
 
-struct RgbImage {
-  std::uint32_t width{};
-  std::uint32_t height{};
-  std::vector<std::uint8_t> pixels;
-};
-
 struct PngState {
   png_structp png{};
   png_infop info{};
@@ -225,10 +219,13 @@ std::pair<std::uint32_t, std::uint32_t> resized_shape(
   return {width, height};
 }
 
+// Integer taps for output position x are values[x*stride, x*stride+count[x]),
+// applied to inputs starting at first[x].
 struct ResampleWeights {
   unsigned precision{};
-  std::vector<std::uint32_t> first;
-  std::vector<std::vector<std::int16_t>> values;
+  std::size_t stride{};
+  std::vector<std::uint32_t> first, count;
+  std::vector<std::int16_t> values;
 };
 
 double cubic(double x) {
@@ -244,7 +241,7 @@ double cubic(double x) {
 ResampleWeights resample_weights(std::uint32_t input, std::uint32_t output) {
   ResampleWeights weights;
   weights.first.resize(output);
-  weights.values.resize(output);
+  weights.count.resize(output);
   std::vector<std::vector<double>> floating(output);
   const double scale = static_cast<double>(input) / output;
   const double support = 2.0 * std::max(1.0, scale);
@@ -255,6 +252,8 @@ ResampleWeights resample_weights(std::uint32_t input, std::uint32_t output) {
     const auto first = std::max(0, static_cast<int>(center - support + 0.5));
     const auto end = std::min(static_cast<int>(input), static_cast<int>(center + support + 0.5));
     weights.first[x] = static_cast<std::uint32_t>(first);
+    weights.count[x] = static_cast<std::uint32_t>(end - first);
+    weights.stride = std::max<std::size_t>(weights.stride, end - first);
     floating[x].resize(end - first);
     double total = 0.0;
     for (int i = first; i < end; ++i) {
@@ -269,29 +268,42 @@ ResampleWeights resample_weights(std::uint32_t input, std::uint32_t output) {
          static_cast<int>(0.5 + maximum * (1 << (weights.precision + 1))) < (1 << 15)) {
     ++weights.precision;
   }
+  weights.values.resize(output * weights.stride);
   for (std::uint32_t x = 0; x < output; ++x) {
-    weights.values[x].reserve(floating[x].size());
-    for (double value : floating[x]) {
-      value *= 1 << weights.precision;
-      weights.values[x].push_back(static_cast<std::int16_t>(value < 0 ? value - 0.5 : value + 0.5));
+    for (std::size_t i = 0; i < floating[x].size(); ++i) {
+      const double value = floating[x][i] * (1 << weights.precision);
+      weights.values[x * weights.stride + i] = static_cast<std::int16_t>(value < 0 ? value - 0.5 : value + 0.5);
     }
   }
   return weights;
 }
 
+std::uint8_t resampled(int sum, unsigned precision) {
+  return static_cast<std::uint8_t>(std::clamp(sum >> precision, 0, 255));
+}
+
+// Integer sums are order-independent, so the loop structure is free to change
+// without altering any output byte.
 RgbImage resize(RgbImage image, std::uint32_t width, std::uint32_t height) {
   if (image.width != width) {
     const auto weights = resample_weights(image.width, width);
+    const int half = 1 << (weights.precision - 1);
     std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * image.height * 3);
     for (std::uint32_t y = 0; y < image.height; ++y) {
+      const auto* row = image.pixels.data() + static_cast<std::size_t>(y) * image.width * 3;
+      auto* output = pixels.data() + static_cast<std::size_t>(y) * width * 3;
       for (std::uint32_t x = 0; x < width; ++x) {
-        for (std::size_t c = 0; c < 3; ++c) {
-          int sum = 1 << (weights.precision - 1);
-          const auto* source = image.pixels.data() + (static_cast<std::size_t>(y) * image.width + weights.first[x]) * 3 + c;
-          for (std::size_t i = 0; i < weights.values[x].size(); ++i) sum += source[3 * i] * weights.values[x][i];
-          pixels[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
-              static_cast<std::uint8_t>(std::clamp(sum >> weights.precision, 0, 255));
+        const auto* source = row + static_cast<std::size_t>(weights.first[x]) * 3;
+        const auto* taps = weights.values.data() + x * weights.stride;
+        int red = half, green = half, blue = half;
+        for (std::uint32_t i = 0; i < weights.count[x]; ++i) {
+          red += source[3 * i] * taps[i];
+          green += source[3 * i + 1] * taps[i];
+          blue += source[3 * i + 2] * taps[i];
         }
+        output[3 * x] = resampled(red, weights.precision);
+        output[3 * x + 1] = resampled(green, weights.precision);
+        output[3 * x + 2] = resampled(blue, weights.precision);
       }
     }
     image.width = width;
@@ -299,15 +311,18 @@ RgbImage resize(RgbImage image, std::uint32_t width, std::uint32_t height) {
   }
   if (image.height != height) {
     const auto weights = resample_weights(image.height, height);
-    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 3);
+    const std::size_t row_bytes = static_cast<std::size_t>(width) * 3;
+    std::vector<std::uint8_t> pixels(row_bytes * height);
+    std::vector<int> sums(row_bytes);
     for (std::uint32_t y = 0; y < height; ++y) {
-      for (std::size_t x = 0; x < static_cast<std::size_t>(width) * 3; ++x) {
-        int sum = 1 << (weights.precision - 1);
-        const auto* source = image.pixels.data() + static_cast<std::size_t>(weights.first[y]) * width * 3 + x;
-        for (std::size_t i = 0; i < weights.values[y].size(); ++i) sum += source[i * width * 3] * weights.values[y][i];
-        pixels[static_cast<std::size_t>(y) * width * 3 + x] =
-            static_cast<std::uint8_t>(std::clamp(sum >> weights.precision, 0, 255));
+      std::fill(sums.begin(), sums.end(), 1 << (weights.precision - 1));
+      for (std::uint32_t i = 0; i < weights.count[y]; ++i) {
+        const auto* source = image.pixels.data() + (weights.first[y] + i) * row_bytes;
+        const int tap = weights.values[y * weights.stride + i];
+        for (std::size_t x = 0; x < row_bytes; ++x) sums[x] += source[x] * tap;
       }
+      auto* output = pixels.data() + y * row_bytes;
+      for (std::size_t x = 0; x < row_bytes; ++x) output[x] = resampled(sums[x], weights.precision);
     }
     image.height = height;
     image.pixels = std::move(pixels);
@@ -328,10 +343,9 @@ PreparedImage patchify(const RgbImage& image, std::uint32_t max_soft_tokens) {
   const std::uint32_t patch_width = image.width / kPatchSize;
   const std::uint32_t patch_height = image.height / kPatchSize;
   prepared.soft_token_count = patch_width * patch_height / (kPoolSize * kPoolSize);
-  prepared.pixels.resize(static_cast<std::size_t>(prepared.padded_patch_rows) * kPatchSize * kPatchSize * 3 * sizeof(float));
+  prepared.pixels.resize(static_cast<std::size_t>(prepared.padded_patch_rows) * kPatchSize * kPatchSize * 3);
   prepared.positions.resize(static_cast<std::size_t>(prepared.padded_patch_rows) * 2 * sizeof(std::int32_t), 0xff);
-  constexpr float factor = 1.0f / 255.0f;
-  std::size_t offset = 0;
+  auto* output = prepared.pixels.data();
   for (std::uint32_t py = 0; py < patch_height; ++py) {
     for (std::uint32_t px = 0; px < patch_width; ++px) {
       const std::size_t row = static_cast<std::size_t>(py) * patch_width + px;
@@ -340,13 +354,7 @@ PreparedImage patchify(const RgbImage& image, std::uint32_t max_soft_tokens) {
       for (std::uint32_t y = 0; y < kPatchSize; ++y) {
         const auto* source = image.pixels.data() +
             (static_cast<std::size_t>(py * kPatchSize + y) * image.width + px * kPatchSize) * 3;
-        for (std::uint32_t x = 0; x < kPatchSize * 3; ++x) {
-          const float value = source[x] * factor;
-          std::uint32_t bits;
-          std::memcpy(&bits, &value, sizeof(bits));
-          write_u32(prepared.pixels.data() + offset, bits);
-          offset += sizeof(float);
-        }
+        output = std::copy_n(source, kPatchSize * 3, output);
       }
     }
   }
@@ -378,7 +386,15 @@ PreparedImage prepare_image_data_url(std::string_view data_url, std::uint32_t ma
       offset += size + 12;
     }
   }
-  auto image = png ? decode_png(encoded) : decode_jpeg(encoded);
+  return prepare_rgb_image(png ? decode_png(encoded) : decode_jpeg(encoded), max_soft_tokens);
+}
+
+PreparedImage prepare_rgb_image(RgbImage image, std::uint32_t max_soft_tokens) {
+  if (!vision_engine::is_supported_soft_token_capacity(max_soft_tokens))
+    invalid("max_soft_tokens must be one of 70, 140, 280, 560, 1120");
+  validate_size(image.width, image.height);
+  if (image.pixels.size() != std::size_t(image.width) * image.height * 3)
+    invalid("RGB image byte count differs from dimensions");
   const auto [width, height] = resized_shape(image, max_soft_tokens);
   return patchify(resize(std::move(image), width, height), max_soft_tokens);
 }

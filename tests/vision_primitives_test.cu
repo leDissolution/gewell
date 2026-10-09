@@ -101,13 +101,13 @@ void require_close(float actual, float expected, float tolerance,
 
 void test_normalize() {
   constexpr std::size_t kElements = gewell::gemma4_31b::kVisionPatchWidth;
-  std::vector<float> input(kElements);
+  std::vector<std::uint8_t> input(kElements);
   std::vector<BFloat16> expected(kElements);
   for (std::size_t i = 0; i < kElements; ++i) {
-    input[i] = static_cast<float>(i % 17) / 16.0F;
-    expected[i] = bf16(2.0F * (input[i] - 0.5F));
+    input[i] = static_cast<std::uint8_t>(i * 37);
+    expected[i] = bf16(2.0F * (input[i] * (1.0F / 255.0F) - 0.5F));
   }
-  DeviceBuffer<float> device_input(kElements);
+  DeviceBuffer<std::uint8_t> device_input(kElements);
   DeviceBuffer<BFloat16> device_output(kElements);
   device_input.copy_from(input);
   gewell::vision_primitives::normalize_patch_values(

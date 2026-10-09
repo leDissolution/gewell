@@ -1,5 +1,61 @@
 # Model bundles and conversion
 
+EmbeddingGemma 2 uses a separate BF16 text bundle on SM120. A prepared bundle
+with all three components (text, vision, audio) is published at
+[LeDissolution/EmbeddingGemma-2-Gewell](https://huggingface.co/LeDissolution/EmbeddingGemma-2-Gewell):
+
+```bash
+hf download LeDissolution/EmbeddingGemma-2-Gewell --local-dir EMBEDDING_DIR
+build/gewell serve-embeddings EMBEDDING_DIR --vision --audio
+```
+
+Omit `--vision` or `--audio` to leave that component unloaded. To extract a
+bundle yourself, for example from a fine-tune:
+
+```bash
+python3 tools/extract_embeddinggemma2.py --snapshot SOURCE_DIR --output EMBEDDING_DIR
+build/gewell serve-embeddings EMBEDDING_DIR
+```
+
+The source must have the supported EmbeddingGemma 2 architecture and BF16 text
+weights. Extraction validates all 413 tensors, preserves their values and
+creates `text.safetensors`, `config.json` and `tokenizer.json` in a new directory.
+It accepts compatible fine-tunes without source/revision allowlists. Native
+startup validates configuration, tokenizer and tensor inventory. Text inputs
+support up to 8192 tokens including BOS/EOS and 128/256/512/768 dimensions.
+No task prefixes are inserted automatically. Explicit GPU allocations are
+274,210,816 weight bytes and 167,773,696 scratch bytes at the 8192-token
+capacity, excluding CUDA/cuBLAS overhead; the token-embedding table stays in
+host memory. Embedding serving runs independently of generation serving.
+
+For image or video inputs, extract an image-capable bundle:
+
+```bash
+python3 tools/extract_embeddinggemma2.py --snapshot SOURCE_DIR --vision --output IMAGE_EMBEDDING_DIR
+build/gewell serve-embeddings IMAGE_EMBEDDING_DIR --vision
+```
+
+This adds 211 BF16 tower/bridge tensors in `vision.safetensors` and copies
+`processor_config.json`. The combined explicit allocations are 610,017,280
+weight bytes and 178,782,528 scratch bytes at the 8192-token capacity, excluding
+CUDA/cuBLAS overhead. Vision weights stay resident; vision and text execution
+share scratch. Without the boolean `--vision`, only text weights are loaded.
+
+For audio inputs, add `--audio` to extraction and serving:
+
+```bash
+python3 tools/extract_embeddinggemma2.py --snapshot SOURCE_DIR --vision --audio --output MULTIMODAL_DIR
+build/gewell serve-embeddings MULTIMODAL_DIR --vision --audio
+```
+
+This adds 752 BF16 audio tower/bridge tensors in `audio.safetensors`. Omit
+`--vision` from both commands for a text/audio bundle. With all three
+modalities the explicit allocations are 1,223,507,968 weight bytes and
+1,028,441,648 scratch bytes, excluding CUDA/cuBLAS/cuDNN overhead. Requests
+that mix images or video with audio need both options.
+
+The remaining bundle and conversion instructions describe Gemma 4 generation.
+
 A serving bundle contains text weights and tokenizer data:
 
 ```text
@@ -207,14 +263,6 @@ python3 tools/convert.py --snapshot "$SOURCE_DIR" \
   --mask /path/to/recipe.mask --input-scales /path/to/scales.json \
   --output /path/to/custom-calibrated-model
 ```
-
-### Online calibration (coming later)
-
-Running calibration samples during conversion to measure activation ranges
-for the selected model and mask is not implemented yet. The current converter
-uses saved scales and runs on CPU with NumPy. Online calibration is intended
-to support layer-by-layer execution so the entire BF16 model need not fit in
-GPU memory; there is no calibration-dataset option in the converter today.
 
 ## Optional assistant and vision
 

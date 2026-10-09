@@ -66,13 +66,14 @@ unsigned blocks_for(std::size_t elements) {
   return static_cast<unsigned>(blocks);
 }
 
-__global__ void normalize_patch_values_kernel(const float* input,
+__global__ void normalize_patch_values_kernel(const std::uint8_t* input,
                                                BFloat16* output,
                                                std::size_t elements) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < elements) {
-    output[index] = __float2bfloat16_rn(2.0F * (input[index] - 0.5F));
+    const float value = __fmul_rn(input[index], 1.0F / 255.0F);
+    output[index] = __float2bfloat16_rn(2.0F * (value - 0.5F));
   }
 }
 
@@ -333,7 +334,7 @@ __global__ void standardize_kernel(const float* input, const BFloat16* bias,
 
 }  // namespace
 
-void normalize_patch_values(const float* input, BFloat16* output,
+void normalize_patch_values(const std::uint8_t* input, BFloat16* output,
                             std::uint32_t patch_rows, cudaStream_t stream) {
   check_pointer(input, "normalize_patch_values input");
   check_pointer(output, "normalize_patch_values output");

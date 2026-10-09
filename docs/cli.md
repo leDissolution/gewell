@@ -20,6 +20,7 @@ Options take separate values: `--mtp-depth 3`, not `--mtp-depth=3`.
 | Command | Arguments and purpose |
 |---|---|
 | `serve-http` | `--model-dir DIR --max-batch N --kv-cache-gpu-mib N [OPTIONS]` — persistent HTTP server |
+| `serve-embeddings` | `MODEL_DIR [OPTIONS]` — dedicated EmbeddingGemma 2 text/image/video/audio server |
 | `generate` | `ARTIFACT PROMPT.u32 NEW_TOKENS OUTPUT.u32 [LOGITS.bf16]` — one token-based generation |
 | `caption` | `ARTIFACT PROMPT.u32 PIXELS.f32 POSITIONS.i32 MAX_NEW_TOKENS OUTPUT.u32 [LOGITS.bf16]` — one prepared image |
 | `generate-batch` | `ARTIFACT REQUESTS.tsv MAX_BATCH KV_MIB OUTPUT_DIR [EVENTS.tsv]` — offline request queue |
@@ -116,6 +117,39 @@ decode immediately. Larger budgets can improve throughput at the cost of
 longer inter-token gaps; TTFT depends on the workload.
 
 ## HTTP options
+
+For EmbeddingGemma 2, run `build/gewell serve-embeddings MODEL_DIR`. It accepts
+the host, port, model, connection, body, output and timeout options below, plus:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--vision` | disabled | Load the bundle's vision component for images and video; boolean flag after `MODEL_DIR` |
+| `--audio` | disabled | Load the bundle's audio component for audio parts; boolean flag after `MODEL_DIR` |
+| `--max-inputs N` | `32` | Independent inputs per request, 1..256 |
+| `--max-pending N` | `8` | Active plus queued requests, 1..256; overflow returns 503 |
+| `--max-batch-tokens N` | `8192` | Fixed scratch and per-input token limit, 3..8192, including BOS/EOS |
+| `--max-body-total-bytes N` | `1073741824` | Aggregate request bodies plus prepared media; exhaustion returns 503 |
+
+The default model ID is `google/embeddinggemma-2`. `POST /v1/embeddings` requires
+`model` and `input` (a string, content object, or nonempty array of either). Optional
+`dimensions` is 128, 256, 512 or 768 (default); `encoding_format` is `float`
+(default) or `base64` of little-endian FP32. Supply task prefixes explicitly.
+Usage counts actual tokens including BOS/EOS and inserted image/video/audio features. Image
+budgets and structured parts are described in the [HTTP API](http-api.md).
+Unknown fields, unfilled media placeholders, excess length/input count and response-budget overflow return 400;
+unknown models return 404. There is no truncation. Requests run one at a time.
+Short inputs within a request are packed into shared masked encoder forwards,
+and their images and video frames share vision forwards; batches retain input
+order and return all results together. Disconnects
+cancel remaining work at layer boundaries. `/health`, `/metrics`, `/v1/models`
+and model detail are supported; generation/cache routes are unavailable.
+Metrics beginning `gewell:embedding_` report encoder request outcomes, throughput,
+timing, queue depth, and explicit allocations separately from generation.
+`images_total` and `image_soft_tokens_total` count still images; `videos_total`,
+`video_frames_total` and `video_soft_tokens_total` count clips, selected frames
+and their feature rows in completed input forwards; `audios_total` and
+`audio_soft_tokens_total` count audio clips and their feature rows. Retained image/frame patches and outstanding request bodies
+share `--max-body-total-bytes`; prepared-memory exhaustion returns 503.
 
 All HTTP options follow `serve-http`.
 
@@ -224,21 +258,3 @@ explicitly selected by a rule; changing packed storage requires repacking.
 Without a mask, the artifact's stored precision is used. The 31B mask retains
 its three-field format and layer range 0–59.
 
-`generate-batch`'s optional `EVENTS.tsv` injects deterministic arrival,
-cancellation, and failure events for scheduler testing. `replay-rollout`
-consumes four TSV fields: request ID, prompt token path, continuation token
-path, and saved generating-model logits. Neither is needed to launch serving.
-
-For 26B, replay prefills each prompt in `CHUNK_ROWS` pieces, then feeds the
-recorded continuation through single-row cached decode. Leading
-`--nvfp4-activation-policy always|prefill` applies to that decode. Each saved
-logit row must predict the corresponding continuation token, including the
-final token; the final token itself is not fed. 31B retains causal chunked
-prefill replay. Both models support weight-QDQ overlays; 26B replay also accepts
-converted BF16, FP8, NVFP4, and mixed native artifacts. Replay records the mask's
-SHA-256 separately from the unchanged artifact payload hash.
-
-The separately built `gewell_diagnostics` contains fixed capture/profile
-commands: `bos`, `pair`, `cached-pair`, `short-decode`, `local-boundary`,
-`local-boundary-prefill`, `graph-decode`, `profile-decode`, and `vision`.
-Its fixtures are separate from the model-serving bundle and are intended for development/debug purposes.

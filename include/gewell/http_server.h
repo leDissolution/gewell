@@ -15,12 +15,15 @@ struct Settings {
   std::size_t max_output_bytes = 8 * 1024 * 1024;
   std::uint32_t socket_timeout_seconds = 60;
   bool verbose = false;
+  // Dedicated embeddings mode; generation and cache routes are unavailable.
+  std::optional<EmbeddingLimits> embeddings;
 };
 
 struct Admission { ClientId client; Request request; };
 
-// One network thread and one request-preparation worker; the GPU owner only
-// exchanges bounded admissions, token bursts, outcomes and lifecycle events.
+// One network thread and request-preparation workers (one, or four for
+// embeddings); the GPU owner only exchanges bounded admissions, token bursts,
+// outcomes and lifecycle events.
 class Server {
  public:
   Server(const text::Tokenizer& tokenizer, Settings settings,
@@ -42,6 +45,8 @@ class Server {
   void emit(ClientId client, const std::uint32_t* tokens, std::size_t count,
             const TokenLogprobs* logprobs = nullptr);
   void finish(ClientId client, Result result);
+  void finish_embeddings(ClientId client, EmbeddingResult result);
+  bool cancelled(ClientId client) const;
   void reject(ClientId client, Error error);
   // Mark unhealthy and fail pending requests (JSON before SSE, error after it).
   void fail_all(Error error);

@@ -16,6 +16,72 @@ model name in requests.
 | `GET /v1/cache/stats` | Cache capacity and use |
 | `GET /v1/cache/index` | Retained prefixes and active executions |
 | `GET /metrics` | Prometheus metrics |
+| `POST /v1/embeddings` | Text/image/video embeddings, only in `serve-embeddings` mode |
+
+## Embeddings
+
+```bash
+curl http://127.0.0.1:6311/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"google/embeddinggemma-2","input":["task: search result | query: What causes auroras?","title: none | text: Charged particles from the sun cause auroras."],"dimensions":768}'
+```
+
+`model` is required. `input` accepts a nonempty string, a content object, or a
+nonempty array of either. Text and task prefixes are passed verbatim; BOS/EOS are added
+by the tokenizer. `dimensions` accepts 128, 256, 512 or 768 (default).
+`encoding_format` accepts `float` (default) or `base64` of little-endian FP32.
+Other fields and raw media placeholders in text are rejected. The response contains
+`object:"list"`, `model`, and an ordered `data` array with `object:"embedding"`,
+zero-based `index`, and `embedding` in each item. `usage.prompt_tokens` and
+`usage.total_tokens` count actual tokens including BOS/EOS, media boundaries and
+inserted features, without vision padding.
+
+Image and video requests require an image-capable bundle started with `--vision`;
+audio requires an audio-capable bundle started with `--audio`.
+Each structured input is exactly `{"content":[...]}` with ordered parts:
+
+| Part | Shape |
+|---|---|
+| Text | `{"type":"text","text":"..."}` |
+| Image | `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}` |
+| Video | `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}` |
+| Audio | `{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,..."}}` |
+
+The abbreviated URLs illustrate the shape; supply actual base64 media bytes.
+Images support PNG/JPEG. Videos support H.264 in MP4 and VP8/VP9 in WebM
+(`data:video/webm;base64,...`). Audio supports WAV (PCM or IEEE float), MP3
+(`audio/mpeg`) and FLAC (`audio/flac`); it is downmixed to 16 kHz mono without
+loudness normalization and is not truncated (about 25 tokens per second). Local
+paths, remote URLs, `detail`, and unknown fields are not accepted. Text parts concatenate without separators;
+empty parts are allowed when the complete input contains nonempty text or media.
+Multiple media parts and text form one embedding in their supplied order.
+
+Optional top-level `mm_processor_kwargs` accepts only `max_soft_tokens`, one of
+70, 140, 280, 560, 1120 (default 280), applied to every image in the request. The
+processor's actual feature count can be smaller. These kwargs do not alter video.
+Video samples at a fixed 1 FPS, uniformly caps the selections to 32 frames and
+uses a maximum of 140 soft tokens per frame. Sampling uses frame count and the
+stream's declared average frame rate, including for variable-rate clips. Missing
+FPS uses all frames before the uniform cap; sub-1-FPS sources may repeat frames.
+Timestamps are not inserted. Container rotation is not applied, and the soundtrack
+is ignored. Clips with changing frame dimensions are rejected.
+
+The assembled sequence, including all media, must fit the token limit. Each media
+data URL is bounded to 8 MiB, decoded sides to 8192 pixels, and decoded pixels per
+image/frame to 16,777,216. Prepared
+patch/position buffers share the aggregate request-memory limit. Invalid image,
+video or audio data returns 400 `invalid_image`, `invalid_video` or
+`invalid_audio`; expanded overflow returns 400
+`context_length_exceeded`, and prepared-memory exhaustion returns 503
+`capacity_exceeded`. Errors identify indexed input/part paths.
+
+Each input is limited to 8192 tokens by default; there is no truncation.
+Malformed input, unsupported dimensions and request/output limits return 400;
+unknown model IDs return 404; a full execution queue returns 503. The entire
+request is validated before execution. Batch results are returned together;
+disconnecting cancels video preparation, queued work or active execution at a
+layer boundary.
+See [CLI limits](cli.md) for request, scratch, queue and transport settings.
 
 ## Generation
 

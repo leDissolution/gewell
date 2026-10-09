@@ -100,4 +100,8 @@ File::File(const std::string& path, const std::vector<TensorSpec>& specs) {
 File::~File() {
   if (mapping_) ::munmap(const_cast<std::uint8_t*>(mapping_), mapping_bytes_);
 }
+
+void File::drop_resident_pages() const {
+  ::madvise(const_cast<std::uint8_t*>(mapping_), mapping_bytes_, MADV_DONTNEED);
+}
 }  // namespace gewell::component

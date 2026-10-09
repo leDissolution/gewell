@@ -19,9 +19,10 @@ inline constexpr std::uint32_t kMaxPatchRows =
 // patch_rows is the compact valid prefix: padding rows are never evaluated.
 // Input and output regions must not overlap except where explicitly allowed.
 
-// Apply Gemma 4's model-side pixel transform and cast the result to BF16:
-// output = BF16(2 * (input - 0.5)). Tensors are [patch_rows,768].
-void normalize_patch_values(const float* input, BFloat16* output,
+// Apply Gemma 4's rescale and model-side pixel transform, casting to BF16:
+// output = BF16(2 * (input * (1/255) - 0.5)) with FP32 arithmetic. Input is
+// uint8 [patch_rows,768]; output is [patch_rows,768].
+void normalize_patch_values(const std::uint8_t* input, BFloat16* output,
                             std::uint32_t patch_rows,
                             cudaStream_t stream = nullptr);
 

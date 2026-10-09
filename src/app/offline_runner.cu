@@ -339,7 +339,8 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
             delete input;
             *prepared_image_bytes -= bytes;
           });
-      retained->pixels = read_bytes(job.image_paths[i].first, pixels);
+      retained->pixels = vision_engine::prepared_pixels_from_file_bytes(
+          read_bytes(job.image_paths[i].first, vision_engine::prepared_pixel_file_bytes(image->padded_patch_rows)));
       retained->positions = read_bytes(job.image_paths[i].second, positions);
       loaded.push_back(std::move(retained));
     }

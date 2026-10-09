@@ -115,6 +115,7 @@ struct Server::Impl {
     std::vector<std::uint32_t> tokens;
     std::vector<TokenLogprobs> logprobs;
     std::optional<Result> result;
+    std::optional<EmbeddingResult> embedding_result;
     std::string method, path, input, wire;
     std::size_t body_length = 0, body_received = 0, sent = 0;
     bool parsed_header = false, request_complete = false;
@@ -137,9 +138,15 @@ struct Server::Impl {
     std::shared_ptr<runtime::ImageInput> image;
     std::shared_ptr<std::atomic<std::size_t>> total;
     std::size_t bytes{};
-    ~ImageLease() { if (bytes) total->fetch_sub(bytes); }
+    ~ImageLease() { image.reset(); if (bytes) total->fetch_sub(bytes); }
   };
-  std::shared_ptr<std::atomic<std::size_t>> image_bytes =
+  struct AudioLease {
+    embeddinggemma2::audio::Input input;
+    std::shared_ptr<std::atomic<std::size_t>> total;
+    std::size_t bytes{};
+    ~AudioLease() { input={}; if (bytes) total->fetch_sub(bytes); }
+  };
+  std::shared_ptr<std::atomic<std::size_t>> media_bytes =
       std::make_shared<std::atomic<std::size_t>>(0);
   std::size_t max_burst;
   int listener = -1, wake_fd = -1;
@@ -147,7 +154,8 @@ struct Server::Impl {
   std::string instance = std::to_string(Clock::now().time_since_epoch().count());
   mutable std::mutex mutex;
   std::condition_variable work_available;
-  std::thread io_thread, worker_thread;
+  std::thread io_thread;
+  std::vector<std::thread> worker_threads;
   std::atomic<bool> stopping{false}, healthy{true}, model_ready{false};
   std::map<ClientId, std::shared_ptr<Client>> clients;
   std::deque<std::shared_ptr<Client>> jobs;
@@ -168,14 +176,18 @@ struct Server::Impl {
         !settings.max_body_bytes || !settings.max_body_total_bytes ||
         settings.max_output_bytes < 1024 || !settings.socket_timeout_seconds || !max_burst ||
         max_burst > static_cast<std::size_t>(std::numeric_limits<int>::max()) || settings.model.empty() ||
+        (settings.embeddings && (!settings.embeddings->max_inputs || settings.embeddings->max_inputs > 256 ||
+          settings.embeddings->max_batch_tokens < 3 || settings.embeddings->max_batch_tokens > 8192)) ||
         (images.prepare && (!images.max_image_tokens ||
           !images.prepared_bytes.count(images.default_max_soft_tokens) ||
-          !images.prepared_bytes.at(images.default_max_soft_tokens))))
+          !images.prepared_bytes.at(images.default_max_soft_tokens))) ||
+        (images.prepare_video_frame && (!images.prepared_bytes.count(embeddinggemma2::kVideoFrameBudget) ||
+          !images.prepared_bytes.at(embeddinggemma2::kVideoFrameBudget))))
       throw std::invalid_argument("invalid HTTP bounds, port, model, or token burst (output minimum: 1024 bytes)");
     metrics::Writer initial(settings.model);
     initial.gauge("vllm:kv_cache_usage_perc", "Nonreclaimable allocated GPU cache pool fraction; 1 means full.", 0);
     observability = std::make_shared<const Observability>(Observability{
-        metrics::Snapshot{}.render(settings.model) + initial.str(),
+        settings.embeddings ? std::string{} : metrics::Snapshot{}.render(settings.model) + initial.str(),
         std::make_shared<const std::string>(nlohmann::json{
             {"instance_id", instance}, {"model_name", settings.model}, {"snapshot_time", nullptr},
             {"checkpoints", nlohmann::json::array()}, {"executions", nlohmann::json::array()}}.dump())});
@@ -196,11 +208,15 @@ struct Server::Impl {
         throw std::runtime_error("cannot bind/listen on HTTP " + settings.host + ":" +
                                  std::to_string(settings.port));
       io_thread = std::thread([this] { run_io(); });
-      worker_thread = std::thread([this] { run_worker(); });
+      // Requests are prepared independently, so several can decode media at once.
+      for (int i = 0; i < 4; ++i)
+        worker_threads.emplace_back([this] { run_worker(); });
     } catch (...) {
       stopping = true;
       wake();
+      work_available.notify_all();
       if (io_thread.joinable()) io_thread.join();
+      for (auto& worker : worker_threads) worker.join();
       if (listener >= 0) ::close(listener);
       if (wake_fd >= 0) ::close(wake_fd);
       throw;
@@ -224,7 +240,7 @@ struct Server::Impl {
     work_available.notify_all();
     wake();
     if (io_thread.joinable()) io_thread.join();
-    if (worker_thread.joinable()) worker_thread.join();
+    for (auto& worker : worker_threads) if (worker.joinable()) worker.join();
     std::lock_guard lock(mutex);
     jobs.clear();
     clients.clear();
@@ -272,6 +288,7 @@ struct Server::Impl {
     client.tokens.clear();
     client.logprobs.clear();
     client.result.reset();
+    client.embedding_result.reset();
     client.error.reset();
   }
 
@@ -368,7 +385,7 @@ struct Server::Impl {
     if (length > settings.max_body_bytes) throw Error(413, "request body is too large");
     {
       std::lock_guard lock(mutex);
-      if (length > settings.max_body_total_bytes - body_bytes - image_bytes->load())
+      if (length > settings.max_body_total_bytes - body_bytes - media_bytes->load())
         throw Error(503, "aggregate request body capacity is exhausted", {}, "capacity_exceeded");
       body_bytes += length;
       client.body_charge = length;
@@ -383,7 +400,7 @@ struct Server::Impl {
     client.arrival_time = Clock::now();
     if (client.method == "GET" && client.body.empty()) {
       try {
-        auto request = parse_request(client.method, client.path, {}, tokenizer, settings.model, compiler);
+        auto request = parse(client.method, client.path, {});
         std::lock_guard lock(mutex);
         client.prepared = std::move(request);
       } catch (const Error& error) { queue_error(client, error); }
@@ -461,35 +478,55 @@ struct Server::Impl {
         alive = client->alive;
       }
       auto bounded_images = images;
-      if (images.prepare) bounded_images.prepare = [this, client](std::string_view url, std::uint32_t max_soft_tokens) {
+      auto poll_preparation = [this, client] {
+        std::lock_guard lock(mutex);
+        if (stopping || !client->alive || client->terminal || client->error)
+          throw Error(503, "media preparation cancelled", {}, "request_cancelled");
+      };
+      auto reserve_prepared = [this, client](std::size_t bytes, auto& lease) {
+        lease.total = media_bytes;
+        std::lock_guard lock(mutex);
+        if (stopping || !client->alive || client->terminal || client->error)
+          throw Error(503, "media preparation cancelled", {}, "request_cancelled");
+        if (bytes > settings.max_body_total_bytes - body_bytes - media_bytes->load())
+          throw Error(503, "aggregate media and request body capacity is exhausted", {}, "capacity_exceeded");
+        media_bytes->fetch_add(bytes);
+        lease.bytes = bytes;
+      };
+      auto prepare_bounded = [this, reserve_prepared, poll_preparation](std::uint32_t max_soft_tokens, auto prepare) {
         auto lease = std::make_shared<ImageLease>();
-        lease->total = image_bytes;
-        const auto prepared_bytes = images.prepared_bytes.at(max_soft_tokens);
-        {
-          std::lock_guard lock(mutex);
-          if (stopping || !client->alive || client->terminal || client->error)
-            throw Error(503, "image preparation cancelled", {}, "request_cancelled");
-          if (prepared_bytes > settings.max_body_total_bytes - body_bytes - image_bytes->load())
-            throw Error(503, "aggregate image and request body capacity is exhausted", {}, "capacity_exceeded");
-          image_bytes->fetch_add(prepared_bytes);
-          lease->bytes = prepared_bytes;
-        }
-        lease->image = images.prepare(url, max_soft_tokens);
+        reserve_prepared(images.prepared_bytes.at(max_soft_tokens),*lease);
+        lease->image = prepare();
         if (!lease->image || lease->image->pixels.size() > lease->bytes ||
             lease->image->positions.size() > lease->bytes - lease->image->pixels.size())
           throw Error(500, "image processor exceeded its reserved tensor capacity", {}, "execution_failed");
-        {
-          std::lock_guard lock(mutex);
-          if (stopping || !client->alive || client->terminal || client->error)
-            throw Error(503, "image preparation cancelled", {}, "request_cancelled");
-        }
+        poll_preparation();
         return std::shared_ptr<runtime::ImageInput>(lease, lease->image.get());
+      };
+      bounded_images.poll_preparation = poll_preparation;
+      if (images.prepare) bounded_images.prepare = [this, prepare_bounded](std::string_view url, std::uint32_t budget) {
+        return prepare_bounded(budget, [&] { return images.prepare(url, budget); });
+      };
+      if (images.prepare_video_frame) bounded_images.prepare_video_frame = [this, prepare_bounded](gemma4::RgbImage frame) {
+        return prepare_bounded(embeddinggemma2::kVideoFrameBudget,
+            [&] { return images.prepare_video_frame(std::move(frame)); });
+      };
+      embeddinggemma2::audio::Acquire acquire_audio;
+      if (settings.embeddings && settings.embeddings->audio) acquire_audio = [reserve_prepared, poll_preparation](std::uint32_t rows) {
+        auto lease=std::make_shared<AudioLease>();
+        const auto count=std::size_t(rows)*embeddinggemma2::audio::kFeatureWidth;
+        reserve_prepared(count*sizeof(float)+rows,*lease);
+        lease->input.features.reserve(count);lease->input.mask.reserve(rows);
+        if (lease->input.features.capacity()*sizeof(float)+lease->input.mask.capacity()!=lease->bytes)
+          throw Error(500,"audio processor exceeded its reserved tensor capacity",{},"execution_failed");
+        poll_preparation();
+        return std::shared_ptr<embeddinggemma2::audio::Input>(lease,&lease->input);
       };
       std::optional<Request> request;
       std::optional<Error> error;
       if (alive) {
         try {
-          request = parse_request(client->method, client->path, body, tokenizer, settings.model, compiler, bounded_images);
+          request = parse(client->method, client->path, body, bounded_images, acquire_audio);
           if (settings.verbose && request->prompt) {
             text::IncrementalTextDecoder decoder(tokenizer);
             std::string prompt;
@@ -517,6 +554,14 @@ struct Server::Impl {
       }
       wake();
     }
+  }
+
+  Request parse(std::string_view method, std::string_view path, std::string_view body,
+                const ImageSupport& support = {}, const embeddinggemma2::audio::Acquire& acquire_audio = {}) {
+    if (settings.embeddings)
+      return parse_embedding_request(method, path, body, tokenizer, settings.model, compiler,
+                                     *settings.embeddings, settings.max_output_bytes, support, acquire_audio);
+    return parse_request(method, path, body, tokenizer, settings.model, compiler, support);
   }
 
   void dispatch(Client& client, Request request) {
@@ -587,11 +632,13 @@ struct Server::Impl {
       std::vector<std::uint32_t> tokens;
       std::vector<TokenLogprobs> logprobs;
       std::optional<Result> result;
+      std::optional<EmbeddingResult> embedding_result;
       {
         std::lock_guard lock(mutex);
         tokens.swap(client.tokens);
         logprobs.swap(client.logprobs);
         result.swap(client.result);
+        embedding_result.swap(client.embedding_result);
       }
       if (!tokens.empty()) {
         if (!client.output) throw Error(500, "tokens received for a control request");
@@ -620,6 +667,12 @@ struct Server::Impl {
         } else {
           json_reply(client, 200, control_json(*client.request, *result).dump(), true);
         }
+      }
+      if (embedding_result) {
+        json_reply(client, 200, embedding_json(*client.request, *embedding_result, settings.model).dump(), true);
+        // The serialized response contains all remaining delivery state.
+        // A slow reader must not retain completed inputs or their media leases.
+        client.request.reset();
       }
       if (client.wire.empty()) {
         std::lock_guard lock(mutex);
@@ -828,6 +881,21 @@ void Server::finish(ClientId id, Result result) {
   client->reserved = client->occupied = client->terminal = true;
   client->result = std::move(result);
   impl_->wake();
+}
+
+void Server::finish_embeddings(ClientId id, EmbeddingResult result) {
+  std::lock_guard lock(impl_->mutex);
+  const auto client = impl_->find(id);
+  if (!client || client->terminal) return;
+  client->reserved = client->occupied = client->terminal = true;
+  client->embedding_result = std::move(result);
+  impl_->wake();
+}
+
+bool Server::cancelled(ClientId id) const {
+  std::lock_guard lock(impl_->mutex);
+  const auto client = impl_->find(id);
+  return !client || client->terminal || impl_->stopping;
 }
 
 void Server::reject(ClientId id, Error error) {
